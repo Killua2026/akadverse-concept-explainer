@@ -2,7 +2,16 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 .claude/
+
+# FAISS index — generated at runtime
+akadverse_concept_faiss_index/
+
+# Temp upload files
+*.pdf
+!tests/
+
 
 # C extensions
 *.so
