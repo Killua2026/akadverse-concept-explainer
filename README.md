@@ -1,5 +1,5 @@
 # AkadVerse Concept Explainer
-### Tier 5 Learning AI Tool | Microservice Port: `8006`
+### Tier 5 Learning AI Tool | Microservice Port: `8010`
 
 > A RAG-powered study assistant that explains academic concepts in two modes:
 > from your own uploaded lecture notes, or from live web sources via
@@ -200,7 +200,7 @@ Full dependency reference:
 From inside your project folder with the virtual environment activated:
 
 ```bash
-uvicorn concept_explainer:app --host 127.0.0.1 --port 8006 --reload
+uvicorn concept_explainer:app --host 127.0.0.1 --port 8010 --reload
 ```
 
 **Expected startup output (first run, no prior uploads):**
@@ -211,7 +211,7 @@ uvicorn concept_explainer:app --host 127.0.0.1 --port 8006 --reload
 [Startup] Max upload size: 50 MB
 [Startup] No existing index found — awaiting first PDF upload.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8006 (Press CTRL+C to quit)
+INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
 ```
 
 **Expected startup output (after a previous upload):**
@@ -458,7 +458,7 @@ FastAPI auto-generates an interactive testing interface. Once the server is
 running, open your browser and go to:
 
 ```
-http://127.0.0.1:8006/docs
+http://127.0.0.1:8010/docs
 ```
 
 You will see all four endpoints listed. To test any endpoint:
@@ -710,7 +710,7 @@ see roughly 7 batch logs in total before completion.
 
 **`Address already in use` on startup**
 
-Port 8006 is occupied by another process. Use a different port:
+Port 8010 is occupied by another process. Use a different port:
 ```bash
 uvicorn concept_explainer:app --host 127.0.0.1 --port 8009 --reload
 ```

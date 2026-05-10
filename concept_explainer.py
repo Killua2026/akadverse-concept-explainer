@@ -1,6 +1,6 @@
 """
 AkadVerse — Concept Explainer (RAG-powered Study Assistant)
-Tier 5 | Microservice Port: 8006
+Tier 5 | Microservice Port: 8010
 ========================================================================
 v1.0 — Original build:
   - /upload-note: Upload a PDF, chunk it, embed it, store in FAISS.
@@ -812,5 +812,5 @@ async def health_check():
 
 
 # =========================================================
-# Run: uvicorn concept_explainer:app --host 127.0.0.1 --port 8006 --reload
+# Run: uvicorn concept_explainer:app --host 127.0.0.1 --port 8010 --reload
 # =========================================================
