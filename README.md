@@ -15,20 +15,21 @@
 3. [Architecture Overview](#architecture-overview)
 4. [Prerequisites](#prerequisites)
 5. [Getting Your API Key](#getting-your-api-key)
-6. [Installation](#installation)
-7. [Running the Server](#running-the-server)
-8. [API Endpoints](#api-endpoints)
+6. [Configuration](#configuration)
+7. [Installation](#installation)
+8. [Running the Server](#running-the-server)
+9. [API Endpoints](#api-endpoints)
    - [POST /upload-note](#1-post-upload-note)
    - [POST /explain-concept](#2-post-explain-concept)
    - [POST /explain-with-grounding](#3-post-explain-with-grounding)
    - [GET /health](#4-get-health)
-9. [Testing with Swagger UI](#testing-with-swagger-ui)
-10. [Example Test Inputs](#example-test-inputs)
-11. [Understanding the Responses](#understanding-the-responses)
-12. [Choosing the Right Mode](#choosing-the-right-mode)
-13. [Generated Files](#generated-files)
-14. [Common Errors and Fixes](#common-errors-and-fixes)
-15. [Project Structure](#project-structure)
+10. [Testing with Swagger UI](#testing-with-swagger-ui)
+11. [Example Test Inputs](#example-test-inputs)
+12. [Understanding the Responses](#understanding-the-responses)
+13. [Choosing the Right Mode](#choosing-the-right-mode)
+14. [Generated Files](#generated-files)
+15. [Common Errors and Fixes](#common-errors-and-fixes)
+16. [Project Structure](#project-structure)
 
 ---
 
@@ -130,7 +131,8 @@ exact material, then use Mode B to fill any gaps the notes do not cover.
 1. Go to [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 2. Sign in with a Google account.
 3. Click **Create API Key**.
-4. Copy the key -- you will paste it into Swagger UI form fields when testing.
+4. Copy the key and provide it to the service through the `GOOGLE_API_KEY`
+  environment variable.
 
 > The free tier includes access to Gemini 2.5 Flash, sufficient embedding
 > quota for lecture-sized PDFs, and Search Grounding support.
@@ -141,8 +143,6 @@ exact material, then use Mode B to fill any gaps the notes do not cover.
 > some regions. If you receive a `400` or `403` error on the grounding
 > endpoint specifically, check your quota settings at
 > [https://aistudio.google.com](https://aistudio.google.com).
-
----
 
 ## Installation
 
@@ -233,6 +233,37 @@ server automatically when you edit the code.
 
 ---
 
+## Configuration
+
+The service reads the Gemini key once when `concept_explainer.py` is imported.
+The key is never accepted in an HTTP request, stored in the FAISS index, or
+shown in Swagger UI. Set it before starting Uvicorn.
+
+**Windows PowerShell, current terminal only:**
+
+```powershell
+$env:GOOGLE_API_KEY = "your-gemini-api-key"
+```
+
+**Windows Command Prompt, current terminal only:**
+
+```bat
+set GOOGLE_API_KEY=your-gemini-api-key
+```
+
+**Persist for future Windows terminals:**
+
+```bat
+setx GOOGLE_API_KEY "your-gemini-api-key"
+```
+
+After using `setx`, open a new terminal before starting the service. Startup
+fails immediately with a clear `RuntimeError` if the variable is missing or
+empty. Do not commit API keys to source control, README files, or `.env`
+files that are not excluded from version control.
+
+---
+
 ## API Endpoints
 
 ### 1. `POST /upload-note`
@@ -247,7 +278,6 @@ in a FAISS vector index on disk. This must be called before using
 | Field | Required | Description | Example |
 |---|---|---|---|
 | `file` | Yes | A PDF file to index (max 50 MB) | `lecture_notes.pdf` |
-| `google_api_key` | Yes | Your Gemini API key | `AIza...` |
 
 **Success response (200 OK):**
 
@@ -320,7 +350,6 @@ re-upload needed.
 | Field | Required | Description | Example |
 |---|---|---|---|
 | `question` | Yes | The concept or question to explain | `Explain the stepping-stone method` |
-| `google_api_key` | Yes | Your Gemini API key | `AIza...` |
 
 **Success response (200 OK):**
 
@@ -370,7 +399,6 @@ verify the information.
 | Field | Required | Description | Example |
 |---|---|---|---|
 | `question` | Yes | Any academic concept or question | `Explain Dijkstra's shortest path algorithm` |
-| `google_api_key` | Yes | Your Gemini API key | `AIza...` |
 
 **Success response (200 OK):**
 
@@ -465,7 +493,9 @@ You will see all four endpoints listed. To test any endpoint:
 
 1. Click the endpoint name to expand it.
 2. Click **"Try it out"** (top right of the endpoint card).
-3. Fill in the form fields. For file uploads, click **"Choose File"**.
+3. Fill in the displayed request fields. The Gemini key is already configured
+  in the server environment and is not a request field. For file uploads,
+  click **"Choose File"**.
 4. Click **"Execute"**.
 5. The response appears below, along with the exact `curl` command used.
 
@@ -494,7 +524,6 @@ Call `POST /explain-with-grounding`:
 | Field | Value |
 |---|---|
 | `question` | `Explain Dijkstra's shortest path algorithm` |
-| `google_api_key` | Your key |
 
 **Expected:** All five explanation fields richly populated, plus a `sources`
 list with 3 to 8 citations from sites like Wikipedia, Stanford, FreeCodeCamp,
@@ -509,7 +538,6 @@ Call `POST /upload-note`:
 | Field | Value |
 |---|---|
 | `file` | Any PDF lecture note you have (under 50 MB) |
-| `google_api_key` | Your key |
 
 **Expected:** `200 OK` with `chunks_embedded` and `pages_loaded` counts.
 Progress logs appear in your terminal every 10 chunks. After completion,
@@ -524,7 +552,6 @@ Call `POST /explain-concept` with a question about a topic in your PDF:
 | Field | Value |
 |---|---|
 | `question` | A concept from your uploaded lecture note |
-| `google_api_key` | Your key |
 
 **Expected:** A structured response grounded in your lecturer's material.
 If a concept is not explicitly covered in the notes, `"I do not know based

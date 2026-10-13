@@ -57,7 +57,7 @@ import shutil
 import threading
 from uuid import uuid4                          # FIX 2: For unique temp file names
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, List, Optional, cast
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel, Field, SecretStr
@@ -78,6 +78,8 @@ from langchain_core.prompts import PromptTemplate
 # =========================================================
 # CONSTANTS
 # =========================================================
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 # FIX 1: Path where the FAISS index folder is saved to disk.
 # On every successful upload, the index is written here.
@@ -268,6 +270,11 @@ async def lifespan(_: "FastAPI") -> AsyncIterator[None]:
     Lifespan handler: runs on startup and shutdown.
     Replaces the deprecated @app.on_event("startup") pattern.
     """
+    if GOOGLE_API_KEY is None or not GOOGLE_API_KEY:
+        raise RuntimeError(
+            "GOOGLE_API_KEY environment variable is not set. Set it before starting the service."
+        )
+
     print("[Startup] AkadVerse Concept Explainer initializing...")
     print(f"[Startup] FAISS index path: '{FAISS_INDEX_PATH}'")
     print(f"[Startup] Max upload size: {MAX_UPLOAD_SIZE_MB} MB")
@@ -397,8 +404,7 @@ def _extract_json_from_grounded_response(raw_text: str) -> dict:
 
 @app.post("/upload-note", response_model=UploadSuccessResponse, tags=["Document Ingestion"])
 async def upload_note(
-    file: UploadFile = File(..., description="A PDF lecture note to index."),
-    google_api_key: str = Form(..., description="Your Google Gemini API key.")
+    file: UploadFile = File(..., description="A PDF lecture note to index.")
 ):
     """
     Upload a PDF lecture note, chunk it, embed it with Gemini, and
@@ -484,7 +490,7 @@ async def upload_note(
             try:
                 embeddings = GoogleGenerativeAIEmbeddings(
                     model=embedding_model,
-                    api_key=SecretStr(google_api_key)
+                    api_key=SecretStr(cast(str, GOOGLE_API_KEY))
                 )
 
                 print(f"[Embedding] Trying model: {embedding_model}")
@@ -578,8 +584,7 @@ async def upload_note(
 
 @app.post("/explain-concept", response_model=ExplanationResponse, tags=["Q&A"])
 async def explain_concept(
-    question: str = Form(..., description="The concept or question you want explained."),
-    google_api_key: str = Form(..., description="Your Google Gemini API key.")
+    question: str = Form(..., description="The concept or question you want explained.")
 ):
     """
     Ask a question about your uploaded lecture notes. Retrieves the top-3
@@ -593,7 +598,7 @@ async def explain_concept(
     # Use the first candidate — if it fails here, the user will get a clear error.
     embeddings_for_load = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
-        api_key=SecretStr(google_api_key)
+        api_key=SecretStr(cast(str, GOOGLE_API_KEY))
     )
 
     # FIX 1: Try to get the in-memory store, or load from disk if missing
@@ -623,11 +628,11 @@ async def explain_concept(
         context_text = "\n\n---\n\n".join(doc.page_content for doc in relevant_docs)
 
         # -- Step 2: Select the generative model dynamically --
-        selected_model = get_valid_model_name(google_api_key)
+        selected_model = get_valid_model_name(cast(str, GOOGLE_API_KEY))
 
         llm = ChatGoogleGenerativeAI(
             model=selected_model,
-            api_key=google_api_key,
+            api_key=GOOGLE_API_KEY,
             temperature=0.3   # Low temperature keeps explanations factual and grounded
         )
 
@@ -663,8 +668,7 @@ async def explain_concept(
 
 @app.post("/explain-with-grounding", response_model=GroundedExplanationResponse, tags=["Q&A"])
 async def explain_with_grounding(
-    question: str = Form(..., description="The concept or question you want explained from the web."),
-    google_api_key: str = Form(..., description="Your Google Gemini API key.")
+    question: str = Form(..., description="The concept or question you want explained from the web.")
 ):
     """
     Explains a concept using Gemini's native Google Search Grounding tool.
@@ -688,10 +692,10 @@ async def explain_with_grounding(
     """
     try:
         # -- Step 1: Build the grounding-enabled Gemini client --
-        client = genai.Client(api_key=google_api_key)
+        client = genai.Client(api_key=GOOGLE_API_KEY)
 
         # Dynamically select the best available generative model
-        selected_model = get_valid_model_name(google_api_key)
+        selected_model = get_valid_model_name(cast(str, GOOGLE_API_KEY))
         # Grounding works best with models that support it; gemini-2.0-flash
         # and above have full grounding support. We fall back gracefully if
         # the selected model doesn't support it (caught in the except block).
