@@ -1,0 +1,65 @@
+import asyncio
+import sys
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
+
+@pytest.fixture
+def storage_session():
+    @asynccontextmanager
+    async def isolated_session():
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        from config import StorageSettings
+        from db import Database
+
+        database = Database(StorageSettings.from_env())
+        schema = f"concept_explainer_test_{uuid4().hex}"
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "migrations" / "001_pgvector_storage.sql"
+        )
+        migration = await asyncio.to_thread(
+            migration_path.read_text, encoding="utf-8"
+        )
+        statements = [
+            statement.strip()
+            for statement in migration.replace("concept_explainer", schema).split(";")
+            if statement.strip() and statement.strip() not in {"BEGIN", "COMMIT"}
+        ]
+        try:
+            async with database.engine.connect() as connection:
+                transaction = await connection.begin()
+                try:
+                    extension = await connection.scalar(text(
+                        "SELECT extname FROM pg_extension WHERE extname = 'vector'"
+                    ))
+                    assert extension == "vector", "Apply the approved migration first."
+                    # Exercise reruns using only a generated test schema.
+                    for _ in range(2):
+                        for statement in statements:
+                            await connection.execute(text(statement))
+                    sessions = async_sessionmaker(
+                        connection,
+                        expire_on_commit=False,
+                        join_transaction_mode="create_savepoint",
+                    )
+                    async with sessions() as session:
+                        yield session, schema
+                finally:
+                    await transaction.rollback()
+        finally:
+            await database.dispose()
+
+    return isolated_session

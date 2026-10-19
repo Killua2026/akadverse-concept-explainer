@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.pyc
 .claude/
+.continue/
 
 # FAISS index — generated at runtime
 akadverse_concept_faiss_index/
