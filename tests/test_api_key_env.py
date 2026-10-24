@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 
 def _load_service():
-    service = importlib.import_module("concept_explainer")
+    service = importlib.import_module("main")
     return importlib.reload(service)
 
 

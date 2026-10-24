@@ -370,6 +370,7 @@ akadverse-concept-explainer/
 |-- workers/
 |   `-- ingestion.py              # Job loop, re-queue on startup (2b)
 |-- services/
+|   |-- model_discovery.py        # Shared Gemini model discovery (2b1)
 |   |-- extractors/
 |   |   |-- pdf.py                # (2c)
 |   |   |-- docx.py               # (2c)
@@ -447,6 +448,12 @@ The same applies when the FastAPI app itself starts using `db.py` on Windows.
 - Handle expected errors explicitly and provide useful, actionable error messages.
 - Validate edge cases at system boundaries, including malformed input, missing configuration, external-service failures, and database errors.
 - Do not hide failures with broad exception handlers or silent fallbacks.
+
+### Code hygiene
+
+Routers use a dependency injection pattern: `make_<name>_router(api_key)` returns an `APIRouter` subclass whose `.deps` is a `TypedDict` with callables such as `embeddings` and `vector_store`. Routes read dependencies through `.deps` at call time rather than importing module-level state. `main.py` reads `GOOGLE_API_KEY` at module level and passes it into the factories; `importlib.reload(main)` re-executes the read and rebuilds the routers. Follow this pattern for `/ingest` in 2b2.
+
+Smallest-change rule for Pylance and lint fixes: fix warnings with the smallest possible change. Do not introduce new classes, abstractions, or design patterns unless the warning genuinely requires it. If a warning cannot be given the most recommended fix with a type annotation or a one-line accessor, stop and ask before proceeding.
 
 ## Definition of done (per sub-phase)
 

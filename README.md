@@ -178,7 +178,7 @@ choosing an unregistered local testing port.
 4. Copy the key and provide it to the service through the `GOOGLE_API_KEY`
   environment variable.
 
-> The free tier includes access to Gemini 2.5 Flash, sufficient embedding
+> The free tier includes access to the configured Gemini 3.x models, sufficient embedding
 > quota for lecture-sized PDFs, and Search Grounding support.
 
 > **Important for Search Grounding:** `/explain-with-grounding` uses
@@ -322,7 +322,7 @@ service-level requirements file automatically.
 From inside your project folder with the virtual environment activated:
 
 ```bash
-uvicorn concept_explainer:app --host 127.0.0.1 --port 8010 --reload
+uvicorn main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
 **Expected startup output (first run, no prior uploads):**
@@ -565,8 +565,8 @@ re-upload needed.
 
 ```
 [FAISS] Loaded existing index from 'akadverse_concept_faiss_index'.
-[Model] Using generative model: gemini-2.5-flash
-[Explain] Generating explanation for: 'Explain the stepping-stone method...' using gemini-2.5-flash...
+[Model] Using generative model: gemini-3.5-flash-lite
+[Explain] Generating explanation for: 'Explain the stepping-stone method...' using gemini-3.5-flash-lite...
 [KAFKA MOCK] Published event 'session.ended' - study interaction logged.
 ```
 
@@ -619,8 +619,8 @@ verify the information.
 **Expected terminal output:**
 
 ```
-[Model] Using generative model: gemini-2.5-flash
-[Grounding] Using model: gemini-2.5-flash with Google Search grounding...
+[Model] Using generative model: gemini-3.5-flash-lite
+[Grounding] Using model: gemini-3.5-flash-lite with Google Search grounding...
 [Grounding] Received grounded response (11325 chars).
 [Grounding] Extracted 7 cited source(s).
 [KAFKA MOCK] Published event 'session.ended' - grounded study interaction logged.
