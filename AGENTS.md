@@ -32,7 +32,9 @@ Status:
 
 - [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
 - [x] Phase 2a: pgvector storage (replacing FAISS)
-- [ ] Phase 2b: `/ingest` endpoint + Postgres jobs table
+- [ ] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
+- [ ] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
+- [ ] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [ ] Phase 2c: PDF / DOCX / PPTX extractors
 - [ ] Phase 2d: `/documents/{id}` delete + callback client
 - [ ] Phase 2e: retire old `/upload-note` and `/explain-concept`
@@ -396,11 +398,17 @@ next until the current one is merged and its tests pass.
 migration against Supabase. No endpoint changes yet. Add a smoke test that
 connects to the DB and inserts/deletes one chunk.
 
-**Phase 2b: `/ingest` endpoint + worker.** Add `auth.py`, `models.py`,
-`routes/ingest.py`, `workers/ingestion.py`, `services/embedding.py`. Extract
-`main.py` from the current `concept_explainer.py`. Leave the old endpoints
-in place for now (they still work, they just use FAISS). Add the jobs table
-wiring.
+**Phase 2b1: Extract main.py, routes/grounding.py.** Extract `main.py` and
+`routes/grounding.py` from the current `concept_explainer.py`. Keep old
+endpoints unchanged.
+
+**Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only).**
+Add `auth.py`, `models.py`, `migrations/002_jobs_table.sql`, and
+`routes/ingest.py`. Wire the jobs table and return `202 Accepted` only.
+
+**Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion.**
+Add `services/embedding.py` and `workers/ingestion.py`. Wire end-to-end PDF
+ingestion.
 
 **Phase 2c: extractors.** Add `services/extractors/*` and
 `services/chunking.py`. Wire them into the worker. Add unit tests per
