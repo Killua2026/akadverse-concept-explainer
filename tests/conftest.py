@@ -63,3 +63,21 @@ def storage_session():
             await database.dispose()
 
     return isolated_session
+
+
+@pytest.fixture
+def worker_database(storage_session, monkeypatch):
+    @asynccontextmanager
+    async def isolated_worker():
+        from types import SimpleNamespace
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+        from workers import ingestion
+
+        async with storage_session() as (session, schema):
+            monkeypatch.setattr(ingestion, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
+            yield SimpleNamespace(sessions=async_sessionmaker(
+                session.bind, expire_on_commit=False,
+                join_transaction_mode="create_savepoint",
+            )), schema
+    return isolated_worker

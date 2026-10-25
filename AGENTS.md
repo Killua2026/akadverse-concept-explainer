@@ -33,9 +33,9 @@ Status:
 - [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
 - [x] Phase 2a: pgvector storage (replacing FAISS)
 - [x] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
-- [ ] Phase 2b0: Dual-provider support implemented; current validation and merge pending
-- [ ] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
-- [ ] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
+- [x] Phase 2b0: Dual-provider support implemented; current validation and merge pending
+- [x] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
+- [x] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [ ] Phase 2c: PDF / DOCX / PPTX extractors
 - [ ] Phase 2d: `/documents/{id}` delete + callback client
 - [ ] Phase 2e: retire old `/upload-note` and `/explain-concept`

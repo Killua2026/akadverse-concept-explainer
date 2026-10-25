@@ -3,6 +3,9 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from contextlib import suppress
+from fastapi.responses import JSONResponse
+from workers.ingestion import recover_stuck_jobs, worker_loop
 
 from fastapi import FastAPI
 from config import GeminiSettings, StorageSettings
@@ -53,7 +56,33 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     Replaces the deprecated @app.on_event("startup") pattern.
     """
     gemini_settings.validate()
-    await configure_ingestion(application)
+    application.state.worker_task = None
+    application.state.ingest_database = None
+    if not gemini_settings.use_enterprise:
+        application.state.ingest_status = "disabled (ingestion requires enterprise mode)"
+        application.state.worker_status = "disabled (ingestion requires enterprise mode)"
+    else:
+        await configure_ingestion(application)
+        application.state.worker_status = (
+            "disabled (ingest not configured)" if application.state.ingest_status.startswith("disabled (missing ")
+            else "stopped (db unavailable)"
+        )
+        if application.state.ingest_status == "ready":
+            try:
+                await recover_stuck_jobs(application.state.ingest_database)
+            except (SQLAlchemyError, OSError):
+                logger.error("worker.db_unavailable")
+                application.state.ingest_status = "disabled (db unreachable)"
+            else:
+                application.state.worker_task = asyncio.create_task(
+                    worker_loop(application.state.ingest_database, gemini_settings)
+                )
+                application.state.worker_status = "running"
+                def worker_finished(task):
+                    if not task.cancelled() and task.exception() is not None:
+                        application.state.worker_status = "stopped (db unavailable)"
+                        application.state.ingest_status = "disabled (db unreachable)"
+                application.state.worker_task.add_done_callback(worker_finished)
 
     print("[Startup] AkadVerse Concept Explainer initializing...")
     print(f"[Startup] FAISS index path: '{legacy.FAISS_INDEX_PATH}'")
@@ -65,6 +94,11 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     try:
         yield
     finally:
+        task = application.state.worker_task
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, SQLAlchemyError, OSError):
+                await task
         database = application.state.ingest_database
         if database is not None:
             await database.dispose()
@@ -96,6 +130,17 @@ grounding_router = make_grounding_router(GOOGLE_API_KEY, settings=gemini_setting
 app.include_router(grounding_router)
 app.include_router(ingest_router)
 
+
+@app.middleware("http")
+async def enterprise_ingestion_guard(request, call_next):
+    if request.url.path == "/ingest" and getattr(
+        request.app.state, "ingest_status", None
+    ) == "disabled (ingestion requires enterprise mode)":
+        return JSONResponse(status_code=503, content={
+            "detail": "Ingestion requires LLM_PROVIDER=gemini_enterprise. Developer API mode is not supported for ingestion."
+        })
+    return await call_next(request)
+
 @app.get("/health", tags=["System"])
 async def health_check():
     """
@@ -108,6 +153,7 @@ async def health_check():
         "status": "ok",
         "provider": gemini_settings.llm_provider,
         "ingest_status": getattr(app.state, "ingest_status", "disabled (db unreachable)"),
+        "worker_status": getattr(app.state, "worker_status", "disabled (ingest not configured)"),
         "version": "1.2",
         "index_in_memory": index_in_memory,
         "index_on_disk": index_on_disk,
