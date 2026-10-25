@@ -464,9 +464,10 @@ See [Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterp
 - `GOOGLE_CLOUD_PROJECT`: required in Enterprise mode only.
 - `GOOGLE_CLOUD_LOCATION`: Enterprise location; missing or blank defaults to `global`.
 - `GOOGLE_APPLICATION_CREDENTIALS`: ADC JSON path; runtime ADC can also be used.
-- `DATABASE_URL`: required for storage operations and the real database test, not current HTTP routes.
-- `AI_SERVICE_API_KEY`: reserved for future inbound ingestion authentication.
-- `AI_SERVICE_CALLBACK_SECRET`: reserved for future outbound callbacks.
+- `DATABASE_URL`: required for `/ingest` and the ingestion worker. `/health` reports `ingest_status="disabled (missing DATABASE_URL)"` when absent.
+- `AI_SERVICE_API_KEY`: shared secret for inbound `/ingest` authentication (Phase 2b2).
+- `AI_SERVICE_CALLBACK_SECRET`: reserved for future outbound callbacks (Phase 2d).
+- `WORKER_COUNT`: number of ingestion worker tasks (default `1`). Enterprise supports up to ~10 concurrent workers (~75 embedding calls/minute each). Developer API free tier should not exceed 1 (100 RPM limit). Restart required after change.
 
 ---
 

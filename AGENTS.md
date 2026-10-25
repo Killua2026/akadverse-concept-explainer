@@ -246,6 +246,8 @@ from `requirements.txt` once the migration is complete.
 
 ## Jobs table and background worker
 
+Worker count is set via `WORKER_COUNT` env var, default 1. Rate limit guidance: each worker sends ~75 embedding calls/minute. Enterprise tier supports up to ~10 concurrent workers safely. Developer API free tier should not exceed 1 worker (75 RPM vs 100 RPM limit). Do not raise `WORKER_COUNT` without verifying rate limits.
+
 The FSE's contract requires async processing with callback delivery. Jobs
 MUST survive a process restart. Do NOT use in-memory `JOBS: Dict` (that
 pattern from the root AGENTS.md is for ephemeral tasks only and does NOT
@@ -342,9 +344,10 @@ synchronous discovery once; `lifespan()` validates the selected provider.
 | `GOOGLE_CLOUD_PROJECT` | Enterprise project | Enterprise only |
 | `GOOGLE_CLOUD_LOCATION` | Enterprise location, default `global` | Optional |
 | `GOOGLE_APPLICATION_CREDENTIALS` | ADC JSON path; runtime ADC also supported | Deployment dependent |
-| `DATABASE_URL` | Storage and real database tests | Storage only |
-| `AI_SERVICE_API_KEY` | Future inbound ingestion authentication | When ingestion lands |
-| `AI_SERVICE_CALLBACK_SECRET` | Future outbound callbacks | When callbacks land |
+| `DATABASE_URL` | Postgres storage for `/ingest` (Phase 2b2) and the ingestion worker (Phase 2b3); absent: `/health.ingest_status` is `disabled (missing DATABASE_URL)` | Required for ingestion |
+| `AI_SERVICE_API_KEY` | Shared secret for inbound `/ingest` authentication, implemented in Phase 2b2 | Required for ingestion |
+| `AI_SERVICE_CALLBACK_SECRET` | Reserved for future outbound callbacks (Phase 2d); callback delivery is not yet implemented | Not required until Phase 2d |
+| `WORKER_COUNT` | Ingestion worker tasks, default `1`; restart required after change | Optional |
 
 Do not read or log secret values or inspect the user's `.env`. Do not commit
 `.env` or credential files. Rotate the previously shared callback secret

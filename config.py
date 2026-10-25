@@ -11,10 +11,22 @@ EMBEDDING_DIMENSIONS = 768
 EMBEDDING_BATCH_SIZE = 10
 EMBEDDING_BATCH_SLEEP_SECONDS = 8
 WORKER_POLL_SECONDS = 2
+WORKER_COUNT_DEFAULT = 1
 STUCK_JOB_MINUTES = 5
 from dataclasses import dataclass, field
 
 from pydantic import SecretStr
+
+
+def get_worker_count() -> int:
+    raw = os.getenv("WORKER_COUNT", str(WORKER_COUNT_DEFAULT)).strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        raise RuntimeError("WORKER_COUNT must be an integer >= 1") from None
+    if count < 1:
+        raise RuntimeError("WORKER_COUNT must be an integer >= 1")
+    return count
 
 
 @dataclass(frozen=True)

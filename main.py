@@ -3,12 +3,12 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
-from contextlib import suppress
 from fastapi.responses import JSONResponse
 from workers.ingestion import recover_stuck_jobs, worker_loop
+from workers.ingestion import logger as worker_logger
 
 from fastapi import FastAPI
-from config import GeminiSettings, StorageSettings
+from config import GeminiSettings, StorageSettings, get_worker_count
 from db import Database
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -56,7 +56,17 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     Replaces the deprecated @app.on_event("startup") pattern.
     """
     gemini_settings.validate()
-    application.state.worker_task = None
+    worker_count = get_worker_count()
+    application.state.worker_count = worker_count
+    application.state.worker_tasks = []
+    def worker_log_context(record):
+        if record.getMessage() == "worker.started":
+            task = asyncio.current_task()
+            tasks = application.state.worker_tasks
+            if task in tasks:
+                record.worker_index = tasks.index(task)
+        return True
+    worker_logging_enabled = False
     application.state.ingest_database = None
     if not gemini_settings.use_enterprise:
         application.state.ingest_status = "disabled (ingestion requires enterprise mode)"
@@ -74,15 +84,19 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
                 logger.error("worker.db_unavailable")
                 application.state.ingest_status = "disabled (db unreachable)"
             else:
-                application.state.worker_task = asyncio.create_task(
-                    worker_loop(application.state.ingest_database, gemini_settings)
-                )
+                worker_logger.addFilter(worker_log_context)
+                worker_logging_enabled = True
+                application.state.worker_tasks = [
+                    asyncio.create_task(worker_loop(application.state.ingest_database, gemini_settings))
+                    for _ in range(worker_count)
+                ]
                 application.state.worker_status = "running"
                 def worker_finished(task):
                     if not task.cancelled() and task.exception() is not None:
                         application.state.worker_status = "stopped (db unavailable)"
                         application.state.ingest_status = "disabled (db unreachable)"
-                application.state.worker_task.add_done_callback(worker_finished)
+                for task in application.state.worker_tasks:
+                    task.add_done_callback(worker_finished)
 
     print("[Startup] AkadVerse Concept Explainer initializing...")
     print(f"[Startup] FAISS index path: '{legacy.FAISS_INDEX_PATH}'")
@@ -94,11 +108,12 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     try:
         yield
     finally:
-        task = application.state.worker_task
-        if task is not None:
+        tasks = application.state.worker_tasks
+        for task in tasks:
             task.cancel()
-            with suppress(asyncio.CancelledError, SQLAlchemyError, OSError):
-                await task
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if worker_logging_enabled:
+            worker_logger.removeFilter(worker_log_context)
         database = application.state.ingest_database
         if database is not None:
             await database.dispose()
@@ -154,6 +169,7 @@ async def health_check():
         "provider": gemini_settings.llm_provider,
         "ingest_status": getattr(app.state, "ingest_status", "disabled (db unreachable)"),
         "worker_status": getattr(app.state, "worker_status", "disabled (ingest not configured)"),
+        "worker_count": getattr(app.state, "worker_count", 0),
         "version": "1.2",
         "index_in_memory": index_in_memory,
         "index_on_disk": index_on_disk,

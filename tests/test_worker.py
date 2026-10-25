@@ -15,6 +15,131 @@ from config import GeminiSettings
 from workers import ingestion
 
 
+@pytest.mark.parametrize("value, expected", [(None, 1), ("1", 1), ("3", 3)])
+def test_worker_count_valid(monkeypatch, value, expected):
+    from config import get_worker_count
+    if value is None:
+        monkeypatch.delenv("WORKER_COUNT", raising=False)
+    else:
+        monkeypatch.setenv("WORKER_COUNT", value)
+    assert get_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", ""])
+def test_worker_count_invalid(monkeypatch, value):
+    from config import get_worker_count
+    monkeypatch.setenv("WORKER_COUNT", value)
+    with pytest.raises(RuntimeError, match="^WORKER_COUNT must be an integer >= 1$"):
+        get_worker_count()
+
+
+def test_multiple_workers_no_collision(monkeypatch, caplog):
+    from collections import Counter
+    from pathlib import Path
+    from uuid import uuid4
+    from fastapi.testclient import TestClient
+    from config import StorageSettings
+    from db import Database
+    import main
+
+    schema = f"concept_explainer_test_{uuid4().hex}"
+    monkeypatch.setenv("WORKER_COUNT", "3")
+    monkeypatch.setattr(main, "gemini_settings", GeminiSettings(
+        llm_provider="gemini_enterprise", google_cloud_project="test-project"
+    ))
+    monkeypatch.setattr(ingestion, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
+    caplog.set_level(logging.INFO)
+    database = None
+    claimed = set()
+    all_claimed = asyncio.Event()
+    original_claim = ingestion.claim_next_queued_job
+
+    async def claim(db):
+        job = await original_claim(db)
+        if job is not None:
+            claimed.add(job["document_id"])
+            if len(claimed) == 3:
+                all_claimed.set()
+        return job
+
+    async def download(url, path):
+        # Hold all three jobs in processing to prove overlapping claims.
+        await asyncio.wait_for(all_claimed.wait(), timeout=30)
+
+    monkeypatch.setattr(ingestion, "claim_next_queued_job", claim)
+    monkeypatch.setattr(ingestion, "download_file", download)
+    monkeypatch.setattr(ingestion, "extract_pdf", lambda path: path.name.split("_")[-1])
+    monkeypatch.setattr(ingestion, "RecursiveCharacterTextSplitter", Mock(return_value=SimpleNamespace(
+        split_text=lambda content: [f"{content} chunk {i}" for i in range(int(content[0]))]
+    )))
+    monkeypatch.setattr(ingestion, "embed_chunks", AsyncMock(
+        side_effect=lambda chunks, settings: [[0.5] * 768 for _ in chunks]
+    ))
+
+    async def configure(app):
+        nonlocal database
+        database = Database(StorageSettings.from_env())
+        directory = Path(__file__).resolve().parents[1] / "migrations"
+        try:
+            async with database.engine.begin() as connection:
+                for name in ("001_pgvector_storage.sql", "002_jobs_table.sql"):
+                    migration = await asyncio.to_thread((directory / name).read_text, encoding="utf-8")
+                    for statement in migration.replace("concept_explainer", schema).split(";"):
+                        statement = statement.strip()
+                        if statement and statement not in {"BEGIN", "COMMIT"}:
+                            await connection.execute(text(statement))
+                for index in range(1, 4):
+                    payload = {"file_name": f"{index}.pdf", "file_url": f"https://example.com/{index}",
+                               "mime_type": "application/pdf", "metadata": {"weeks": [index]}}
+                    await connection.execute(text(f"INSERT INTO {schema}.jobs (document_id,payload) VALUES (:id,CAST(:payload AS jsonb))"),
+                                             {"id": f"job-{index}", "payload": json.dumps(payload)})
+        except BaseException:
+            async with database.engine.begin() as connection:
+                await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            await database.dispose()
+            raise
+        app.state.ingest_database = database
+        app.state.ingest_status = "ready"
+
+    monkeypatch.setattr(main, "configure_ingestion", configure)
+
+    async def wait_for_completion():
+        async def wait():
+            while True:
+                async with database.sessions() as session:
+                    rows = (await session.execute(text(f"SELECT document_id,status,attempts FROM {schema}.jobs"))).all()
+                if all(row.status == "done" for row in rows):
+                    assert len(rows) == 3
+                    assert all(row.attempts == 1 for row in rows)
+                    return
+                assert not any(row.status == "failed" for row in rows)
+                await asyncio.sleep(0.05)
+        await asyncio.wait_for(wait(), timeout=60)
+        async with database.sessions() as session:
+            counts = dict((await session.execute(text(f"SELECT document_id,count(*) FROM {schema}.chunks GROUP BY document_id"))).all())
+        assert counts == {"job-1": 1, "job-2": 2, "job-3": 3}
+
+    async def cleanup():
+        async with database.engine.begin() as connection:
+            await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+
+    with TestClient(main.app) as client:
+        try:
+            assert client.get("/health").json()["worker_count"] == 3
+            client.portal.call(wait_for_completion)
+        finally:
+            for task in main.app.state.worker_tasks:
+                client.portal.call(task.cancel)
+            async def settle():
+                await asyncio.gather(*main.app.state.worker_tasks, return_exceptions=True)
+            client.portal.call(settle)
+            client.portal.call(cleanup)
+    claims = Counter(record.document_id for record in caplog.records if record.getMessage() == "job.claimed")
+    assert claims == {"job-1": 1, "job-2": 1, "job-3": 1}
+    starts = [record.worker_index for record in caplog.records if record.getMessage() == "worker.started"]
+    assert sorted(starts) == [0, 1, 2]
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -186,7 +311,7 @@ async def test_developer_mode_does_not_start_worker(monkeypatch):
     import main
     monkeypatch.setattr(main, "gemini_settings", GeminiSettings(google_api_key="test"))
     async with main.lifespan(main.app):
-        assert main.app.state.worker_task is None
+        assert main.app.state.worker_tasks == []
         assert (await main.health_check())["worker_status"] == "disabled (ingestion requires enterprise mode)"
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
             response = await client.post("/ingest", json={})
@@ -207,5 +332,5 @@ async def test_health_worker_running(monkeypatch):
     monkeypatch.setattr(main, "worker_loop", loop)
     async with main.lifespan(main.app):
         assert (await main.health_check())["worker_status"] == "running"
-        assert main.app.state.worker_task is not None
-    assert main.app.state.worker_task.done()
+        assert len(main.app.state.worker_tasks) == 1
+    assert all(task.done() for task in main.app.state.worker_tasks)
