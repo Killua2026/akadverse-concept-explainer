@@ -2,9 +2,10 @@ from google import genai
 
 
 MODEL_PRIORITY_ORDER = (
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",   # Most cost-efficient Gemini model, optimized for low latency use cases for high-volume, cost-sensitive LLM traffic.
+    "gemini-3.5-flash-lite",   # Highly cost-efficient, high-volume production standard
+    "gemini-3.5-flash",        # Higher-throughput mid-tier
+    "gemini-3.8-flash",        # Flagship standard utility fallback
 )
 DEFAULT_MODEL = MODEL_PRIORITY_ORDER[0]
 
