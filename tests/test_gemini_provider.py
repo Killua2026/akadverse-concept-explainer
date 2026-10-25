@@ -62,7 +62,8 @@ def test_create_client(monkeypatch, enterprise):
     constructor = Mock()
     monkeypatch.setattr(provider.genai, "Client", constructor)
     assert provider.create_client(settings) is constructor.return_value
-    expected = {"enterprise": True, "project": "test-project", "location": "us-central1"} if enterprise else {"api_key": "test-key"}
+    expected = {"enterprise": True, "project": "test-project", "location": "global"} if enterprise else {"api_key": "test-key"}
+    # Gemini 3.x models are served at global; see docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations
     constructor.assert_called_once_with(**expected)
 
 
@@ -86,7 +87,8 @@ def test_settings_cache_enterprise_discovery(monkeypatch):
     settings = GeminiSettings.from_env()
     settings.validate()
     assert settings.model_names == ["test-model"]
-    discovery.assert_called_once_with("test-project", "us-central1")
+    # Gemini 3.x models are served at global; see docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations
+    discovery.assert_called_once_with("test-project", "global")
 
 
 @pytest.mark.parametrize("enterprise", [True, False])
@@ -109,7 +111,9 @@ async def test_grounding_selected_provider(monkeypatch, enterprise):
         response = await session.post("/explain-with-grounding", data={"question": "Recursion?"})
     assert response.status_code == 200
     assert response.json() == {**fields, "sources": []}
-    assert generate.await_args.kwargs["model"] == "test-model"
+    await_args = generate.await_args
+    assert await_args is not None
+    assert await_args.kwargs["model"] == "test-model"
 
 
 @pytest.mark.parametrize("enterprise", [True, False])
@@ -136,6 +140,7 @@ def test_legacy_wrapper_arguments(monkeypatch, enterprise):
     with TestClient(app) as client:
         response = client.post("/explain-concept", data={"question": "Recursion?"})
     assert response.status_code == 200
-    args = {"vertexai": True, "project": "test-project", "location": "us-central1"} if enterprise else {"vertexai": False, "api_key": "test-key"}
+    args = {"vertexai": True, "project": "test-project", "location": "global"} if enterprise else {"vertexai": False, "api_key": "test-key"}
+    # Gemini 3.x models are served at global; see docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations
     embeddings.assert_called_once_with(model="models/gemini-embedding-001", **args)
     chat.assert_called_once_with(model="test-model", temperature=0.3, **args)
