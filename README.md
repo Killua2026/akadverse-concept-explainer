@@ -1,5 +1,17 @@
 # AkadVerse Concept Explainer
 
+Phase 2b2 adds authenticated `POST /ingest` queue admission only. Apply
+`migrations/002_jobs_table.sql` after migration 001. Jobs remain queued
+until the Phase 2b3 worker is deployed. Duplicate document IDs retain their
+original payload and increment attempts from zero.
+
+Start with `uv run python run.py` on port 8010, especially on Windows.
+The launcher sets the SelectorEventLoop policy before Uvicorn creates its
+loop. Direct `uvicorn main:app` is unsuitable for Windows database use.
+Ingestion requires `DATABASE_URL` and `AI_SERVICE_API_KEY`; missing settings
+disable ingestion without disabling grounding. Startup probes the database
+with `asyncio.wait_for(..., timeout=2.0)`. Health reports ingestion readiness.
+
 ### Phase 2b0: Gemini Enterprise Agent Platform provider configuration
 
 Both grounding and legacy RAG use explicit provider selection.

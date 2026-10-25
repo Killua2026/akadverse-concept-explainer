@@ -26,13 +26,13 @@ def storage_session():
 
         database = Database(StorageSettings.from_env())
         schema = f"concept_explainer_test_{uuid4().hex}"
-        migration_path = (
-            Path(__file__).resolve().parents[1]
-            / "migrations" / "001_pgvector_storage.sql"
-        )
-        migration = await asyncio.to_thread(
-            migration_path.read_text, encoding="utf-8"
-        )
+        migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+        migrations = []
+        for name in ("001_pgvector_storage.sql", "002_jobs_table.sql"):
+            migrations.append(await asyncio.to_thread(
+                (migrations_dir / name).read_text, encoding="utf-8"
+            ))
+        migration = "\n".join(migrations)
         statements = [
             statement.strip()
             for statement in migration.replace("concept_explainer", schema).split(";")
