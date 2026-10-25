@@ -9,6 +9,13 @@ __pycache__/
 # FAISS index — generated at runtime
 akadverse_concept_faiss_index/
 
+# JSON files containing configuration or data that should not be tracked
+*.json
+!package.json
+!config*.json
+!.eslintrc*.json
+*-credentials.json
+
 # Temp upload files
 *.pdf
 !tests/

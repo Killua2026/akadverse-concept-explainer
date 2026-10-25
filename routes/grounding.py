@@ -1,13 +1,17 @@
 import re
 import json
-from typing import List, cast
+from typing import List
 
 from fastapi import APIRouter, HTTPException, Form
 from pydantic import BaseModel, Field
-from google import genai
 from google.genai import types
 
-from services.model_discovery import get_valid_model_name
+from config import GeminiSettings
+from services.gemini_provider import create_client
+
+
+class GroundingRouter(APIRouter):
+    selected_model: str | None = None
 
 class GroundedSource(BaseModel):
     """A single cited web source returned by Gemini's grounding metadata."""
@@ -105,9 +109,9 @@ def _extract_json_from_grounded_response(raw_text: str) -> dict:
     }
 
 
-def make_grounding_router(api_key):
-    router = APIRouter()
-    GOOGLE_API_KEY = api_key
+def make_grounding_router(api_key, *, settings: GeminiSettings | None = None):
+    router = GroundingRouter()
+    provider_settings = settings or GeminiSettings(google_api_key=api_key or "")
 
     @router.post("/explain-with-grounding", response_model=GroundedExplanationResponse, tags=["Q&A"])
     async def explain_with_grounding(
@@ -134,13 +138,8 @@ def make_grounding_router(api_key):
         google-generativeai syntax (tools='google_search_retrieval').
         """
         try:
-            # -- Step 1: Build the grounding-enabled Gemini client --
-            client = genai.Client(api_key=GOOGLE_API_KEY)
-
-            # Dynamically select the best available generative model
-            selected_model = get_valid_model_name(cast(str, GOOGLE_API_KEY))
-            # The shared model discovery helper selects the configured 3.x
-            # priority order. We fall back gracefully if grounding fails.
+            selected_model = router.selected_model or provider_settings.model_names[0]
+            # Reuse startup discovery for the selected provider.
             print(f"[Grounding] Using model: {selected_model} with Google Search grounding...")
 
             # -- Step 2: Format the prompt that asks Gemini to include a JSON block --
@@ -150,14 +149,17 @@ def make_grounding_router(api_key):
             # types.Tool(google_search=types.GoogleSearch()) is the v1.2+ SDK syntax.
             # This is different from the older SDK which used tools='google_search_retrieval'.
             # The grounding tool makes Gemini autonomously search Google during generation.
-            response = client.models.generate_content(
-                model=selected_model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                    temperature=0.3   # Low temperature for factual accuracy
+            client = create_client(provider_settings)
+            if client is None:
+                raise RuntimeError("Gemini provider is not configured.")
+            response = await client.aio.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.3   # Low temperature for factual accuracy
+                    )
                 )
-            )
 
             # -- Step 4: Extract the raw text from the response --
             if not response.candidates:

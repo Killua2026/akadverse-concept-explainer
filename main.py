@@ -3,12 +3,14 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from config import GeminiSettings
 
 from routes import legacy
 from routes.grounding import make_grounding_router
 from routes.legacy import make_legacy_router
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+gemini_settings = GeminiSettings.from_env()
 GoogleGenerativeAIEmbeddings = legacy.GoogleGenerativeAIEmbeddings
 _get_or_load_vector_store = legacy._get_or_load_vector_store
 
@@ -18,10 +20,7 @@ async def lifespan(_: "FastAPI") -> AsyncIterator[None]:
     Lifespan handler: runs on startup and shutdown.
     Replaces the deprecated @app.on_event("startup") pattern.
     """
-    if GOOGLE_API_KEY is None or not GOOGLE_API_KEY:
-        raise RuntimeError(
-            "GOOGLE_API_KEY environment variable is not set. Set it before starting the service."
-        )
+    gemini_settings.validate()
 
     print("[Startup] AkadVerse Concept Explainer initializing...")
     print(f"[Startup] FAISS index path: '{legacy.FAISS_INDEX_PATH}'")
@@ -45,7 +44,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-legacy_router = make_legacy_router(GOOGLE_API_KEY)
+legacy_router = make_legacy_router(GOOGLE_API_KEY, settings=gemini_settings)
 # Resolve these module symbols at call time so existing test monkeypatches apply.
 # The router captures the API key separately, keeping environment reloads isolated.
 legacy_router.legacy_dependencies["embeddings"] = (
@@ -55,7 +54,8 @@ legacy_router.legacy_dependencies["vector_store"] = (
     lambda embeddings: _get_or_load_vector_store(embeddings)
 )
 app.include_router(legacy_router)
-app.include_router(make_grounding_router(GOOGLE_API_KEY))
+grounding_router = make_grounding_router(GOOGLE_API_KEY, settings=gemini_settings)
+app.include_router(grounding_router)
 
 @app.get("/health", tags=["System"])
 async def health_check():
@@ -67,6 +67,7 @@ async def health_check():
 
     return {
         "status": "ok",
+        "provider": gemini_settings.llm_provider,
         "version": "1.2",
         "index_in_memory": index_in_memory,
         "index_on_disk": index_on_disk,

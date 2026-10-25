@@ -12,7 +12,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 
-from services.model_discovery import get_valid_model_name
+from config import GeminiSettings
 
 FAISS_INDEX_PATH = "akadverse_concept_faiss_index"
 
@@ -150,9 +150,16 @@ class LegacyRouter(APIRouter):
         }
 
 
-def make_legacy_router(api_key: Optional[str]) -> LegacyRouter:
+def make_legacy_router(api_key: Optional[str], *, settings: GeminiSettings | None = None) -> LegacyRouter:
     router = LegacyRouter()
     GOOGLE_API_KEY = api_key
+    provider_settings = settings or GeminiSettings(google_api_key=api_key)
+    provider_arguments = (
+        {"vertexai": True, "project": provider_settings.google_cloud_project,
+         "location": provider_settings.google_cloud_location}
+        if provider_settings.use_enterprise else
+        {"api_key": GOOGLE_API_KEY, "vertexai": False}
+    )
 
     @router.post("/upload-note", response_model=UploadSuccessResponse, tags=["Document Ingestion"])
     async def upload_note(
@@ -241,7 +248,7 @@ def make_legacy_router(api_key: Optional[str]) -> LegacyRouter:
                 try:
                     embeddings = GoogleGenerativeAIEmbeddings(
                         model=embedding_model,
-                        api_key=SecretStr(cast(str, GOOGLE_API_KEY))
+                        **provider_arguments
                     )
 
                     print(f"[Embedding] Trying model: {embedding_model}")
@@ -345,7 +352,7 @@ def make_legacy_router(api_key: Optional[str]) -> LegacyRouter:
         # Use the first candidate — if it fails here, the user will get a clear error.
         embeddings_for_load = router.legacy_dependencies["embeddings"](
             model="models/gemini-embedding-001",
-            api_key=SecretStr(cast(str, GOOGLE_API_KEY))
+            **provider_arguments
         )
 
         # FIX 1: Try to get the in-memory store, or load from disk if missing
@@ -375,11 +382,11 @@ def make_legacy_router(api_key: Optional[str]) -> LegacyRouter:
             context_text = "\n\n---\n\n".join(doc.page_content for doc in relevant_docs)
 
             # -- Step 2: Select the generative model dynamically --
-            selected_model = get_valid_model_name(cast(str, GOOGLE_API_KEY))
+            selected_model = provider_settings.model_names[0]
 
             llm = ChatGoogleGenerativeAI(
                 model=selected_model,
-                api_key=GOOGLE_API_KEY,
+                **provider_arguments,
                 temperature=0.3   # Low temperature keeps explanations factual and grounded
             )
 

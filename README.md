@@ -1,4 +1,31 @@
 # AkadVerse Concept Explainer
+
+### Phase 2b0: Vertex AI provider configuration
+
+Grounded explanations now prefer Gemini Enterprise (Vertex AI) whenever
+`GOOGLE_CLOUD_PROJECT` is configured. Authenticate using Application Default
+Credentials (ADC), with permission to call Vertex AI in that project.
+Purchased credits apply to the configured Cloud project.
+
+| Variable | Behavior |
+|---|---|
+| `GOOGLE_CLOUD_PROJECT` | Cloud project for Enterprise generation |
+| `GOOGLE_CLOUD_LOCATION` | Region, defaults to `us-central1` |
+| `LLM_PROVIDER` | Optional `gemini_enterprise` or `gemini` override |
+| `GOOGLE_API_KEY` | Developer API fallback key |
+
+With no Cloud project, the service uses `GOOGLE_API_KEY`. Set
+`LLM_PROVIDER=gemini` to explicitly use Developer API even with a project.
+Enterprise uses ADC and does not require a Developer API key. A configured
+Enterprise provider with invalid ADC or insufficient permissions reports an
+API failure; it does not silently switch billing providers on request failure.
+Model discovery runs asynchronously at startup and uses provider-specific
+priority defaults if discovery is unavailable.
+
+This switch applies to `/explain-with-grounding`. Legacy FAISS endpoints
+still require `GOOGLE_API_KEY`. Phase 2b2 ingestion, durable jobs, workers,
+and Phase 2e FAISS retirement are outside this change.
+
 ### Tier 5 Learning AI Tool | Microservice Port: `8010`
 
 > A RAG-powered study assistant that explains academic concepts in two modes:

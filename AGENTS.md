@@ -32,7 +32,8 @@ Status:
 
 - [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
 - [x] Phase 2a: pgvector storage (replacing FAISS)
-- [ ] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
+- [x] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
+- [ ] Phase 2b0: Vertex AI provider switch (implemented; merge pending)
 - [ ] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
 - [ ] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [ ] Phase 2c: PDF / DOCX / PPTX extractors
@@ -406,6 +407,13 @@ endpoints unchanged.
 **Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only).**
 Add `auth.py`, `models.py`, `migrations/002_jobs_table.sql`, and
 `routes/ingest.py`. Wire the jobs table and return `202 Accepted` only.
+
+**Phase 2b0: Vertex AI provider switch.** Runs before 2b2. Grounded
+generation uses Enterprise when GOOGLE_CLOUD_PROJECT is configured, or
+Developer API otherwise. LLM_PROVIDER can explicitly select gemini or
+gemini_enterprise. Use ADC for Enterprise authentication. This phase may
+change grounding client construction, discovery, and async SDK invocation,
+but preserves its HTTP contract. Legacy FAISS routes remain unchanged.
 
 **Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion.**
 Add `services/embedding.py` and `workers/ingestion.py`. Wire end-to-end PDF
