@@ -1,30 +1,16 @@
 # AkadVerse Concept Explainer
 
-### Phase 2b0: Vertex AI provider configuration
+### Phase 2b0: Gemini Enterprise Agent Platform provider configuration
 
-Grounded explanations now prefer Gemini Enterprise (Vertex AI) whenever
-`GOOGLE_CLOUD_PROJECT` is configured. Authenticate using Application Default
-Credentials (ADC), with permission to call Vertex AI in that project.
-Purchased credits apply to the configured Cloud project.
-
-| Variable | Behavior |
-|---|---|
-| `GOOGLE_CLOUD_PROJECT` | Cloud project for Enterprise generation |
-| `GOOGLE_CLOUD_LOCATION` | Region, defaults to `us-central1` |
-| `LLM_PROVIDER` | Optional `gemini_enterprise` or `gemini` override |
-| `GOOGLE_API_KEY` | Developer API fallback key |
-
-With no Cloud project, the service uses `GOOGLE_API_KEY`. Set
-`LLM_PROVIDER=gemini` to explicitly use Developer API even with a project.
-Enterprise uses ADC and does not require a Developer API key. A configured
-Enterprise provider with invalid ADC or insufficient permissions reports an
-API failure; it does not silently switch billing providers on request failure.
-Model discovery runs asynchronously at startup and uses provider-specific
-priority defaults if discovery is unavailable.
-
-This switch applies to `/explain-with-grounding`. Legacy FAISS endpoints
-still require `GOOGLE_API_KEY`. Phase 2b2 ingestion, durable jobs, workers,
-and Phase 2e FAISS retirement are outside this change.
+Both grounding and legacy RAG use explicit provider selection.
+`LLM_PROVIDER=gemini_enterprise` selects Gemini Enterprise Agent Platform with ADC;
+`LLM_PROVIDER=gemini` is the default and uses the Developer API key.
+Project presence does not select Enterprise. Discovery runs synchronously
+in settings loading and caches models on settings. Discovery failure retains
+provider priorities; request failures do not switch providers.
+Enterprise location defaults to `global` for Gemini 3.x Search Grounding.
+See [Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup). Phase 2b2 ingestion, durable jobs,
+workers, and Phase 2e FAISS retirement remain outside this change.
 
 ### Tier 5 Learning AI Tool | Microservice Port: `8010`
 
@@ -44,6 +30,7 @@ and Phase 2e FAISS retirement are outside this change.
    - [Port Registry](#port-registry)
 5. [Getting Your API Key](#getting-your-api-key)
    - [Supabase Setup](#supabase-setup)
+   - [Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup)
 6. [Configuration](#configuration)
 7. [Installation](#installation)
 8. [Running the Server](#running-the-server)
@@ -62,9 +49,9 @@ and Phase 2e FAISS retirement are outside this change.
 17. [Part of the AkadVerse Platform](#part-of-the-akadverse-platform)
 18. [Integration Notes for Full Stack Engineer](#integration-notes-for-full-stack-engineer)
 
-Additional Phase 2a sections:
+Additional implementation sections:
 
-- [Current Status: Phase 2a](#current-status-phase-2a)
+- [Current Status: Phase 2b0](#current-status-phase-2b0)
 - [Postgres Storage](#postgres-storage)
 - [Database Migrations](#database-migrations)
 - [Automated Tests](#automated-tests)
@@ -95,15 +82,15 @@ Every response, regardless of mode, is structured into five fields:
 the concept, a plain-language explanation, a
 relatable analogy, a concrete example, and a step-by-step worked problem.
 
-### Current Status: Phase 2a
+### Current Status: Phase 2b0
 
-Storage foundations are implemented and the migration has been applied and
-verified in the development Supabase project. The last verified suite result
-was five passing tests. No endpoint was changed as part of Phase 2a.
-`concept_explainer.py` still runs the FAISS-backed upload and explanation routes.
-`config.py` and `db.py` are independent storage modules, not wired into FastAPI's
-lifespan yet. The jobs table and ingestion worker are deferred to Phase 2b;
-student retrieval is not implemented. See `AGENTS.md` for the phased roadmap.
+Phase 2a storage and Phase 2b1 router extraction are implemented. `main.py`
+mounts the legacy and grounding routers. Phase 2b0 wires both SDK and
+LangChain calls to the selected provider; endpoint contracts stay the same
+except for `/health.provider`. FAISS still serves legacy requests, while
+Postgres storage remains independent of HTTP routes. Ingestion, jobs,
+workers, and student retrieval are not implemented by 2b0. Current
+validation and merge are still required before claiming completion.
 
 ---
 
@@ -160,7 +147,8 @@ flows shown above do not call this path yet.
   concurrent uploads of files with the same name cannot corrupt each other.
 - **File size is checked before any processing begins.** Files over 50 MB
   are rejected immediately with a clear 413 error.
-- The generative model is discovered via `client.models.list()` when needed.
+- The generative model is discovered synchronously via `client.models.list()`
+  during settings loading and cached for both routers.
   Legacy embedding code tries a hardcoded candidate list; it does not discover
   embedding models dynamically.
 - Search Grounding and `with_structured_output()` **cannot run together**
@@ -174,7 +162,7 @@ flows shown above do not call this path yet.
 
 - **Python 3.12**, matching the repository's root `pyproject.toml`
 - **uv**, the Python package and project manager
-- A **Google Gemini API key** (one key covers both modes - free tier available)
+- **Gemini Enterprise Agent Platform project and ADC credentials** for Enterprise, or a **Google Gemini API key** for Developer mode
 - Internet connection (for embedding calls and grounding search)
 - A **Supabase Postgres project** with pgvector enabled for storage and DB tests
 - Database credentials permitted to create an isolated test schema and roll it back
@@ -199,21 +187,12 @@ choosing an unregistered local testing port.
 
 ## Getting Your API Key
 
-1. Go to [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-2. Sign in with a Google account.
-3. Click **Create API Key**.
-4. Copy the key and provide it to the service through the `GOOGLE_API_KEY`
-  environment variable.
-
-> The free tier includes access to the configured Gemini 3.x models, sufficient embedding
-> quota for lecture-sized PDFs, and Search Grounding support.
-
-> **Important for Search Grounding:** `/explain-with-grounding` uses
-> Google's native Search Grounding tool. This is available on the free tier
-> but may require billing to be configured on your Google Cloud account in
-> some regions. If you receive a `400` or `403` error on the grounding
-> endpoint specifically, check your quota settings at
-> [https://aistudio.google.com](https://aistudio.google.com).
+For Developer mode (`LLM_PROVIDER=gemini`), create a key in
+[Google AI Studio](https://aistudio.google.com/apikey) and set
+`GOOGLE_API_KEY` privately in the service environment or ignored `.env`.
+Model access, grounding availability, and quota depend on the account;
+free-tier access is not guaranteed. For Enterprise mode, follow
+[Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup) instead.
 
 ## Supabase Setup
 
@@ -291,6 +270,77 @@ One row means pgvector is enabled and ready. Zero rows means step (b) is
 still required; enable the extension from the dashboard and verify again
 before proceeding.
 
+## Gemini Enterprise Agent Platform (formerly Vertex AI) Setup
+
+### (a) Prerequisites
+
+Use a Google Cloud account with permissions to create projects, link billing, enable APIs, and manage service accounts. You will need the **Project Creator** role (`roles/resourcemanager.projectCreator`) to create a project, or you can select an existing project where you have been granted any role. To enable the required APIs, you need the `serviceusage.services.enable` permission, typically included in the **Owner** (`roles/owner`) or **Service Usage Admin** (`roles/serviceusage.serviceUsageAdmin`) roles.
+
+Install the Google Cloud CLI and initialize it with `gcloud init`. If you are using an external identity provider (IdP), sign in to the gcloud CLI with your federated identity first.
+
+The API service name remains `aiplatform.googleapis.com`, but the console label is now the **Gemini Enterprise Agent Platform API**.
+
+### (b) Create or select the GCP project
+
+In the Google Cloud Console, use the project selector to create a new project or select an existing one. Link the appropriate billing account and record its project ID. Set `GOOGLE_CLOUD_PROJECT` to that ID in the service's ignored `.env` file.
+
+### (c) Enable the Gemini Enterprise Agent Platform API
+
+Enable the **Gemini Enterprise Agent Platform API** (service name: `aiplatform.googleapis.com`) in APIs & Services. Alternatively, set the project ID in the current PowerShell environment and run:
+
+```powershell
+gcloud services enable aiplatform.googleapis.com --project $env:GOOGLE_CLOUD_PROJECT
+```
+
+The gcloud command itself remains valid and unchanged.
+
+### (d) Create the service account
+
+In IAM & Admin, create a dedicated service account for this service. Grant it `roles/aiplatform.user` (the **Agent Platform User** role) on the selected project. This is the minimal role required for standard Gemini model access and inference.
+
+If you plan to use **RAG Engine, Agent Runtime, or other advanced GEA features**, additional roles may be required depending on the operation. RAG Engine operations typically use the same `roles/aiplatform.user`, but specific features like Agent Runtime may require dedicated roles such as `roles/aiplatform.ragEngineUser` or agent-specific default access roles. The role ID `roles/aiplatform.user` is stable even if console labels change.
+
+### (e) Download the JSON key outside the repository
+
+Where organization policy permits keys, open the service account's **Keys** tab and create a JSON key. Save it in a private directory outside the repo. Never paste the contents into logs, chat, or documentation.
+
+The existing `.gitignore` excludes `*-credentials.json`; `service-account*.json` is also excluded by the broader `*.json` rule. These names are ignored by normal Git adds. Keep keys outside the repo and never force-add them.
+
+### (f) Configure authentication and the location
+
+**Authentication:** GEA supports two methods: **Application Default Credentials (ADC)** and **API keys (Express Mode)**. ADC is recommended for production, while API keys are convenient for testing and rapid prototyping.
+
+- **Option 1 - ADC (recommended for production):**
+  Set `LLM_PROVIDER=gemini_enterprise`, set `GOOGLE_CLOUD_PROJECT` to the selected project ID, and set `GOOGLE_APPLICATION_CREDENTIALS` to the absolute path of the JSON key in your ignored `.env` file.
+
+- **Option 2 - API Key (Express Mode):**
+  Set `LLM_PROVIDER=gemini_enterprise` and set `GOOGLE_API_KEY` to your Express Mode API key in the ignored `.env` file. You can obtain an Express Mode API key from the Google Cloud Console's Gemini Enterprise Agent Platform "Get started" page or via the Express Mode sign-up flow.
+
+`config.py` loads `.env`; existing process variables take precedence.
+
+**Location:** Set `GOOGLE_CLOUD_LOCATION=global` for Gemini 3.x generation and Search Grounding, as newer Gemini models are served from the global endpoint.
+
+**Important - Embeddings:** Model availability varies by endpoint. `gemini-embedding-001` is **regional-only** and is absent from the global catalog; it is available in regions such as `us-central1`, `us-east1`, `us-east4`, `us-west1`, `us-west4`, `europe-west1`, and `europe-west4`. `gemini-embedding-2` is served from the global and multi-region endpoints (us, eu) but not from `us-central1`. Verify embedding model availability at your chosen location before ingestion embedding work; per-operation location handling may be necessary.
+
+See [ADC search order](https://cloud.google.com/docs/authentication/application-default-credentials) for details on how ADC resolves credentials.
+
+### (g) Verify configuration and a live request
+
+From `akadverse-concept-explainer/`, run:
+
+```powershell
+uv run uvicorn main:app --host 127.0.0.1 --port 8010 --reload
+```
+
+Wait for application startup to complete, then use a second terminal:
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8010/health
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8010/explain-with-grounding -ContentType 'application/x-www-form-urlencoded' -Body @{question='Explain recursion in one example.'}
+```
+
+Health should report `provider: gemini_enterprise`; it does not probe ADC, API key validity, or IAM permissions. The grounded request exercises the configured authentication method and may incur charges. Discovery fallback warnings do not prove model access. Do not share credential-bearing error output.
+
 ## Installation
 
 ### Step 1 - Set up your project folder
@@ -335,7 +385,7 @@ Full dependency reference:
 | `pypdf` | latest | PDF text extraction backend for PyPDFLoader |
 | `sqlalchemy[asyncio]` | pinned: 2.1.4 | Async engine and session factory |
 | `psycopg[binary]` | pinned: 3.2.6 | Postgres async driver and binary distribution |
-| `python-dotenv` | pinned: 1.0.1 | Test environment loading |
+| `python-dotenv` | pinned: 1.0.1 | Application and test environment loading |
 
 The root uv project supplies pytest and httpx. This service's additional
 dependencies are recorded in `requirements.txt`; install that file into the
@@ -346,10 +396,10 @@ service-level requirements file automatically.
 
 ## Running the Server
 
-From inside your project folder with the virtual environment activated:
+From `akadverse-concept-explainer/`, after configuring the selected provider:
 
 ```bash
-uvicorn main:app --host 127.0.0.1 --port 8010 --reload
+uv run uvicorn main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
 **Expected startup output (first run, no prior uploads):**
@@ -384,46 +434,27 @@ server automatically when you edit the code.
 
 ## Configuration
 
-| Variable | Current use |
-|---|---|
-| `GOOGLE_API_KEY` | Required by the existing application's startup validation |
-| `DATABASE_URL` | Required when `StorageSettings.from_env()` is called for storage or tests |
-| `AI_SERVICE_API_KEY` | Planned inbound ingestion authentication; not wired in Phase 2a |
-| `AI_SERVICE_CALLBACK_SECRET` | Planned outbound callback authentication; not wired in Phase 2a |
+`LLM_PROVIDER=gemini` (default) selects Developer API and requires
+`GOOGLE_API_KEY`; `gemini_enterprise` selects Gemini Enterprise Agent Platform
+and requires a
+Cloud project with ADC. Location defaults to `global`. Unknown providers
+and missing required provider settings fail startup. `config.py` loads
+`.env` without overriding process variables, then synchronously discovers
+and caches models. Restart after changing settings. Discovery fallback
+retains priorities; request errors never trigger a provider switch.
+See [Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup) for detailed Enterprise setup.
 
-`tests/conftest.py` calls `load_dotenv()` at import time. Tests therefore load
-the ignored service `.env` automatically; existing process variables take
-precedence. Neither `config.py` nor `concept_explainer.py` loads `.env` itself.
-For the current application, provide `GOOGLE_API_KEY` in the process environment
-before startup, or use Uvicorn's environment-file option with the same app and
-port. `DATABASE_URL` alone does not make the HTTP routes use Postgres.
+### Environment Variables
 
-The service reads the Gemini key once when `concept_explainer.py` is imported.
-The key is never accepted in an HTTP request, stored in the FAISS index, or
-shown in Swagger UI. Set it before starting Uvicorn.
-
-**Windows PowerShell, current terminal only:**
-
-```powershell
-$env:GOOGLE_API_KEY = "your-gemini-api-key"
-```
-
-**Windows Command Prompt, current terminal only:**
-
-```bat
-set GOOGLE_API_KEY=your-gemini-api-key
-```
-
-**Persist for future Windows terminals:**
-
-```bat
-setx GOOGLE_API_KEY "your-gemini-api-key"
-```
-
-After using `setx`, open a new terminal before starting the service. Startup
-fails immediately with a clear `RuntimeError` if the variable is missing or
-empty. Do not commit API keys to source control, README files, or `.env`
-files that are not excluded from version control.
+- `.env.example` is the canonical reference for supported environment variables and their purposes; it contains no credentials.
+- `LLM_PROVIDER`: `gemini` by default, or `gemini_enterprise`; project presence does not select Enterprise.
+- `GOOGLE_API_KEY`: required in Developer mode only; never an HTTP request field.
+- `GOOGLE_CLOUD_PROJECT`: required in Enterprise mode only.
+- `GOOGLE_CLOUD_LOCATION`: Enterprise location; missing or blank defaults to `global`.
+- `GOOGLE_APPLICATION_CREDENTIALS`: ADC JSON path; runtime ADC can also be used.
+- `DATABASE_URL`: required for storage operations and the real database test, not current HTTP routes.
+- `AI_SERVICE_API_KEY`: reserved for future inbound ingestion authentication.
+- `AI_SERVICE_CALLBACK_SECRET`: reserved for future outbound callbacks.
 
 ---
 
@@ -668,6 +699,7 @@ correctly before testing other endpoints.
 ```json
 {
   "status": "ok",
+  "provider": "gemini_enterprise",
   "version": "1.2",
   "index_in_memory": false,
   "index_on_disk": true,
@@ -705,8 +737,8 @@ You will see all four endpoints listed. To test any endpoint:
 
 1. Click the endpoint name to expand it.
 2. Click **"Try it out"** (top right of the endpoint card).
-3. Fill in the displayed request fields. The Gemini key is already configured
-  in the server environment and is not a request field. For file uploads,
+3. Fill in the displayed request fields. Provider authentication is configured
+  on the server and is not a request field. For file uploads,
   click **"Choose File"**.
 4. Click **"Execute"**.
 5. The response appears below, along with the exact `curl` command used.
@@ -725,10 +757,13 @@ in the root uv environment, run:
 uv run pytest tests/ -q --tb=short
 ```
 
-The last verified result after Phase 2a was **5 passed, 2 deprecation warnings**.
-Three tests cover existing API-key behavior; two cover storage round-trip
-and missing-`DATABASE_URL` validation. The database test needs a reachable
-Supabase project with pgvector already enabled; it is not a mocked database test.
+The suite has 21 cases covering startup validation, provider selection,
+synchronous discovery, fallback logging, client construction, cached models,
+grounding responses, legacy wrapper arguments, route registration, and
+storage. The last run reported 20 passed, one database connection timeout,
+and two deprecation warnings. It preceded the location-default change to
+`global`; rerun before claiming current success. The database test needs
+reachable Postgres with pgvector enabled and is not mocked.
 
 `tests/conftest.py` sets the Windows SelectorEventLoop policy before other
 imports, then loads `.env` through python-dotenv. It creates a unique
@@ -745,6 +780,14 @@ launcher or starts using `db.py` in FastAPI on Windows, set the same selector
 policy before Uvicorn starts. The current production app does not use `db.py`.
 
 ---
+
+### Verification limits
+
+- SDK and LangChain constructors, discovery, and generation are mocked in provider tests.
+- Real ADC credential resolution and token refresh are not exercised by those tests.
+- Actual Vertex permissions, billing, quotas, and project model availability are not exercised.
+- PDF uploads and real FAISS embedding, persistence, and retrieval are not exercised by automated provider tests.
+- Grounding metadata edge cases, citation failures, malformed JSON, and empty SDK responses are not covered by the happy-path tests.
 
 ## Example Test Inputs
 
@@ -954,16 +997,16 @@ uv pip install --upgrade "google-genai>=1.67.0"
 
 **`400` or `403` on `/explain-with-grounding` mentioning grounding not supported**
 
-Your API key may need Google Search Grounding enabled or billing configured
-in your Google Cloud project. Check quota settings at
-[https://aistudio.google.com](https://aistudio.google.com). Grounding
-requires at least the Pay-as-you-go tier in some regions.
+Check the selected provider. For Enterprise, verify ADC, project access,
+API enablement, billing, and `GOOGLE_CLOUD_LOCATION=global` following
+[Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup). For Developer mode, check the key and
+quota in [AI Studio](https://aistudio.google.com).
 
 **`413 Request Entity Too Large` on `/upload-note`**
 
 Your PDF exceeds 50 MB. Upload a focused set of lecture slides rather than
 a full textbook. To raise the limit, change `MAX_UPLOAD_SIZE_MB` at the
-top of `concept_explainer.py`.
+top of `routes/legacy.py`.
 
 **`400 Bad Request`: "No lecture notes found"**
 
@@ -992,8 +1035,8 @@ Port 8010 is occupied by another process. Two options:
 
 **`RuntimeError`: DATABASE_URL environment variable is not set**
 
-Storage validation needs `DATABASE_URL`. Tests load `.env` from their fixture;
-the application does not load it automatically. Check the configured variable
+Storage validation needs `DATABASE_URL`. Application configuration and
+tests load `.env`; existing process variables take precedence. Check the configured variable
 without printing its value, and use the bare Postgres URL described above.
 
 **`ModuleNotFoundError`: No module named 'psycopg'**
@@ -1018,30 +1061,41 @@ output free of credentials.
 
 ---
 
+**Provider configuration fails at startup**
+
+Unknown `LLM_PROVIDER` values are rejected. Developer mode requires
+`GOOGLE_API_KEY`; Enterprise requires `GOOGLE_CLOUD_PROJECT`. Invalid ADC
+or denied permissions can surface during discovery or generation rather
+than configuration validation. Follow [Gemini Enterprise Agent Platform (formerly Vertex AI) Setup](#gemini-enterprise-agent-platform-formerly-vertex-ai-setup).
+
 ## Project Structure
 
-```
+```text
 akadverse-concept-explainer/
-│
-├── concept_explainer.py                  # Existing FastAPI app and legacy FAISS routes
-├── config.py                             # Storage environment validation
-├── db.py                                 # Async Postgres engine and session factory
-├── migrations/
-│   └── 001_pgvector_storage.sql           # Manual Phase 2a storage migration
-├── tests/
-│   ├── conftest.py                        # Windows policy, dotenv, isolated test schema
-│   ├── test_api_key_env.py                # Existing API-key tests
-│   └── test_db.py                         # Storage and configuration tests
-├── conftest.py                            # Existing root test configuration
-├── AGENTS.md                              # Service instructions and roadmap
-├── .env.example                           # Variable names with empty values
-├── requirements.txt                      # Python dependencies
-├── README.md                             # This file
-├── .gitignore                            # Excludes index folder and env files
-│
-└── akadverse_concept_faiss_index/        # Generated on first upload - DO NOT COMMIT
-    ├── index.faiss
-    └── index.pkl
+  main.py                         # FastAPI app, validation, router mounting
+  config.py                       # Storage/Gemini settings, dotenv, cached models
+  db.py                           # Independent async Postgres storage
+  routes/
+    grounding.py                  # Grounding with provider wiring
+    legacy.py                     # Existing FAISS routes with provider wiring
+  services/
+    gemini_provider.py            # Factory and synchronous Enterprise discovery
+    model_discovery.py            # Developer discovery and priorities
+  migrations/
+    001_pgvector_storage.sql      # Manual Phase 2a migration
+  tests/
+    conftest.py                   # Windows policy and isolated database fixture
+    test_api_key_env.py           # Startup validation
+    test_gemini_provider.py       # Discovery and wrapper mocks
+    test_db.py                    # Real storage checks
+    test_refactor.py              # Route registration
+  conftest.py                     # Existing root test configuration
+  AGENTS.md                       # Service instructions and roadmap
+  .env.example                    # Canonical environment-variable reference
+  requirements.txt                # Service dependencies
+  README.md                       # This file
+  .gitignore                      # Generated files and credential exclusions
+  akadverse_concept_faiss_index/   # Generated legacy index, never commit
 ```
 
 ---
@@ -1067,6 +1121,8 @@ and chat history for Phase 4, so delivery dates in the architecture handoff
 below require coordination before anyone builds against them.
 
 (a) **Architecture.** "Chat history is a separate phase. We ship ingestion first. Phase 2b delivers `/ingest` and `/documents/{id}`. Phase 3 delivers the retrieval endpoint and Stewart's chat history. Do not build against the retrieval endpoint yet."
+
+As of Phase 2b0, the service's outbound LLM calls go through Gemini Enterprise Agent Platform. This does not change the request or response contract; no integration changes required.
 
 (b) **Upload UI.** "Please enable DOCX and PPTX uploads in the lecturer UI. Please disable ZIP for now; ZIP support is deferred to a later phase."
 

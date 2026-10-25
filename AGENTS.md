@@ -33,7 +33,7 @@ Status:
 - [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
 - [x] Phase 2a: pgvector storage (replacing FAISS)
 - [x] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
-- [ ] Phase 2b0: Vertex AI provider switch (implemented; merge pending)
+- [ ] Phase 2b0: Dual-provider support implemented; current validation and merge pending
 - [ ] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
 - [ ] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [ ] Phase 2c: PDF / DOCX / PPTX extractors
@@ -50,18 +50,18 @@ to the next phase until the current one is complete, tested, and merged.
 The code you are working with may not yet match the target state. Known
 legacy items to migrate or delete, in order of phase:
 
-- `FAISS_INDEX_PATH` constant and `_vector_store` global: replace with pgvector (2a)
-- Imports of `langchain_community.vectorstores.FAISS`: remove (2a)
+- `FAISS_INDEX_PATH` constant and `_vector_store` global: retain until retirement (2e)
+- Imports of `langchain_community.vectorstores.FAISS`: remove (2e)
 - Global `faiss_lock`: remove once FAISS is gone (2a)
 - `time.sleep()` in embedding batches: replace with `asyncio.sleep()` (2b)
 - `print()` calls for logging: replace with `logging` module (2b)
 - `POST /upload-note` and `POST /explain-concept`: retire (2e)
 
 If you see any of these, treat them as legacy. Do not add features to them.
-Migrate or delete as part of the current phase.
+Retain legacy code until its scheduled phase; 2b0 changes only provider wiring.
 
 `POST /explain-with-grounding` is NOT legacy. It stays unchanged.
-Do not modify it unless explicitly asked.
+Phase 2b0 authorizes provider-only wiring; preserve its prompt, parsing, citations, and HTTP contract.
 
 ## Endpoints to build (Phase 2 target state)
 
@@ -239,7 +239,7 @@ CREATE TABLE concept_explainer.jobs (
 CREATE INDEX ON concept_explainer.jobs (status, created_at);
 ```
 
-**FAISS is gone.** Delete `akadverse_concept_faiss_index/`, the
+**FAISS remains in the current runtime until Phase 2e.** In 2e, delete `akadverse_concept_faiss_index/`, the
 `FAISS_INDEX_PATH` constant, and every import of
 `langchain_community.vectorstores.FAISS`. Also delete the `faiss-cpu` line
 from `requirements.txt` once the migration is complete.
@@ -331,47 +331,50 @@ Reject unsupported types with:
 
 ## Environment variables
 
-| Var | Purpose | Required |
+`.env.example` is the canonical reference. `config.py` loads `.env` without
+overriding process variables. `main.py` loads Gemini settings and performs
+synchronous discovery once; `lifespan()` validates the selected provider.
+
+| Var | Purpose | Required now |
 |---|---|---|
-| `GOOGLE_API_KEY` | Gemini API key (embeddings) | Yes |
-| `DATABASE_URL` | Supabase Postgres connection string | Yes |
-| `AI_SERVICE_API_KEY` | Inbound auth (AkadVerse to us) | Yes |
-| `AI_SERVICE_CALLBACK_SECRET` | Outbound auth (us to AkadVerse) | Yes |
-| `LOG_LEVEL` | Python log level, defaults to `INFO` | No |
+| `LLM_PROVIDER` | Explicit `gemini` default or `gemini_enterprise` | Optional |
+| `GOOGLE_API_KEY` | Developer authentication | Developer only |
+| `GOOGLE_CLOUD_PROJECT` | Enterprise project | Enterprise only |
+| `GOOGLE_CLOUD_LOCATION` | Enterprise location, default `global` | Optional |
+| `GOOGLE_APPLICATION_CREDENTIALS` | ADC JSON path; runtime ADC also supported | Deployment dependent |
+| `DATABASE_URL` | Storage and real database tests | Storage only |
+| `AI_SERVICE_API_KEY` | Future inbound ingestion authentication | When ingestion lands |
+| `AI_SERVICE_CALLBACK_SECRET` | Future outbound callbacks | When callbacks land |
 
-All required vars are read once at startup in `config.py` and validated in
-`lifespan()`. The service MUST refuse to start if any are missing, with a
-clear error naming the missing variable.
-
-Do NOT read or log the values. Do NOT read the user's `.env` file to check
-contents. If a value appears in a log line, that is a bug.
-
-**Note on secrets:** the callback secret shared in chat during planning
-must be rotated before any production deployment. Do not commit any `.env`
-file. `.env.example` contains only the variable names and empty values.
+Do not read or log secret values or inspect the user's `.env`. Do not commit
+`.env` or credential files. Rotate the previously shared callback secret
+before deployment. The example has non-secret provider/location defaults;
+credential fields remain empty.
 
 ## Target file structure (build incrementally, per sub-phase)
 
-The current `concept_explainer.py` is a single 500-line file. Split it as
-each sub-phase lands. Do NOT create the full tree in one shot; add files
+Phase 2b1 extracted `main.py` and routers; 2b0 adds shared provider wiring.
+Add future files only as each sub-phase lands. Do NOT create the full tree in one shot; add files
 per sub-phase so each diff stays reviewable.
 
 ```
 akadverse-concept-explainer/
 |-- AGENTS.md
 |-- main.py                       # FastAPI app + lifespan + router mounting (2b)
-|-- config.py                     # Settings from env, startup validation (2a)
+|-- config.py                     # Storage/Gemini settings and model cache (2a, 2b0)
 |-- auth.py                       # Bearer token dependency (2b)
 |-- db.py                         # SQLAlchemy async engine, session factory (2a)
 |-- models.py                     # Pydantic request/response schemas (2b)
 |-- routes/
 |   |-- ingest.py                 # POST /ingest (2b)
 |   |-- documents.py              # DELETE /documents/{id} (2d)
-|   `-- grounding.py              # POST /explain-with-grounding (moved unchanged)
+|   |-- legacy.py                 # Existing FAISS routes, provider wiring only
+|   `-- grounding.py              # Grounding with the same HTTP contract
 |-- workers/
 |   `-- ingestion.py              # Job loop, re-queue on startup (2b)
 |-- services/
-|   |-- model_discovery.py        # Shared Gemini model discovery (2b1)
+|   |-- model_discovery.py        # Developer discovery (2b1)
+|   |-- gemini_provider.py        # Factory and Enterprise discovery (2b0)
 |   |-- extractors/
 |   |   |-- pdf.py                # (2c)
 |   |   |-- docx.py               # (2c)
@@ -381,6 +384,10 @@ akadverse-concept-explainer/
 |   `-- callback.py               # Outbound POST with retry (2d)
 |-- tests/
 |   |-- conftest.py               # Root fixture: async client, test DB (2a)
+|   |-- test_api_key_env.py       # Provider startup checks
+|   |-- test_gemini_provider.py   # Discovery and wrapper mocks
+|   |-- test_db.py                # Real isolated storage checks
+|   |-- test_refactor.py          # Route registration
 |   |-- test_auth.py              # (2b)
 |   |-- test_ingest.py            # (2b)
 |   |-- test_extractors.py        # (2c)
@@ -408,12 +415,12 @@ endpoints unchanged.
 Add `auth.py`, `models.py`, `migrations/002_jobs_table.sql`, and
 `routes/ingest.py`. Wire the jobs table and return `202 Accepted` only.
 
-**Phase 2b0: Vertex AI provider switch.** Runs before 2b2. Grounded
-generation uses Enterprise when GOOGLE_CLOUD_PROJECT is configured, or
-Developer API otherwise. LLM_PROVIDER can explicitly select gemini or
-gemini_enterprise. Use ADC for Enterprise authentication. This phase may
-change grounding client construction, discovery, and async SDK invocation,
-but preserves its HTTP contract. Legacy FAISS routes remain unchanged.
+**Phase 2b0: Gemini Enterprise Agent Platform (formerly Vertex AI) provider switch.** Runs before 2b2. Explicit
+`LLM_PROVIDER=gemini_enterprise` selects Enterprise; `gemini` is the default.
+Unknown values fail startup. Both SDK grounding and LangChain legacy calls
+use the selected provider. Preserve all business logic and FAISS code.
+`/health` adds only `provider`. Discovery is synchronous in settings loading,
+not an async lifecycle task. No ingestion, migrations, jobs, or worker work.
 
 **Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion.**
 Add `services/embedding.py` and `workers/ingestion.py`. Wire end-to-end PDF
@@ -439,9 +446,9 @@ The same applies when the FastAPI app itself starts using `db.py` on Windows.
 
 - **Framework:** pytest + `httpx.AsyncClient` via `httpx.ASGITransport`
 - **Command:** `uv run pytest tests/ -q --tb=short`
-- **Async tests:** `pytest-asyncio` with `asyncio_mode = "auto"` in
-  `pyproject.toml`
-- **Mock everything external:** Gemini SDK (`monkeypatch` the embed method),
+- **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
+- **Provider mocks:** synchronous SDK discovery, constructors, async generation, and LangChain wrappers. The database acceptance test is real.
+- **Future ingestion mocks:** embedding methods,
   Supabase signed-URL fetch (`respx` or `httpx.MockTransport`), callback
   POST (`respx`)
 - **Per-endpoint minimum:** one happy path, one auth-failure test, one
@@ -459,7 +466,11 @@ The same applies when the FastAPI app itself starts using `db.py` on Windows.
 
 ### Code hygiene
 
-Routers use a dependency injection pattern: `make_<name>_router(api_key)` returns an `APIRouter` subclass whose `.deps` is a `TypedDict` with callables such as `embeddings` and `vector_store`. Routes read dependencies through `.deps` at call time rather than importing module-level state. `main.py` reads `GOOGLE_API_KEY` at module level and passes it into the factories; `importlib.reload(main)` re-executes the read and rebuilds the routers. Follow this pattern for `/ingest` in 2b2.
+`main.py` builds Gemini settings once and passes them to both router
+factories. `LegacyRouter.legacy_dependencies` exposes typed embedding and
+vector-store callables resolved at request time. Both routers use cached
+settings model selection. Keep provider arguments separate from business
+logic and preserve existing monkeypatch seams when changing wiring.
 
 Smallest-change rule for Pylance and lint fixes: fix warnings with the smallest possible change. Do not introduce new classes, abstractions, or design patterns unless the warning genuinely requires it. If a warning cannot be given the most recommended fix with a type annotation or a one-line accessor, stop and ask before proceeding.
 
@@ -489,7 +500,7 @@ green:
   these. If they need a change, surface it to the developer first
 - Do not add a `/query` or `/explain` endpoint yet. That is Phase 3
 - Do not add ZIP support yet. That is Phase 3
-- Do not touch `/explain-with-grounding`
+- Preserve grounding business logic; 2b0 permits provider/client/model wiring only
 - Do not add JWT verification or any user auth to this service. The Next.js
   backend handles user auth
 - Do not add Redis, Celery, RabbitMQ, or any external queue. The Postgres
@@ -533,20 +544,24 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-**Do the smoke tests before any real work.** In a fresh Codex session, run these two prompts in sequence. Do not write code until both pass.
+Validate 2b0 after the global-location change and merge it before starting
+2b2. Complete the global embedding verification first. Do not extend legacy
+routes or build student retrieval in this phase.
 
-**Smoke test 1:**
+## Phase 2b0 decision record
 
-> Read both AGENTS.md files. In one paragraph, tell me what this service does, what phase it is in, and what you would build next. Do not write any code.
+Provider selection is explicit, matching the orchestrator. Enterprise uses
+`genai.Client(enterprise=True, project=..., location=...)`; Developer uses
+`genai.Client(api_key=...)`. LangChain uses `vertexai=True` plus project and
+location, or `vertexai=False` plus the Developer key. Discovery runs
+synchronously in settings loading and caches models. Enterprise discovery
+returns a ranked list, logs credential-safe fallback warnings, and returns
+priorities on failure. Developer discovery remains in `model_discovery.py`.
+No request failure silently switches providers. `/health.provider` reports
+configuration, not verified ADC or permissions. Enterprise priorities are
+`gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3.5-flash`, and
+`gemini-3.8-flash`; this list does not prove project availability.
 
-You want Codex to say: this is the AkadVerse concept explainer on port 8010, it is in Phase 2 (ingestion rewrite), next step is Phase 2a (pgvector migration). It should **not** say anything about extending `/upload-note` or building `/explain-concept`.
+## Global-location embedding verification before ingestion
 
-**Smoke test 2:**
-
-> Open `concept_explainer.py`. List every piece of code in it that is marked as legacy in the AGENTS.md and would need to be removed or replaced during Phase 2. Do not modify anything yet.
-
-You want Codex to name: FAISS imports, `FAISS_INDEX_PATH`, `_vector_store`, `faiss_lock`, `time.sleep()`, `print()` calls, `/upload-note`, `/explain-concept`. If it misses any of these or names something that is not on the list, the AGENTS.md is not being read properly and you should stop and debug that before proceeding.
-
-**If both pass:** come back and I will write the Phase 2a prompt (pgvector migration) calibrated for Codex. That phase is small and self-contained, and it will confirm whether Codex is following the file structure and phase discipline as intended before you hand it the bigger Phase 2b work.
-
-**One last thing:** the `[file content begin]` blocks you have been pasting include a raw `AI_SERVICE_CALLBACK_SECRET` value. Do not copy that into `.env` locally either, even for testing. Generate a fresh one with `openssl rand -hex 32`, use that for your dev environment, and tell the FSE to rotate theirs before production. The one in chat is now treated as public.
+Before Phase 2b2 embedding calls are implemented, verify Gemini embedding models are served at `GOOGLE_CLOUD_LOCATION=global`. If they are not, the embedding service will need per-operation location handling. Do not implement 2b2 without this verification.
