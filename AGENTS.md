@@ -12,7 +12,7 @@ Python package and project manager used: uv
 Two concerns live in this service:
 
 1. **Ingestion** (current focus): accept lecturer-uploaded course documents,
-   chunk and embed them into pgvector, report results via callback.
+   chunk and embed them into pgvector. Callback delivery is planned for 2d.
 2. **Retrieval** (future): given a course offering and week, retrieve chunks
    and answer student questions. NOT yet implemented. Do not build it unless
    explicitly asked.
@@ -25,15 +25,15 @@ and you should surface the conflict to the developer before proceeding.
 ## Current phase
 
 **Phase 2: Ingestion rewrite.** The old FAISS-based endpoints are being
-retired and replaced with the contract below. Everything in this document
-describes the target state, not the current code state.
+retired and replaced incrementally. Current implementation and the remaining
+target contracts are labeled separately below.
 
 Status:
 
 - [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
-- [x] Phase 2a: pgvector storage (replacing FAISS)
+- [x] Phase 2a: pgvector storage (legacy FAISS retained until 2e)
 - [x] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
-- [x] Phase 2b0: Dual-provider support implemented; current validation and merge pending
+- [x] Phase 2b0: Dual-provider support implemented and validated
 - [x] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
 - [x] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [x] Phase 2c: PDF / DOCX / PPTX extractors
@@ -45,27 +45,45 @@ Status:
 Update this checklist when a phase or sub-phase is merged. Do not proceed
 to the next phase until the current one is complete, tested, and merged.
 
-## What the current code looks like (may be stale)
+## Current implementation: Phase 2c
 
-The code you are working with may not yet match the target state. Known
-legacy items to migrate or delete, in order of phase:
+The checkout includes `f2f7334` (`feat(2c): add DOCX and PPTX extractors`).
+Phase 2d is next. Do not implement it without an explicit task.
 
-- `FAISS_INDEX_PATH` constant and `_vector_store` global: retain until retirement (2e)
-- Imports of `langchain_community.vectorstores.FAISS`: remove (2e)
-- Global `faiss_lock`: remove once FAISS is gone (2a)
-- `time.sleep()` in embedding batches: replace with `asyncio.sleep()` (2b)
-- `print()` calls for logging: replace with `logging` module (2b)
-- `POST /upload-note` and `POST /explain-concept`: retire (2e)
+- `/ingest` requires Enterprise mode, a ready database, and shared-secret auth.
+  It returns 202 after durable queue admission, before document processing.
+- Workers download and extract PDF/DOCX/PPTX, chunk at 1000/200, embed through
+  Enterprise, and atomically replace document chunks in pgvector.
+- `services.extractors.extract_text(file_path: str, mime_type: str) -> str`
+  dispatches to per-format `extract_text(file_path: str) -> str` functions.
+  `services/extractors/errors.py` owns `ExtractionError`. Services never import
+  workers; `workers/ingestion.py` imports `extract_text` from `services.extractors`.
+- `services.chunking.chunk_text(text: str) -> list[str]` owns splitting.
+  The worker runs blocking extraction/chunking through `asyncio.to_thread`.
+- Extraction errors become failed jobs with their safe message capped at 500
+  characters. A failed chunk replacement rolls back and retains previous chunks.
+- Callback delivery and the delete endpoint are not implemented. Only
+  `callback.would_fire` is logged. `done` currently means chunks were committed.
+- Legacy `/upload-note` and `/explain-concept` still use FAISS. New ingestion
+  does not feed them. Grounding remains independent and unchanged.
+- `run.py` already provides the Windows selector-loop setup on port 8010.
+- Latest full-suite verification on 26 October 2026: 86 passed, two existing
+  deprecation warnings. Focused results: 21 worker tests and 20 extractor tests.
+  These tests do not establish live Cloud model access or callback delivery.
 
-If you see any of these, treat them as legacy. Do not add features to them.
-Retain legacy code until its scheduled phase; 2b0 changes only provider wiring.
+## Legacy retention boundary
 
-`POST /explain-with-grounding` is NOT legacy. It stays unchanged.
-Phase 2b0 authorizes provider-only wiring; preserve its prompt, parsing, citations, and HTTP contract.
+Retain the FAISS index constant, vector-store global, lock, imports, and routes
+until Phase 2e. Legacy blocking sleeps and print statements are existing debt;
+do not expand or refactor them during extractor or callback work without scope
+approval. New ingestion uses async I/O, async sleep, and logging.
 
-## Endpoints to build (Phase 2 target state)
+`POST /explain-with-grounding` is retained. Preserve its prompt, parsing,
+citations, provider wiring, and HTTP contract unless explicitly authorized.
 
-### `POST /ingest`
+## Endpoint contracts: current and planned
+
+### `POST /ingest` (implemented; current queue semantics below)
 
 Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`
 
@@ -98,27 +116,29 @@ Behavior:
 
 1. Validate Bearer token with `secrets.compare_digest` against `AI_SERVICE_API_KEY`
 2. Reject `application/zip` and any MIME type outside the supported list (see File Type Support)
-3. Upsert a `jobs` row keyed by `document_id` (idempotency key). If a row exists, reset it to `queued` and increment `attempts`
+3. Upsert a `jobs` row keyed by `document_id` (idempotency key). A new row starts queued with attempts zero. A duplicate requeues the existing row and increments attempts but retains its original payload, including signed URL and metadata. Claiming also increments attempts. Do not describe a duplicate request as refreshing the URL or replacing the payload.
 4. Return `202 Accepted` with `{"status": "queued", "document_id": "..."}` immediately
 5. Background worker picks up the job (see Jobs section below)
 
-Background worker steps per job:
+Background worker steps per job (current Phase 2c):
 
-1. Mark job `processing` in the DB
-2. Download the file from `file_url` with a 60 second timeout
-3. Validate size (reject if larger than 20 MB; the FSE caps uploads at 8 MB, this is a safety net)
-4. Detect type from the `mime_type` field, not by sniffing
-5. Extract text with the correct extractor
-6. If extraction yields no text, fail the job with a user-friendly error like "No extractable text (scanned PDF?)"
-7. Chunk with `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)`
-8. Embed each chunk with Gemini, batched at 10 chunks per call, with `await asyncio.sleep(8)` between batches
-9. `DELETE FROM concept_explainer.chunks WHERE document_id = $1` (idempotency, safe to re-run)
-10. Insert new chunks with `metadata` copied verbatim from the request
-11. Delete the temp file in a `finally` block
-12. POST to `callback_url` with the result payload
-13. Mark job `done` on success, or `failed` with the error message on failure
+1. Atomically claim a queued job, mark processing, and increment attempts.
+2. Download `file_url` to a UUID-prefixed temp path with a 60-second timeout.
+3. Enforce the 20 MB streamed-byte limit, independent of the legacy 50 MB limit.
+4. Select the extractor from the declared MIME type, not filename sniffing.
+5. Extract usable text or raise a safe `ExtractionError`.
+6. Chunk with `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)`.
+7. Embed up to 10 chunks per request, with `await asyncio.sleep(8)` between batches.
+8. In one transaction, delete existing chunks for the document, insert new chunks
+   with the validated request metadata, and mark the job done.
+9. Log completion and `callback.would_fire`; do not send a callback yet.
+10. On failure, mark failed with a safe message capped at 500 characters.
+11. Delete the temp file in `finally` on either outcome.
 
-### `DELETE /documents/{document_id}`
+The Phase 2d callback delivery requirements are specified separately below.
+They do not describe current job completion behavior.
+
+### `DELETE /documents/{document_id}` (Phase 2d target; not implemented)
 
 Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`
 
@@ -128,7 +148,7 @@ Behavior:
 2. `DELETE FROM concept_explainer.chunks WHERE document_id = $1`
 3. Return `204 No Content` on success
 4. Return `404 Not Found` if zero rows were deleted. AkadVerse treats both 204 and 404 as success
-5. Do NOT enqueue a job. This is a synchronous operation
+5. Do NOT enqueue a job. Complete the deletion within the HTTP request using async database I/O
 
 ### `POST /explain-with-grounding`
 
@@ -136,7 +156,7 @@ Behavior:
 the database and is not part of the ingestion flow. Do not modify it while
 working on any Phase 2 sub-phase.
 
-### Retired endpoints (delete in Phase 2e)
+### Legacy endpoints still active (delete in Phase 2e)
 
 - `POST /upload-note`: replaced by `POST /ingest`
 - `POST /explain-concept`: replaced by a future retrieval endpoint in Phase 3
@@ -144,9 +164,9 @@ working on any Phase 2 sub-phase.
 Do not add features to these. Do not fix bugs in these. Delete them in
 Phase 2e once `/ingest` is working and tested end-to-end.
 
-## Outbound callback (this service to AkadVerse)
+## Outbound callback (Phase 2d target; not implemented)
 
-Triggered by the background worker after every job completes or fails.
+Planned delivery after job completion or failure. Today the worker only logs `callback.would_fire`; the required inbound `callback_url` is stored but not called. The rules below are the future contract, not implemented retry behavior.
 
 ```
 POST {callback_url}
@@ -169,10 +189,10 @@ Rules:
 | AkadVerse to this service | `Authorization: Bearer ...` | `AI_SERVICE_API_KEY` |
 | This service to AkadVerse | `Authorization: Bearer ...` | `AI_SERVICE_CALLBACK_SECRET` |
 
-- Both are shared secrets set in `.env` on each side. Generate with `openssl rand -hex 32`
+- Both are shared secrets configured privately on each side; only the inbound secret is consumed today. Generate with `openssl rand -hex 32`
 - Compare with `secrets.compare_digest()` (or `crypto.timingSafeEqual` in Node). Never use `==` for token comparison
 - **No JWT verification inside this service.** The Next.js backend handles user auth and verifies the caller is a student or lecturer before calling this service. This service trusts any request that presents the correct shared secret
-- If the secret is missing or the comparison fails, return `401 Unauthorized` with `{"detail": "Unauthorized"}`. Do not leak which part failed
+- Current inbound behavior: missing database or shared-secret configuration returns 503; unavailable ingestion also returns 503. With ingestion ready, a missing or incorrect Bearer token returns `401 Unauthorized` with `{"detail": "Unauthorized"}`. Developer mode is rejected with 503 by middleware. Do not expose credential values
 
 ## Storage
 
@@ -221,7 +241,7 @@ COMMIT;
 
 #### Phase 2b additions
 
-Add the jobs table and its index in Phase 2b. They are not part of the
+Migration 002 already creates the jobs table and its index. They are not part of the
 Phase 2a storage migration.
 
 ```sql
@@ -246,36 +266,36 @@ from `requirements.txt` once the migration is complete.
 
 ## Jobs table and background worker
 
-Worker count is set via `WORKER_COUNT` env var, default 1. Rate limit guidance: each worker sends ~75 embedding calls/minute. Enterprise tier supports up to ~10 concurrent workers safely. Developer API free tier should not exceed 1 worker (75 RPM vs 100 RPM limit). Do not raise `WORKER_COUNT` without verifying rate limits.
+`WORKER_COUNT` is a positive integer, default 1, validated at startup. Changing
+it requires a restart. `main.py` starts that many asyncio tasks only when
+Enterprise ingestion is ready; Developer mode disables ingestion entirely.
+Each worker processes one job at a time and polls an empty queue every two
+seconds. Shutdown cancels and awaits all worker tasks, then disposes the engine.
 
-The FSE's contract requires async processing with callback delivery. Jobs
-MUST survive a process restart. Do NOT use in-memory `JOBS: Dict` (that
-pattern from the root AGENTS.md is for ephemeral tasks only and does NOT
-apply here).
+Do not promise a fixed safe concurrency or requests-per-minute quota. The
+embedding service sends at most 10 chunks per API request and waits eight
+seconds between batches; actual throughput depends on latency, document size,
+and project/model quota. Increasing workers increases aggregate load.
 
-### Job lifecycle
+Jobs survive process restarts in Postgres. Do not use an in-memory jobs dict,
+Redis, Celery, or an external queue. Callback retry rules remain Phase 2d work.
 
-- `queued`: waiting for the worker
-- `processing`: worker is running (with attempt count incremented)
-- `done`: callback delivered successfully
-- `failed`: retries exhausted or unrecoverable error
+### Job lifecycle (current)
 
-### Worker loop
+- `queued`: waiting for a worker.
+- `processing`: claimed with attempts incremented.
+- `done`: chunks replaced and completion committed in the same transaction.
+- `failed`: processing error stored in `last_error`, capped at 500 characters.
 
-A single `asyncio.Task` runs for the service lifetime:
+Failed jobs are not automatically retried. Duplicate admission requeues them
+with their original payload. The embedding client requests one SDK attempt.
+A worker database failure stops the affected task and disables ingestion;
+there is no automatic task restart. Callback delivery is not implied by `done`.
 
-```
-async def worker_loop():
-    while True:
-        job = await claim_next_queued_job()
-        if job is None:
-            await asyncio.sleep(2)
-            continue
-        await process_job(job)
-```
+### Worker claims
 
-`claim_next_queued_job` runs a `SELECT ... FOR UPDATE SKIP LOCKED` query
-so multiple workers (if ever scaled) do not collide:
+`claim_next_queued_job` uses `FOR UPDATE SKIP LOCKED` so concurrent workers
+claim different queued rows:
 
 ```sql
 UPDATE concept_explainer.jobs
@@ -292,7 +312,7 @@ RETURNING *;
 
 ### Startup recovery
 
-On service start, re-queue any job stuck in `processing` for more than 5
+Once during service startup, re-queue any job stuck in `processing` for more than 5
 minutes. This handles the case where the process crashed mid-job:
 
 ```sql
@@ -302,14 +322,14 @@ WHERE status = 'processing'
   AND updated_at < now() - interval '5 minutes';
 ```
 
-Run this once during `lifespan()` startup, before starting the worker loop.
+This already runs during `lifespan()` startup before worker tasks are created. It is not a periodic recovery sweep.
 
 ## File handling rules (critical - the FSE will reject PRs that violate these)
 
 1. Download the file from `file_url` to a temp path with a UUID prefix (`/tmp/{uuid4().hex}_{filename}`)
 2. Process it, then **delete the temp file immediately** in a `finally` block, whether the job succeeded or failed
 3. **Never** delete or modify the file in Supabase. You have a read-only signed URL. You do not have Supabase write credentials and you must never ask for them
-4. The signed URL expires after 1 hour. If a job is stuck in the queue longer than that, the download will 403. Fail the job with "Signed URL expired, retry needed" and let the FSE's Retry button re-issue a fresh URL
+4. Treat signed-URL expiry as an external storage setting, not a worker guarantee. A download 403 fails with "Signed URL expired, retry needed". Duplicate admission currently retains the old URL, so do not promise a fresh-URL retry without coordinating the queue payload contract.
 5. **Treat document text as untrusted.** Never `eval()`, never execute, never pass it as an instruction to the LLM without clear delimiting (see Retrieval section in Phase 3). Chunk text is data, not code
 
 ## File type support
@@ -318,12 +338,20 @@ DOCX extraction is paragraph-first, then tables. Interleaved document order is n
 
 | MIME type | Extract with | Status |
 |---|---|---|
-| `application/pdf` | `pypdf` (direct `PdfReader` preferred over `PyPDFLoader`) | Supported |
+| `application/pdf` | `pypdf.PdfReader` in `services/extractors/pdf.py` | Supported |
 | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (DOCX) | `python-docx` | Supported |
 | `application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX) | `python-pptx` | Supported |
 | `application/zip` | N/A | **Rejected with 422** |
 
-ZIP support is deferred to Phase 3. Reject ZIP before downloading the file
+DOCX includes paragraph text followed by table cell text. PPTX includes slide
+shape text frames plus non-empty notes from existing notes slides; checking
+`has_notes_slide` must not create notes as a side effect. There is no OCR.
+Empty PDF text raises `ExtractionError("No extractable text (scanned PDF?)")`;
+DOCX/PPTX use `No extractable text in DOCX` or `No extractable text in PPTX`.
+Corrupt-file errors must not expose paths. The dispatcher raises the same shared
+error for unknown MIME types; route validation rejects them before enqueueing.
+
+ZIP support is deferred; no ZIP implementation is authorized in Phase 2c or 2d. Reject ZIP before downloading the file
 so you never waste bandwidth on an unsupported archive. The FSE has been
 asked to disable ZIP uploads in the UI.
 
@@ -346,7 +374,7 @@ synchronous discovery once; `lifespan()` validates the selected provider.
 | `GOOGLE_CLOUD_PROJECT` | Enterprise project | Enterprise only |
 | `GOOGLE_CLOUD_LOCATION` | Enterprise location, default `global` | Optional |
 | `GOOGLE_APPLICATION_CREDENTIALS` | ADC JSON path; runtime ADC also supported | Deployment dependent |
-| `DATABASE_URL` | Postgres storage for `/ingest` (Phase 2b2) and the ingestion worker (Phase 2b3); absent: `/health.ingest_status` is `disabled (missing DATABASE_URL)` | Required for ingestion |
+| `DATABASE_URL` | Postgres storage for `/ingest` and workers; in Enterprise mode, absent configuration reports `disabled (missing DATABASE_URL)` | Required for ingestion |
 | `AI_SERVICE_API_KEY` | Shared secret for inbound `/ingest` authentication, implemented in Phase 2b2 | Required for ingestion |
 | `AI_SERVICE_CALLBACK_SECRET` | Reserved for future outbound callbacks (Phase 2d); callback delivery is not yet implemented | Not required until Phase 2d |
 | `WORKER_COUNT` | Ingestion worker tasks, default `1`; restart required after change | Optional |
@@ -358,14 +386,15 @@ credential fields remain empty.
 
 ## Target file structure (build incrementally, per sub-phase)
 
-Phase 2b1 extracted `main.py` and routers; 2b0 adds shared provider wiring.
+Phases through 2c are implemented. The tree below includes future files only where explicitly labeled 2d.
 Add future files only as each sub-phase lands. Do NOT create the full tree in one shot; add files
 per sub-phase so each diff stays reviewable.
 
 ```
 akadverse-concept-explainer/
 |-- AGENTS.md
-|-- main.py                       # FastAPI app + lifespan + router mounting (2b)
+|-- main.py                       # FastAPI app + lifespan + router mounting
+|-- run.py                        # Windows-compatible launcher, port 8010
 |-- config.py                     # Storage/Gemini settings and model cache (2a, 2b0)
 |-- auth.py                       # Bearer token dependency (2b)
 |-- db.py                         # SQLAlchemy async engine, session factory (2a)
@@ -381,27 +410,34 @@ akadverse-concept-explainer/
 |   |-- model_discovery.py        # Developer discovery (2b1)
 |   |-- gemini_provider.py        # Factory and Enterprise discovery (2b0)
 |   |-- extractors/
+|   |   |-- __init__.py           # MIME dispatcher (2c)
+|   |   |-- errors.py             # ExtractionError (2c)
 |   |   |-- pdf.py                # (2c)
 |   |   |-- docx.py               # (2c)
 |   |   `-- pptx.py               # (2c)
 |   |-- chunking.py               # (2c)
-|   |-- embedding.py              # Gemini embedding, retry/backoff (2b)
+|   |-- embedding.py              # Enterprise batch embedding, no retries (2b3)
 |   `-- callback.py               # Outbound POST with retry (2d)
 |-- tests/
-|   |-- conftest.py               # Root fixture: async client, test DB (2a)
+|   |-- conftest.py               # Isolated DB and generated Office fixtures
 |   |-- test_api_key_env.py       # Provider startup checks
 |   |-- test_gemini_provider.py   # Discovery and wrapper mocks
 |   |-- test_db.py                # Real isolated storage checks
 |   |-- test_refactor.py          # Route registration
 |   |-- test_auth.py              # (2b)
 |   |-- test_ingest.py            # (2b)
-|   |-- test_extractors.py        # (2c)
+|   |-- test_extractors.py        # Pure extraction and chunking (2c)
+|   |-- test_worker.py            # Worker and concurrency regression tests
+|   |-- test_worker_extractors.py # Office extraction with real DB inserts
+|   |-- test_embedding.py         # Embedding batches and validation
+|   |-- fixtures/sample.pdf       # Committed PDF fixture
 |   |-- test_delete.py            # (2d)
 |   `-- test_callback.py          # (2d)
 |-- conftest.py                   # Empty, already present
-|-- pyproject.toml
 `-- requirements.txt
 ```
+
+The root `../pyproject.toml` owns the uv environment; it is not inside this service.
 
 ## Sub-phase scope (do not mix)
 
@@ -431,9 +467,8 @@ not an async lifecycle task. No ingestion, migrations, jobs, or worker work.
 Add `services/embedding.py` and `workers/ingestion.py`. Wire end-to-end PDF
 ingestion.
 
-**Phase 2c: extractors.** Add `services/extractors/*` and
-`services/chunking.py`. Wire them into the worker. Add unit tests per
-extractor.
+**Phase 2c: extractors (complete).** Added `services/extractors/*` and
+`services/chunking.py`, wired into the worker, with extractor and worker integration tests.
 
 **Phase 2d: delete + callback.** Add `routes/documents.py` and
 `services/callback.py`. Wire the callback into the worker's completion path.
@@ -444,18 +479,16 @@ extractor.
 
 ## Testing
 
-Windows: the test suite requires a SelectorEventLoop. `tests/conftest.py`
-sets the policy at import time. When Phase 2b creates `run.py` or any
-other process launcher, include the same policy setup before uvicorn runs.
-The same applies when the FastAPI app itself starts using `db.py` on Windows.
+Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
+`run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
+Preserve this policy in any future process launcher.
 
 - **Framework:** pytest + `httpx.AsyncClient` via `httpx.ASGITransport`
 - **Command:** `uv run pytest tests/ -q --tb=short`
 - **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
 - **Provider mocks:** synchronous SDK discovery, constructors, async generation, and LangChain wrappers. The database acceptance test is real.
-- **Future ingestion mocks:** embedding methods,
-  Supabase signed-URL fetch (`respx` or `httpx.MockTransport`), callback
-  POST (`respx`)
+- **Current ingestion tests:** mocked downloads/embeddings with real PDF/DOCX/PPTX extraction and isolated Postgres inserts. Embedding service tests mock SDK calls. Callback delivery tests belong to Phase 2d.
+- **Fixtures:** committed `tests/fixtures/sample.pdf` (allowed by the PDF ignore exception); DOCX/PPTX generated with writer APIs in `tests/conftest.py`.
 - **Per-endpoint minimum:** one happy path, one auth-failure test, one
   malformed-input test
 - **DB tests:** use a separate test schema and roll it back in a fixture.
@@ -504,8 +537,8 @@ green:
   `/documents/{id}`, or the callback. The FSE has already built against
   these. If they need a change, surface it to the developer first
 - Do not add a `/query` or `/explain` endpoint yet. That is Phase 3
-- Do not add ZIP support yet. That is Phase 3
-- Preserve grounding business logic; 2b0 permits provider/client/model wiring only
+- Do not add ZIP support without an explicitly approved later phase
+- Preserve grounding business logic and HTTP behavior unless explicitly authorized
 - Do not add JWT verification or any user auth to this service. The Next.js
   backend handles user auth
 - Do not add Redis, Celery, RabbitMQ, or any external queue. The Postgres
@@ -543,15 +576,15 @@ direct, opinionated, willing to say "this is the wrong approach and here is
 why". Prefer boring, durable choices over clever ones. If you are unsure
 between two approaches, name both and recommend the one that fails more
 loudly when it fails. Silent failure is worse than loud failure.
-```
 
 ---
 
 ## What to do next
 
-Validate 2b0 after the global-location change and merge it before starting
-2b2. Complete the global embedding verification first. Do not extend legacy
-routes or build student retrieval in this phase.
+Phase 2c is complete. Next is Phase 2d: the document delete endpoint and
+callback client, following the planned contracts above after explicit scope
+approval. Do not retire legacy routes (2e), implement retrieval (3), chat history
+(4), or ZIP support as part of 2d.
 
 ## Phase 2b0 decision record
 
@@ -567,6 +600,16 @@ configuration, not verified ADC or permissions. Enterprise priorities are
 `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, `gemini-3.5-flash`, and
 `gemini-3.8-flash`; this list does not prove project availability.
 
-## Global-location embedding verification before ingestion
+## Current embedding configuration
 
-Before Phase 2b2 embedding calls are implemented, verify Gemini embedding models are served at `GOOGLE_CLOUD_LOCATION=global`. If they are not, the embedding service will need per-operation location handling. Do not implement 2b2 without this verification.
+`config.py` sets `EMBEDDING_MODEL="gemini-embedding-2"`,
+`EMBEDDING_LOCATION="global"`, 768 dimensions, batches of 10, and an eight-second
+inter-batch delay. `services/embedding.py` uses these explicit constants with
+Enterprise ADC; it does not dynamically discover embedding models or inherit
+the generation location override. SDK retry attempts are set to one.
+
+The automated tests verify configuration, batching, and vector validation using
+mocked SDK responses. They do not prove live project model access or quota.
+Verify those operational prerequisites before deployment. The old pre-2b2
+embedding-verification instruction is historical, not a blocker to reimplement
+already completed ingestion.
