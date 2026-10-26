@@ -14,6 +14,20 @@ from uuid import uuid4
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def callback_dns(monkeypatch):
+    """Keep ingestion admission tests independent of public DNS and local secrets."""
+    import socket
+    from routes import ingest
+
+    async def resolve(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", "example.com")
+    monkeypatch.setenv("AI_SERVICE_CALLBACK_SECRET", "test-callback-secret")
+    monkeypatch.setattr(ingest, "resolve_callback_host", resolve)
+
+
 @pytest.fixture
 def storage_session():
     @asynccontextmanager

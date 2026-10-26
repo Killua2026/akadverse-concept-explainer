@@ -151,3 +151,58 @@ def test_queued_job_and_duplicate(storage_session, body):
             assert await session.scalar(text(f"SELECT count(*) FROM {schema}.jobs")) == 1
 
     asyncio.run(check())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("allowed", [None, "", "   ", " , "])
+async def test_missing_callback_allowlist_disables_ingestion(configured, body, monkeypatch, allowed):
+    import main
+    from config import GeminiSettings
+
+    if allowed is None:
+        monkeypatch.delenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", raising=False)
+    else:
+        monkeypatch.setenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", allowed)
+    monkeypatch.setattr(main, "gemini_settings", GeminiSettings(
+        llm_provider="gemini_enterprise", google_cloud_project="test"
+    ))
+    recover = AsyncMock()
+    monkeypatch.setattr(main, "recover_stuck_jobs", recover)
+    async with main.lifespan(main.app):
+        assert main.app.state.ingest_status == "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"
+        assert main.app.state.worker_tasks == []
+        response = await post(main.app, body)
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Ingestion is not configured on this service. Contact the AI team."}
+    recover.assert_not_awaited()
+    app, session = configured
+    assert (await post(app, body)).status_code == 503
+    assert app.state.ingest_status == "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_callback_host_not_allowed(configured, body, monkeypatch):
+    app, session = configured
+    monkeypatch.setenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", "staging.akadverse.com")
+    response = await post(app, body)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "callback_url host not allowed"}
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("host,address", [
+    ("example.com", "93.184.216.34"), ("localhost", "127.0.0.1"), ("127.0.0.1", "127.0.0.1"),
+])
+async def test_callback_host_allowed(configured, body, monkeypatch, host, address):
+    import socket
+    from routes import ingest
+    app, session = configured
+    monkeypatch.setenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", f" {host.upper()} , staging.akadverse.com")
+    monkeypatch.setattr(ingest, "resolve_callback_host", AsyncMock(return_value=[
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))
+    ]))
+    body["callback_url"] = f"https://{host}/callback"
+    assert (await post(app, body)).status_code == 202
+    session.commit.assert_awaited_once()

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import httpx
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 from fastapi.responses import JSONResponse
@@ -13,6 +14,8 @@ from db import Database
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from routes.ingest import router as ingest_router
+from routes.documents import router as documents_router
+from services.callback import CallbackSettings
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,12 @@ async def configure_ingestion(application: FastAPI) -> None:
         return
     if not os.getenv("AI_SERVICE_API_KEY", "").strip():
         application.state.ingest_status = "disabled (missing AI_SERVICE_API_KEY)"
+        return
+    if not os.getenv("AI_SERVICE_CALLBACK_SECRET", "").strip():
+        application.state.ingest_status = "disabled (missing AI_SERVICE_CALLBACK_SECRET)"
+        return
+    if not any(host.strip() for host in os.getenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", "").split(",")):
+        application.state.ingest_status = "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"
         return
     try:
         database = Database(StorageSettings.from_env())
@@ -59,6 +68,10 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     worker_count = get_worker_count()
     application.state.worker_count = worker_count
     application.state.worker_tasks = []
+    callback_client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+    application.state.callback_client = callback_client
+    callback_settings = CallbackSettings.from_env()
+    application.state.callback_settings = callback_settings
     def worker_log_context(record):
         if record.getMessage() == "worker.started":
             task = asyncio.current_task()
@@ -87,7 +100,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
                 worker_logger.addFilter(worker_log_context)
                 worker_logging_enabled = True
                 application.state.worker_tasks = [
-                    asyncio.create_task(worker_loop(application.state.ingest_database, gemini_settings))
+                    asyncio.create_task(worker_loop(application.state.ingest_database, gemini_settings, callback_client, callback_settings))
                     for _ in range(worker_count)
                 ]
                 application.state.worker_status = "running"
@@ -112,6 +125,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await callback_client.aclose()
         if worker_logging_enabled:
             worker_logger.removeFilter(worker_log_context)
         database = application.state.ingest_database
@@ -144,6 +158,7 @@ app.include_router(legacy_router)
 grounding_router = make_grounding_router(GOOGLE_API_KEY, settings=gemini_settings)
 app.include_router(grounding_router)
 app.include_router(ingest_router)
+app.include_router(documents_router)
 
 
 @app.middleware("http")

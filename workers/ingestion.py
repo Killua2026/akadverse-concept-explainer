@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import GeminiSettings, WORKER_POLL_SECONDS
 from db import Database
 from services.embedding import embed_chunks
+from services.callback import CallbackSettings, post_callback
 from services.chunking import chunk_text
 from services.extractors import extract_text
 from services.extractors.errors import ExtractionError
@@ -66,7 +68,18 @@ async def download_file(url: str, path: Path) -> None:
     await asyncio.wait_for(stream(), timeout=60)
 
 
-async def process_job(database: Database, settings: GeminiSettings, job) -> None:
+def sanitize_error(message: str) -> str:
+    """Discard likely paths or leaked content before storing user-facing errors."""
+    message = " ".join(message.split())
+    if any(marker in message for marker in ("\\", "/home/", "/tmp/", "/var/")) or re.search(
+        r"(?<![A-Za-z])(?:[A-Za-z]{21,}\s+){3}[A-Za-z]{21,}(?![A-Za-z])", message
+    ):
+        return "Processing failed (see server logs)"
+    return message[:500]
+
+
+async def process_job(database: Database, settings: GeminiSettings, job,
+                      callback_client: httpx.AsyncClient, callback_settings: CallbackSettings) -> None:
     path = None
     stage = "Document validation"
     try:
@@ -94,22 +107,48 @@ async def process_job(database: Database, settings: GeminiSettings, job) -> None
                     "VALUES (:document_id, :content, CAST(:embedding AS vector), CAST(:metadata AS jsonb))"
                 ), {"document_id": job["document_id"], "content": chunk,
                     "embedding": json.dumps(vector), "metadata": json.dumps(payload["metadata"])})
-            await session.execute(text("UPDATE concept_explainer.jobs SET status='done', last_error=NULL, updated_at=now() WHERE id=:id"), {"id": job["id"]})
+            finalized = (await session.execute(text(
+                "UPDATE concept_explainer.jobs SET status='done', updated_at=now() "
+                "WHERE id=:job_id AND status='processing' RETURNING id"
+            ), {"job_id": job["id"]})).scalar_one_or_none()
+            if finalized is None:
+                await session.execute(text("DELETE FROM concept_explainer.chunks WHERE document_id=:document_id"),
+                                      {"document_id": job["document_id"]})
+        if finalized is None:
+            logger.info("job.cancelled_during_processing", extra={"document_id": job["document_id"]})
+            return
         logger.info("job.completed", extra={"document_id": job["document_id"]})
-        logger.info("callback.would_fire", extra={"document_id": job["document_id"], "status": "ingested", "chunk_count": len(chunks)})
     except Exception as error:
         safe_messages = { "Signed URL expired, retry needed", "File exceeds the 20 MB limit."}
         message = str(error) if isinstance(error, ExtractionError) or (isinstance(error, ValueError) and str(error) in safe_messages) else f"{stage} failed. Retry needed."
+        message = sanitize_error(message)
         async with database.sessions() as session, session.begin():
-            await session.execute(text("UPDATE concept_explainer.jobs SET status='failed', last_error=:error, updated_at=now() WHERE id=:id"), {"id": job["id"], "error": message[:500]})
+            finalized = (await session.execute(text(
+                "UPDATE concept_explainer.jobs SET status='failed', last_error=:error, updated_at=now() "
+                "WHERE id=:job_id AND status='processing' RETURNING id"
+            ), {"job_id": job["id"], "error": message})).scalar_one_or_none()
+        if finalized is None:
+            logger.info("job.cancelled_during_processing", extra={"document_id": job["document_id"]})
+            return
         logger.warning("job.failed", extra={"document_id": job["document_id"]})
-        logger.info("callback.would_fire", extra={"document_id": job["document_id"], "status": "failed", "error": message[:500]})
+        callback_body = {"status": "failed", "error": message}
+    else:
+        callback_body = {"status": "ingested", "chunk_count": len(chunks)}
     finally:
         if path is not None:
             await asyncio.to_thread(path.unlink, missing_ok=True)
+    # Delivery is outside the processing exception handler and all DB transactions.
+    ok = await post_callback(
+        callback_client, url=payload["callback_url"], secret=callback_settings.callback_secret,
+        document_id=job["document_id"], **callback_body,
+    )
+    logger.info("job.callback_outcome", extra={
+        "document_id": job["document_id"], "status": callback_body["status"], "ok": ok,
+    })
 
 
-async def worker_loop(database: Database, settings: GeminiSettings) -> None:
+async def worker_loop(database: Database, settings: GeminiSettings, callback_client: httpx.AsyncClient,
+                      callback_settings: CallbackSettings) -> None:
     logger.info("worker.started")
     try:
         while True:
@@ -118,7 +157,7 @@ async def worker_loop(database: Database, settings: GeminiSettings) -> None:
                 await asyncio.sleep(WORKER_POLL_SECONDS)
                 continue
             logger.info("job.claimed", extra={"document_id": job["document_id"]})
-            await process_job(database, settings, job)
+            await process_job(database, settings, job, callback_client, callback_settings)
     except (SQLAlchemyError, OSError):
         logger.error("worker.db_unavailable")
         raise
