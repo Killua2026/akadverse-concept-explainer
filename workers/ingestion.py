@@ -1,4 +1,4 @@
-"""Single-pass PDF ingestion with short database transactions."""
+"""Single-pass document ingestion with short database transactions."""
 
 import asyncio
 import json
@@ -7,14 +7,15 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from config import GeminiSettings, WORKER_POLL_SECONDS
 from db import Database
 from services.embedding import embed_chunks
+from services.chunking import chunk_text
+from services.extractors import extract_text
+from services.extractors.errors import ExtractionError
 
 logger = logging.getLogger(__name__)
 CLAIM_SQL = """UPDATE concept_explainer.jobs
@@ -31,7 +32,6 @@ RECOVERY_SQL = """UPDATE concept_explainer.jobs
 SET status = 'queued', updated_at = now()
 WHERE status = 'processing'
   AND updated_at < now() - interval '5 minutes';"""
-OFFICE_ERROR = "DOCX/PPTX extraction is coming in Phase 2c; only PDF is processed in 2b3."
 
 
 async def recover_stuck_jobs(database: Database) -> None:
@@ -66,31 +66,19 @@ async def download_file(url: str, path: Path) -> None:
     await asyncio.wait_for(stream(), timeout=60)
 
 
-def extract_pdf(path: Path) -> str:
-    with path.open("rb") as handle:
-        reader = PdfReader(handle)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-
-
 async def process_job(database: Database, settings: GeminiSettings, job) -> None:
     path = None
     stage = "Document validation"
     try:
         payload = job["payload"]
-        if payload["mime_type"] != "application/pdf":
-            raise ValueError(OFFICE_ERROR)
         filename = str(payload["file_name"]).replace("\\", "/").split("/")[-1]
         path = Path("/tmp") / f"{uuid4().hex}_{filename}"
         await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
         stage = "Download"
         await download_file(payload["file_url"], path)
-        stage = "PDF extraction"
-        content = await asyncio.to_thread(extract_pdf, path)
-        if not content.strip():
-            raise ValueError("No extractable text (scanned PDF?)")
-        chunks = await asyncio.to_thread(
-            RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text, content
-        )
+        stage = "Document extraction"
+        content = await asyncio.to_thread(extract_text, path, payload["mime_type"])
+        chunks = await asyncio.to_thread(chunk_text, content)
         stage = "Embedding"
         vectors = await embed_chunks(chunks, settings)
         if len(vectors) != len(chunks):
@@ -110,8 +98,8 @@ async def process_job(database: Database, settings: GeminiSettings, job) -> None
         logger.info("job.completed", extra={"document_id": job["document_id"]})
         logger.info("callback.would_fire", extra={"document_id": job["document_id"], "status": "ingested", "chunk_count": len(chunks)})
     except Exception as error:
-        safe_messages = {OFFICE_ERROR, "No extractable text (scanned PDF?)", "Signed URL expired, retry needed", "File exceeds the 20 MB limit."}
-        message = str(error) if isinstance(error, ValueError) and str(error) in safe_messages else f"{stage} failed. Retry needed."
+        safe_messages = { "Signed URL expired, retry needed", "File exceeds the 20 MB limit."}
+        message = str(error) if isinstance(error, ExtractionError) or (isinstance(error, ValueError) and str(error) in safe_messages) else f"{stage} failed. Retry needed."
         async with database.sessions() as session, session.begin():
             await session.execute(text("UPDATE concept_explainer.jobs SET status='failed', last_error=:error, updated_at=now() WHERE id=:id"), {"id": job["id"], "error": message[:500]})
         logger.warning("job.failed", extra={"document_id": job["document_id"]})

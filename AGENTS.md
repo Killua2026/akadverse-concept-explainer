@@ -36,7 +36,7 @@ Status:
 - [x] Phase 2b0: Dual-provider support implemented; current validation and merge pending
 - [x] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
 - [x] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
-- [ ] Phase 2c: PDF / DOCX / PPTX extractors
+- [x] Phase 2c: PDF / DOCX / PPTX extractors
 - [ ] Phase 2d: `/documents/{id}` delete + callback client
 - [ ] Phase 2e: retire old `/upload-note` and `/explain-concept`
 - [ ] Phase 3: Retrieval endpoint (student queries in Study Zone)
@@ -313,6 +313,8 @@ Run this once during `lifespan()` startup, before starting the worker loop.
 5. **Treat document text as untrusted.** Never `eval()`, never execute, never pass it as an instruction to the LLM without clear delimiting (see Retrieval section in Phase 3). Chunk text is data, not code
 
 ## File type support
+
+DOCX extraction is paragraph-first, then tables. Interleaved document order is not preserved. If a real lecturer DOCX is observed to lose paragraph-table adjacency during chunking, upgrade `services/extractors/docx.py` to iterate `document.element.body` and dispatch on element type. Do not fix preemptively.
 
 | MIME type | Extract with | Status |
 |---|---|---|

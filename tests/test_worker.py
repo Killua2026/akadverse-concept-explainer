@@ -12,6 +12,7 @@ from pypdf import PdfWriter
 from sqlalchemy import text
 
 from config import GeminiSettings
+from db import Database
 from workers import ingestion
 
 
@@ -39,7 +40,6 @@ def test_multiple_workers_no_collision(monkeypatch, caplog):
     from uuid import uuid4
     from fastapi.testclient import TestClient
     from config import StorageSettings
-    from db import Database
     import main
 
     schema = f"concept_explainer_test_{uuid4().hex}"
@@ -49,7 +49,7 @@ def test_multiple_workers_no_collision(monkeypatch, caplog):
     ))
     monkeypatch.setattr(ingestion, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
     caplog.set_level(logging.INFO)
-    database = None
+    database: Database | None = None
     claimed = set()
     all_claimed = asyncio.Event()
     original_claim = ingestion.claim_next_queued_job
@@ -68,8 +68,8 @@ def test_multiple_workers_no_collision(monkeypatch, caplog):
 
     monkeypatch.setattr(ingestion, "claim_next_queued_job", claim)
     monkeypatch.setattr(ingestion, "download_file", download)
-    monkeypatch.setattr(ingestion, "extract_pdf", lambda path: path.name.split("_")[-1])
-    monkeypatch.setattr(ingestion, "RecursiveCharacterTextSplitter", Mock(return_value=SimpleNamespace(
+    monkeypatch.setattr("services.extractors.pdf.extract_text", lambda path: path.name.split("_")[-1])
+    monkeypatch.setattr("services.chunking.RecursiveCharacterTextSplitter", Mock(return_value=SimpleNamespace(
         split_text=lambda content: [f"{content} chunk {i}" for i in range(int(content[0]))]
     )))
     monkeypatch.setattr(ingestion, "embed_chunks", AsyncMock(
@@ -104,7 +104,9 @@ def test_multiple_workers_no_collision(monkeypatch, caplog):
     monkeypatch.setattr(main, "configure_ingestion", configure)
 
     async def wait_for_completion():
+        assert database is not None
         async def wait():
+            assert database is not None
             while True:
                 async with database.sessions() as session:
                     rows = (await session.execute(text(f"SELECT document_id,status,attempts FROM {schema}.jobs"))).all()
@@ -120,20 +122,23 @@ def test_multiple_workers_no_collision(monkeypatch, caplog):
         assert counts == {"job-1": 1, "job-2": 2, "job-3": 3}
 
     async def cleanup():
+        assert database is not None
         async with database.engine.begin() as connection:
             await connection.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
 
     with TestClient(main.app) as client:
+        portal = client.portal
+        assert portal is not None
         try:
             assert client.get("/health").json()["worker_count"] == 3
-            client.portal.call(wait_for_completion)
+            portal.call(wait_for_completion)
         finally:
             for task in main.app.state.worker_tasks:
-                client.portal.call(task.cancel)
+                portal.call(task.cancel)
             async def settle():
                 await asyncio.gather(*main.app.state.worker_tasks, return_exceptions=True)
-            client.portal.call(settle)
-            client.portal.call(cleanup)
+            portal.call(settle)
+            portal.call(cleanup)
     claims = Counter(record.document_id for record in caplog.records if record.getMessage() == "job.claimed")
     assert claims == {"job-1": 1, "job-2": 1, "job-3": 1}
     starts = [record.worker_index for record in caplog.records if record.getMessage() == "worker.started"]
@@ -171,7 +176,7 @@ def mock_pdf(monkeypatch, count=1):
     monkeypatch.setattr(ingestion, "download_file", download)
     monkeypatch.setattr(ingestion, "embed_chunks", AsyncMock(side_effect=lambda chunks, settings: [[0.5] * 768 for _ in chunks]))
     if count > 1:
-        monkeypatch.setattr(ingestion, "RecursiveCharacterTextSplitter", Mock(return_value=SimpleNamespace(split_text=lambda value: [f"New content {i}" for i in range(count)])))
+        monkeypatch.setattr("services.chunking.RecursiveCharacterTextSplitter", Mock(return_value=SimpleNamespace(split_text=lambda value: [f"New content {i}" for i in range(count)])))
     return paths
 
 
@@ -180,6 +185,7 @@ def test_claim_marks_processing(worker_database):
         async with worker_database() as (database, schema):
             await seed(database, schema)
             job = await ingestion.claim_next_queued_job(database)
+            assert job is not None
             assert job["status"] == "processing"
             assert job["attempts"] == 1
             assert await ingestion.claim_next_queued_job(database) is None
@@ -203,19 +209,6 @@ def test_pdf_end_to_end(worker_database, monkeypatch, caplog):
     assert any(r.message == "callback.would_fire" and r.status == "ingested" for r in caplog.records)
 
 
-@pytest.mark.parametrize("mime", ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.presentationml.presentation"])
-def test_docx_pptx_fail(worker_database, mime):
-    async def check():
-        async with worker_database() as (database, schema):
-            await seed(database, schema, mime)
-            await ingestion.process_job(database, GeminiSettings(), await ingestion.claim_next_queued_job(database))
-            async with database.sessions() as session:
-                row = (await session.execute(text(f"SELECT status,last_error FROM {schema}.jobs"))).one()
-                assert row.status == "failed"
-                assert row.last_error == ingestion.OFFICE_ERROR
-    asyncio.run(check())
-
-
 def test_recovery_requeues_stale_processing(worker_database):
     async def check():
         async with worker_database() as (database, schema):
@@ -223,7 +216,9 @@ def test_recovery_requeues_stale_processing(worker_database):
             async with database.sessions() as session, session.begin():
                 await session.execute(text(f"UPDATE {schema}.jobs SET status='processing', updated_at=now()-interval '6 minutes'"))
             await ingestion.recover_stuck_jobs(database)
-            assert (await ingestion.claim_next_queued_job(database))["status"] == "processing"
+            job = await ingestion.claim_next_queued_job(database)
+            assert job is not None
+            assert job["status"] == "processing"
             await ingestion.recover_stuck_jobs(database)
             assert await ingestion.claim_next_queued_job(database) is None
     asyncio.run(check())
@@ -282,7 +277,7 @@ async def test_db_failure_stops_worker(monkeypatch):
     claim = AsyncMock(side_effect=OperationalError("claim", {}, RuntimeError()))
     monkeypatch.setattr(ingestion, "claim_next_queued_job", claim)
     with pytest.raises(OperationalError):
-        await ingestion.worker_loop(None, GeminiSettings())
+        await ingestion.worker_loop(Mock(spec=Database), GeminiSettings())
     assert claim.await_count == 1
 
 
@@ -302,7 +297,7 @@ async def test_empty_queue_sleeps(monkeypatch):
     sleep = AsyncMock(side_effect=asyncio.CancelledError)
     monkeypatch.setattr(ingestion.asyncio, "sleep", sleep)
     with pytest.raises(asyncio.CancelledError):
-        await ingestion.worker_loop(None, GeminiSettings())
+        await ingestion.worker_loop(Mock(spec=Database), GeminiSettings())
     assert sleep.await_args_list == [call(2)]
 
 

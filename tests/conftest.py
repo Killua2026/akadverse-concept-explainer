@@ -81,3 +81,31 @@ def worker_database(storage_session, monkeypatch):
                 join_transaction_mode="create_savepoint",
             )), schema
     return isolated_worker
+
+
+@pytest.fixture
+def office_document(tmp_path):
+    """Generate small Office files without adding binary fixtures."""
+    def create(kind, paragraph="", table="", notes=""):
+        path = tmp_path / f"lecture.{kind}"
+        if kind == "docx":
+            from docx import Document
+            document = Document()
+            if paragraph:
+                document.add_paragraph(paragraph)
+            if table:
+                document.add_table(rows=1, cols=1).cell(0, 0).text = table
+            document.save(path)
+        else:
+            from pptx import Presentation
+            from pptx.util import Inches
+            document = Presentation()
+            if paragraph or notes:
+                slide = document.slides.add_slide(document.slide_layouts[6])
+                if paragraph:
+                    slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1)).text_frame.text = paragraph
+                if notes:
+                    slide.notes_slide.notes_text_frame.text = notes
+            document.save(path)
+        return path
+    return create

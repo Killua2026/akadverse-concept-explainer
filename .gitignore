@@ -93,3 +93,4 @@ Desktop.ini
 # Local settings
 *.env
 *.local
+!tests/fixtures/*.pdf
