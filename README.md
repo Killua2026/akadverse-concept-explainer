@@ -3,12 +3,14 @@
 FastAPI microservice for the AkadVerse Study Zone, reserved port **8010**.
 The intended caller is the Next.js backend, not a browser client.
 
-## Current status: Phase 2c complete
+## Current status: Phase 2d implemented and tested
 
-The current checkout includes Phase 2c (`f2f7334`): durable ingestion of PDF,
-DOCX, and PPTX documents into Supabase Postgres with pgvector. Configurable
-background workers process accepted jobs. Legacy FAISS endpoints and Google
-Search Grounding remain available.
+The current checkout includes Phase 2d (`9fbbf20`): authenticated document
+deletion and outbound callbacks, building on durable PDF/DOCX/PPTX ingestion
+into Supabase Postgres with pgvector. Configurable workers process accepted
+jobs. Legacy FAISS endpoints and Google Search Grounding remain available.
+This records local implementation and automated verification, not a verified
+remote merge, deployment, or live Next.js callback integration.
 
 | Capability | Current state |
 |---|---|
@@ -16,7 +18,7 @@ Search Grounding remain available.
 | Durable jobs and configurable workers | Implemented; startup recovery and concurrent claims |
 | PDF / DOCX / PPTX extraction | Implemented |
 | Shared chunking and Enterprise embeddings | Implemented |
-| Delete endpoint and outbound callback client | Next: Phase 2d; not implemented |
+| Delete endpoint and outbound callback client | Implemented; transactional deletion and bounded post-commit delivery |
 | Legacy FAISS endpoint retirement | Phase 2e; not implemented |
 | Retrieval over ingested pgvector chunks | Phase 3; not implemented |
 | Stewart chat history | Phase 4; not implemented |
@@ -24,8 +26,9 @@ Search Grounding remain available.
 
 `/ingest` writes pgvector chunks. It does not populate the legacy FAISS index,
 and `/explain-concept` does not retrieve the newly ingested pgvector chunks.
-Callbacks currently produce a `callback.would_fire` log only. A job marked
-`done` means its chunks were stored, not that a callback was delivered.
+Callbacks are posted after processing commits. A job marked `done` means its
+chunks were stored, not that a callback was delivered. Delivery failure does
+not change the committed job status or roll back chunks.
 
 ## Contents
 
@@ -36,6 +39,7 @@ Callbacks currently produce a `callback.would_fire` log only. A job marked
 - [API endpoints](#api-endpoints)
 - [Extraction and processing](#extraction-and-processing)
 - [Jobs and workers](#jobs-and-workers)
+- [Outbound callbacks](#outbound-callbacks)
 - [Testing](#testing)
 - [Troubleshooting](#troubleshooting)
 - [Project structure](#project-structure)
@@ -49,9 +53,13 @@ Current ingestion flow:
 Next.js backend -> POST /ingest -> Postgres jobs -> background worker
   -> signed-URL download -> MIME dispatcher -> PDF / DOCX / PPTX extraction
   -> chunking (1000 characters, 200 overlap) -> Enterprise embeddings
-  -> transaction: replace document chunks and mark job done
-  -> callback.would_fire log; temp file removed in finally
+  -> transaction: replace document chunks and conditionally mark job done
+  -> temp-file cleanup -> outbound callback using the shared HTTP client
 ```
+
+Processing failures commit a sanitized error before attempting a failed
+callback. DELETE removes document chunks and jobs in one transaction; workers
+detect cancellation during finalization and skip delivery.
 
 Separate explanation flows remain in place:
 
@@ -82,6 +90,11 @@ uv pip install -r requirements.txt
 Run that install again after synchronizing or updating the root environment;
 `uv run` does not automatically install the service's requirements file.
 The root project supplies pytest, httpx, and multipart support.
+Its dev group pins `pytest-timeout==2.4.0` and
+`sqlalchemy[asyncio]==2.1.4`; the latter keeps async SQLAlchemy's `greenlet`
+dependency installed during `uv sync`. Keep that pin synchronized with the
+service requirements. The service requirements also list pytest and
+pytest-timeout; synchronization does not replace installing service dependencies.
 
 Service requirements include FastAPI, Uvicorn, `google-genai>=1.67.0`,
 LangChain integrations, `langchain-text-splitters`, `faiss-cpu`, Pydantic,
@@ -102,7 +115,7 @@ uv run python run.py
 `run.py` sets the Windows SelectorEventLoop policy before Uvicorn starts,
 binds to `0.0.0.0:8010`, and selects the asyncio loop. It does not enable
 reload. Direct Uvicorn startup bypasses this Windows policy setup.
-Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the five current API
+Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the six current API
 operations and their request schemas. Port 8010 belongs to this service;
 consult the root `AGENTS.md` before choosing any other local testing port.
 
@@ -117,7 +130,8 @@ consult the root `AGENTS.md` before choosing any other local testing port.
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to an external ADC credential file; runtime ADC is also supported |
 | `DATABASE_URL` | Required for ingestion; private Postgres connection string |
 | `AI_SERVICE_API_KEY` | Required shared secret for inbound ingestion authentication |
-| `AI_SERVICE_CALLBACK_SECRET` | Reserved for Phase 2d; currently unused by a callback client |
+| `AI_SERVICE_CALLBACK_SECRET` | Required Bearer secret for outbound callbacks |
+| `AI_SERVICE_CALLBACK_ALLOWED_HOSTS` | Required comma-separated, exact callback hostnames; no wildcard matching |
 | `WORKER_COUNT` | Positive integer, default `1`; restart required after changes |
 
 Developer mode supports the existing explanation routes but disables ingestion
@@ -125,6 +139,13 @@ and workers. `/ingest` returns `503` with an Enterprise-mode requirement.
 A Cloud project setting alone does not select Enterprise mode. Unknown providers,
 missing required provider credentials/settings, and invalid worker counts fail
 startup validation.
+
+In Enterprise mode, ingestion requires non-empty `DATABASE_URL`,
+`AI_SERVICE_API_KEY`, `AI_SERVICE_CALLBACK_SECRET`, and
+`AI_SERVICE_CALLBACK_ALLOWED_HOSTS`. Missing settings report
+`disabled (missing VARIABLE_NAME)` through `ingest_status`; `/ingest` returns
+503 and workers do not start. An empty or comma/whitespace-only allowlist is
+missing configuration. These ingestion gates do not disable grounding.
 
 The implemented Enterprise path uses ADC with project and location. This
 service does not implement an Enterprise Express Mode API-key configuration.
@@ -202,9 +223,20 @@ Example request with illustrative, non-secret values:
 }
 ```
 
-All displayed request and metadata fields are required. The URL fields are
-validated as HTTP URLs. `callback_url` is required by the request schema even
-though outbound delivery is not implemented yet.
+All displayed request and metadata fields are required. `file_url` is validated
+as an HTTP URL. Before queueing, `callback_url` must use HTTPS, have no embedded
+credentials, and match an explicitly listed hostname. Host comparison ignores
+case and trims whitespace around allowlist entries; it does not match wildcards
+or implicitly authorize subdomains. The example requires `example.com` in the
+operator's allowlist; it is not a default authorized destination.
+
+Admission awaits DNS resolution with a two-second timeout. Listed hosts must
+resolve only to globally routable addresses, except explicitly listed
+`localhost` and `127.0.0.1`, which bypass the private-address guard for local
+development. HTTPS is still required for those local hosts. Invalid URLs,
+HTTP callbacks, unlisted hosts, and disallowed/unresolvable addresses return
+422 with a callback-specific detail. DNS is checked at admission, not pinned
+to the later connection, so this is not a guarantee against DNS rebinding.
 
 Success: HTTP `202`, `{"status":"queued","document_id":"lecture-001"}`.
 This confirms queue admission, not extraction or embedding success.
@@ -221,6 +253,21 @@ payload. The worker increments attempts again when claiming a job. Therefore,
 `attempts` is not purely a count of completed processing attempts. Reposting a
 changed signed URL does not replace the existing job's original URL today.
 
+### DELETE /documents/{document_id}
+
+Uses the same `require_ingest_auth` dependency and Bearer token as `/ingest`,
+including its configured/ready-state checks. The path parameter is a string.
+The request deletes matching chunks, then matching jobs, in one database
+transaction using async I/O. It does not enqueue work or delete the remote file.
+
+- `204 No Content`, with no body, if either table had matching rows.
+- `404 Not Found`, with `{"detail":"Document not found"}`, if neither did.
+- `401` for missing/wrong auth when ready; `503` for unavailable configuration
+  or database operations. Next.js treats both 204 and 404 as successful deletion.
+
+Other document IDs are untouched. An in-flight worker detects a removed job
+when its conditional finalization returns no row, as described below.
+
 ### GET /health
 
 Returns provider and legacy index status plus `ingest_status`, `worker_status`,
@@ -231,7 +278,8 @@ of currently healthy tasks. Startup probes the database with a two-second
 application timeout; health does not perform a fresh live LLM request.
 
 The response's embedded `endpoints` map still lists the four historical
-operations; `/ingest` is mounted and appears in OpenAPI despite that map omission.
+operations; `/ingest` and DELETE are mounted and appear in OpenAPI despite
+those map omissions.
 
 ### Existing explanation routes
 
@@ -291,10 +339,13 @@ verify the applicable quota before increasing concurrency.
 Startup recovers processing jobs older than five minutes by requeueing them,
 then launches `WORKER_COUNT` tasks. Each task claims one job at a time using
 `FOR UPDATE SKIP LOCKED`; an empty queue is polled every two seconds. Recovery
-runs at startup, not periodically. Shutdown cancels and awaits the tasks and
-disposes the database engine.
+runs at startup, not periodically. Lifespan creates one shared callback
+`httpx.AsyncClient` with `follow_redirects=False` and `trust_env=False`, stores
+it on `app.state.callback_client`, and passes it with `CallbackSettings` to
+every worker. Shutdown cancels and awaits all workers, closes that client,
+then disposes the database engine.
 
-| Status | Meaning in Phase 2c |
+| Status | Meaning in Phase 2d |
 |---|---|
 | `queued` | Waiting for a worker |
 | `processing` | Claimed; attempts incremented |
@@ -303,30 +354,92 @@ disposes the database engine.
 
 Chunk deletion, insertion, and marking the job done occur in one transaction.
 A failed insert rolls back replacement so previously stored chunks survive.
-`ExtractionError` messages are preserved up to 500 characters; other failures
-use approved safe messages. Callback logs are emitted for success or failure.
+Both done and failed finalization use `WHERE id=:job_id AND status='processing'
+RETURNING id`. If no row is returned, the worker logs
+`job.cancelled_during_processing` and sends no callback or failed update.
+The success path also deletes chunks it just wrote for the document in that
+transaction. Cancellation is not an additional persistent job status.
+
+Errors use safe stage messages or extraction messages, normalize whitespace,
+and reject backslashes, `/home/`, `/tmp/`, `/var/`, or four consecutive
+whitespace-separated alphabetic tokens each longer than 20 characters. Rejected messages become
+`Processing failed (see server logs)`. Accepted messages are capped once at
+500 characters; DB `last_error` and the failed callback reuse the same value.
 Failed jobs are not automatically retried; another admission request can requeue
 them with the original payload. Worker database failures stop the affected task
 and disable ingestion; no automatic worker restart is implemented.
+
+## Outbound callbacks
+
+`services/callback.py` owns `CallbackSettings` and
+`post_callback(client, *, url, secret, document_id, status, chunk_count=None,
+error=None) -> bool`. The worker uses the stored job payload's `callback_url`.
+The client never constructs its own HTTP client or accesses the database.
+It rechecks HTTPS, absence of URL credentials, exact host authorization, and
+a non-empty secret at delivery time, including for previously queued jobs.
+
+POST authentication is `Authorization: Bearer <AI_SERVICE_CALLBACK_SECRET>`.
+Success body: `{"document_id":"lecture-001","status":"ingested","chunk_count":42}`.
+Failure body: `{"document_id":"lecture-001","status":"failed","error":"Safe error"}`.
+Only the status-appropriate field is included, never both `chunk_count` and
+`error`. Callbacks run after the transaction and temp-file cleanup, outside the
+processing exception handler. The worker logs the Boolean delivery outcome.
+
+- Success requires HTTP 200 with a JSON object containing literal `"ok": true`.
+  Additional fields, including `"ignored":"unknown document_id"`, are allowed.
+- Three total attempts use backoff sleeps of one second, then four seconds.
+  Each request uses HTTPX's five-second timeout setting; this is not a strict
+  overall delivery deadline.
+- Retry 5xx, timeouts/connection errors, 3xx, unexpected 2xx, and 200 responses
+  with malformed JSON or without literal `"ok": true`.
+- Never follow callback redirects, including when a supplied client enables
+  them. A 4xx response returns False immediately without retries.
+- Exhaustion logs `callback.failed_permanent` and returns False. Authorization
+  or body validation failures also return False without sending a request.
+
+Callback service logs contain document ID, hostname only, processing status, attempt,
+HTTP status when available, and reason. They do not include the secret,
+Authorization header, full URL, or response body. `job.callback_outcome` records
+delivery success/failure without changing the committed job or chunks.
+
+Delivery is best effort: there is no durable callback outbox or later redelivery
+after exhaustion. A crash after DB commit and before delivery can lose the
+notification. Admission-time DNS checks are not repeated or pinned by the
+callback client; the required host allowlist is rechecked at delivery time.
 
 ## Testing
 
 From this service directory:
 
 ```powershell
-uv run pytest tests/ -q --tb=short
+uv run pytest tests/ -q --tb=short --timeout=30
 ```
 
-Latest full-suite verification on 26 October 2026: **86 passed**, with two
+Last successful full-suite verification on 26 October 2026: **164 passed**, with two
 existing deprecation warnings (Starlette/AnyIO and langchain-community).
-The latest worker-only verification reported **21 passed**; extractor-only
-verification reported **20 passed**.
+The callback suite has **54 tests**, the worker suite **31 tests**, and the pure
+extractor suite **20 tests**. These focused counts are part of the full suite;
+the callback suite was also run separately after its Pylance annotation fix.
+
+During the subsequent documentation verification on the same date, the full
+suite hit the 30-second timeout in
+`tests/test_db.py::test_pgvector_storage_round_trip`. That test also timed out
+when retried alone; the cause has not been established. The fresh independent
+callback/extractor run passed **74 tests**. The earlier 164-pass result is a
+historical successful baseline, not a claim that the latest full run passed.
+Recheck the database-backed suite before release or the next phase.
 
 Tests cover provider configuration, authentication, queue admission, embedding
 validation, extraction/dispatch, chunk boundaries, startup recovery, concurrent
-workers, document replacement, and safe worker failures. Worker integration
+workers, document replacement, safe worker failures, transactional deletion,
+strict callback response handling, retries, redirect refusal, and host
+authorization. Worker tests verify DB status at callback time, preserved status
+after delivery failure, and cancellation on both success and failure paths.
+Cancellation uses `asyncio.Event` barriers rather than timing sleeps.
+Worker integration
 uses real isolated Postgres inserts, real file extraction, mocked downloads,
-and mocked embeddings. The PDF fixture is committed at
+and mocked embeddings/callbacks. Delivery tests use `httpx.MockTransport`, not
+live webhook requests. The PDF fixture is committed at
 `tests/fixtures/sample.pdf`; DOCX/PPTX fixtures are generated programmatically.
 The PDF ignore exception is intentional.
 
@@ -344,11 +457,23 @@ legacy FAISS behavior is not an end-to-end live-service acceptance test.
 ## Troubleshooting
 
 - **Ingestion unavailable:** check `/health`, Enterprise selection, private
-  database/auth configuration, both migrations, and database reachability.
+  database/auth configuration, callback secret, required host allowlist, both
+  migrations, and database reachability.
+- **Callback URL rejected:** check HTTPS, exact hostname membership, and DNS.
+  Localhost/127.0.0.1 must be explicitly listed and still require HTTPS. An
+  empty allowlist disables ingestion instead of permitting arbitrary hosts.
+- **Callback delivery failed:** inspect `callback.attempt`,
+  `callback.failed_permanent`, and `job.callback_outcome`. The receiver must
+  return HTTP 200 with `{"ok":true}`; redirects are not followed and 4xx is
+  not retried. A done job can still have an undelivered callback.
 - **Windows Psycopg/Proactor error:** launch through `uv run python run.py`;
   do not switch to a synchronous driver to hide the loop configuration problem.
 - **Missing packages:** run `uv pip install -r requirements.txt` in the root uv
   environment. Locally installed Office packages do not replace declared pins.
+- **Database test timeout:** the latest documentation check timed out in the
+  real pgvector round-trip test, including an isolated retry. Check database
+  reachability and inspect the isolated test before treating the baseline as
+  freshly green; no application-code fix was made during the docs update.
 - **Expired download URL:** a download `403` records
   `Signed URL expired, retry needed`. Reposting the same ID currently retains
   the old payload; coordinate URL refresh behavior rather than assuming it updates.
@@ -373,11 +498,13 @@ akadverse-concept-explainer/
   db.py                        Async Postgres engine and session factory
   routes/
     ingest.py                  POST /ingest
+    documents.py               Transactional DELETE /documents/{document_id}
     grounding.py               Retained Google Search Grounding route
     legacy.py                  FAISS routes retained until Phase 2e
   workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
   services/
     embedding.py               Enterprise batch embeddings
+    callback.py                CallbackSettings and bounded authorized delivery
     chunking.py                Shared text splitting
     gemini_provider.py         Provider clients and Enterprise discovery
     model_discovery.py         Developer model discovery
@@ -394,7 +521,9 @@ akadverse-concept-explainer/
     conftest.py                Isolated database and generated Office fixtures
     test_api_key_env.py
     test_auth.py
+    test_callback.py
     test_db.py
+    test_delete.py
     test_embedding.py
     test_extractors.py
     test_gemini_provider.py
@@ -411,13 +540,19 @@ akadverse-concept-explainer/
 
 ## Integration and next steps
 
-The request contract requires a signed file URL and callback URL from Next.js.
-Until Phase 2d, inspect the job row and worker logs for results; there is no
-job-status HTTP endpoint or outbound callback implementation. Enable PDF,
-DOCX, and PPTX in lecturer integrations, and continue rejecting ZIP.
+Next.js supplies a signed file URL and an HTTPS callback URL whose hostname
+the operator has explicitly authorized. The receiver validates the shared
+Bearer secret and responds with HTTP 200 and `{"ok":true}`, including for an
+ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
+404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
+There is still no job-status HTTP endpoint.
 
-Phase 2d adds `DELETE /documents/{document_id}` and callback delivery using the
-existing planned contract in `AGENTS.md`. Neither route/client should be assumed
-to exist today. Phase 2e retires the FAISS endpoints, Phase 3 adds pgvector-based
-retrieval, and Phase 4 adds Stewart chat history. Rotate previously exposed
-shared secrets before deployment and exchange replacements privately.
+Phase 2d is implemented and tested in this checkout. Before deployment, verify
+the real receiver, TLS/DNS configuration, both shared secrets, allowlisted
+hosts, ADC/model access, and quotas without exposing credentials. Automated
+tests do not establish those live integration prerequisites or remote merge
+status. Rotate previously exposed secrets and exchange replacements privately.
+
+After Phase 2d is merged and the next scope is explicitly authorized, Phase 2e
+retires the FAISS endpoints. Phase 3 adds pgvector retrieval; Phase 4 adds
+Stewart chat history. Those later phases are not implemented by Phase 2d.
