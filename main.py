@@ -49,14 +49,10 @@ async def configure_ingestion(application: FastAPI) -> None:
         return
     application.state.ingest_status = "ready"
 
-from routes import legacy
 from routes.grounding import make_grounding_router
-from routes.legacy import make_legacy_router
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
-GoogleGenerativeAIEmbeddings = legacy.GoogleGenerativeAIEmbeddings
-_get_or_load_vector_store = legacy._get_or_load_vector_store
 
 @asynccontextmanager
 async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
@@ -112,12 +108,6 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
                     task.add_done_callback(worker_finished)
 
     print("[Startup] AkadVerse Concept Explainer initializing...")
-    print(f"[Startup] FAISS index path: '{legacy.FAISS_INDEX_PATH}'")
-    print(f"[Startup] Max upload size: {legacy.MAX_UPLOAD_SIZE_MB} MB")
-    if os.path.exists(legacy.FAISS_INDEX_PATH):
-        print("[Startup] Existing FAISS index found on disk — will load on first request.")
-    else:
-        print("[Startup] No existing index found — awaiting first PDF upload.")
     try:
         yield
     finally:
@@ -137,24 +127,14 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
 app = FastAPI(
     title="AkadVerse Concept Explainer API",
     description=(
-        "Tier 5 RAG-powered study assistant. Upload lecture notes as PDF, "
-        "then ask questions to receive structured pedagogical explanations. "
+        "Study assistant with durable PDF, DOCX, and PPTX ingestion. "
+        "Document retrieval is planned for Phase 3. "
         "Also supports web-grounded explanations via /explain-with-grounding."
     ),
     version="1.2",
     lifespan=lifespan
 )
 
-legacy_router = make_legacy_router(GOOGLE_API_KEY, settings=gemini_settings)
-# Resolve these module symbols at call time so existing test monkeypatches apply.
-# The router captures the API key separately, keeping environment reloads isolated.
-legacy_router.legacy_dependencies["embeddings"] = (
-    lambda *args, **kwargs: GoogleGenerativeAIEmbeddings(*args, **kwargs)
-)
-legacy_router.legacy_dependencies["vector_store"] = (
-    lambda embeddings: _get_or_load_vector_store(embeddings)
-)
-app.include_router(legacy_router)
 grounding_router = make_grounding_router(GOOGLE_API_KEY, settings=gemini_settings)
 app.include_router(grounding_router)
 app.include_router(ingest_router)
@@ -173,11 +153,7 @@ async def enterprise_ingestion_guard(request, call_next):
 
 @app.get("/health", tags=["System"])
 async def health_check():
-    """
-    Reports service status, FAISS index state, and available endpoints.
-    """
-    index_in_memory = legacy._vector_store is not None
-    index_on_disk = os.path.exists(legacy.FAISS_INDEX_PATH)
+    """Reports service status and available endpoints."""
 
     return {
         "status": "ok",
@@ -186,19 +162,12 @@ async def health_check():
         "worker_status": getattr(app.state, "worker_status", "disabled (ingest not configured)"),
         "worker_count": getattr(app.state, "worker_count", 0),
         "version": "1.2",
-        "index_in_memory": index_in_memory,
-        "index_on_disk": index_on_disk,
-        "rag_status": (
-            "Ready — index loaded." if index_in_memory
-            else "Ready — index on disk, loads on first question." if index_on_disk
-            else "Awaiting PDF upload via /upload-note."
-        ),
-        "grounding_status": "Ready — no PDF required for /explain-with-grounding.",
+        "grounding_status": "Requires shared-secret auth and ready ingestion for /explain-with-grounding.",
         "endpoints": {
-            "POST /upload-note": "Upload a PDF lecture note for RAG Q&A.",
-            "POST /explain-concept": "Ask a question answered from your uploaded notes.",
+            "POST /ingest": "Queue a course document for ingestion.",
+            "DELETE /documents/{id}": "Delete a document and its ingestion jobs.",
             "POST /explain-with-grounding": "Ask any question answered from live web search.",
-            "GET  /health": "This endpoint."
+            "GET /health": "This endpoint."
         }
     }
 

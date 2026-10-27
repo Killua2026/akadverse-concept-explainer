@@ -3,14 +3,11 @@
 FastAPI microservice for the AkadVerse Study Zone, reserved port **8010**.
 The intended caller is the Next.js backend, not a browser client.
 
-## Current status: Phase 2d implemented and tested
+## Current status: Phase 2e implemented
 
-The current checkout includes Phase 2d (`9fbbf20`): authenticated document
-deletion and outbound callbacks, building on durable PDF/DOCX/PPTX ingestion
-into Supabase Postgres with pgvector. Configurable workers process accepted
-jobs. Legacy FAISS endpoints and Google Search Grounding remain available.
-This records local implementation and automated verification, not a verified
-remote merge, deployment, or live Next.js callback integration.
+Phase 2e retires the legacy explanation endpoints and authenticates Google Search
+Grounding with the existing ingestion shared secret. Durable ingestion, document
+deletion, and callbacks remain unchanged. Retrieval is planned for Phase 3.
 
 | Capability | Current state |
 |---|---|
@@ -19,13 +16,12 @@ remote merge, deployment, or live Next.js callback integration.
 | PDF / DOCX / PPTX extraction | Implemented |
 | Shared chunking and Enterprise embeddings | Implemented |
 | Delete endpoint and outbound callback client | Implemented; transactional deletion and bounded post-commit delivery |
-| Legacy FAISS endpoint retirement | Phase 2e; not implemented |
+| Legacy endpoint retirement and grounding auth | Implemented in Phase 2e |
 | Retrieval over ingested pgvector chunks | Phase 3; not implemented |
 | Stewart chat history | Phase 4; not implemented |
 | ZIP ingestion | Rejected; deferred to a later phase |
 
-`/ingest` writes pgvector chunks. It does not populate the legacy FAISS index,
-and `/explain-concept` does not retrieve the newly ingested pgvector chunks.
+`/ingest` writes pgvector chunks. Retrieval over these chunks is not implemented.
 Callbacks are posted after processing commits. A job marked `done` means its
 chunks were stored, not that a callback was delivered. Delivery failure does
 not change the committed job status or roll back chunks.
@@ -61,12 +57,8 @@ Processing failures commit a sanitized error before attempting a failed
 callback. DELETE removes document chunks and jobs in one transaction; workers
 detect cancellation during finalization and skip delivery.
 
-Separate explanation flows remain in place:
-
-- Legacy: `/upload-note` accepts a PDF and builds a local FAISS index;
-  `/explain-concept` retrieves from that index and generates an explanation.
-- Grounding: `/explain-with-grounding` uses the selected Gemini provider and
-  Google Search, returning an explanation with cited sources.
+Grounding uses the selected Gemini provider and Google Search, returning an
+explanation with cited sources. It requires shared-secret authentication.
 
 Explanation responses contain `concept`, `simple_explanation`, `analogy`,
 `example`, and `worked_problem`. Grounding also returns `sources` entries
@@ -97,7 +89,7 @@ service requirements. The service requirements also list pytest and
 pytest-timeout; synchronization does not replace installing service dependencies.
 
 Service requirements include FastAPI, Uvicorn, `google-genai>=1.67.0`,
-LangChain integrations, `langchain-text-splitters`, `faiss-cpu`, Pydantic,
+`langchain-text-splitters`, Pydantic,
 `pypdf`, `python-docx==1.2.0`, `python-pptx==1.0.2`,
 `sqlalchemy[asyncio]==2.1.4`, `psycopg[binary]==3.2.6`, and
 `python-dotenv==1.0.1`. `requirements.txt` is authoritative for service pins.
@@ -115,7 +107,7 @@ uv run python run.py
 `run.py` sets the Windows SelectorEventLoop policy before Uvicorn starts,
 binds to `0.0.0.0:8010`, and selects the asyncio loop. It does not enable
 reload. Direct Uvicorn startup bypasses this Windows policy setup.
-Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the six current API
+Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the four current API
 operations and their request schemas. Port 8010 belongs to this service;
 consult the root `AGENTS.md` before choosing any other local testing port.
 
@@ -129,13 +121,12 @@ consult the root `AGENTS.md` before choosing any other local testing port.
 | `GOOGLE_CLOUD_LOCATION` | Enterprise generation/discovery location; default `global` |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to an external ADC credential file; runtime ADC is also supported |
 | `DATABASE_URL` | Required for ingestion; private Postgres connection string |
-| `AI_SERVICE_API_KEY` | Required shared secret for inbound ingestion authentication |
+| `AI_SERVICE_API_KEY` | Shared secret for ingestion, deletion, and grounding authentication |
 | `AI_SERVICE_CALLBACK_SECRET` | Required Bearer secret for outbound callbacks |
 | `AI_SERVICE_CALLBACK_ALLOWED_HOSTS` | Required comma-separated, exact callback hostnames; no wildcard matching |
 | `WORKER_COUNT` | Positive integer, default `1`; restart required after changes |
 
-Developer mode supports the existing explanation routes but disables ingestion
-and workers. `/ingest` returns `503` with an Enterprise-mode requirement.
+Developer mode disables ingestion and workers; grounding shares the ingestion readiness gate. `/ingest` returns `503` with an Enterprise-mode requirement.
 A Cloud project setting alone does not select Enterprise mode. Unknown providers,
 missing required provider credentials/settings, and invalid worker counts fail
 startup validation.
@@ -145,7 +136,7 @@ In Enterprise mode, ingestion requires non-empty `DATABASE_URL`,
 `AI_SERVICE_CALLBACK_ALLOWED_HOSTS`. Missing settings report
 `disabled (missing VARIABLE_NAME)` through `ingest_status`; `/ingest` returns
 503 and workers do not start. An empty or comma/whitespace-only allowlist is
-missing configuration. These ingestion gates do not disable grounding.
+missing configuration. Grounding shares the same configured/ready-state auth checks and returns 503 when ingestion is unavailable.
 
 The implemented Enterprise path uses ADC with project and location. This
 service does not implement an Enterprise Express Mode API-key configuration.
@@ -177,7 +168,7 @@ It does not own or modify another service's tables.
 Migration 001 creates the schema, pgvector prerequisite, chunks table, and
 indexes. Migration 002 creates durable jobs and the status/creation-time index.
 They are not automatically applied at application startup, and neither migrates
-existing FAISS data. `IF NOT EXISTS` supports reruns but does not reconcile
+data from retired local indexes. `IF NOT EXISTS` supports reruns but does not reconcile
 incompatible existing table definitions.
 
 The `chunks` table stores a generated ID, document ID, content, `vector(768)`
@@ -270,30 +261,24 @@ when its conditional finalization returns no row, as described below.
 
 ### GET /health
 
-Returns provider and legacy index status plus `ingest_status`, `worker_status`,
+Returns status, provider, version, grounding status, available endpoints, plus `ingest_status`, `worker_status`,
 and `worker_count`. In ready Enterprise mode these include `ready`, `running`,
 and the configured count. Disabled states identify missing ingestion settings,
 Developer mode, or database unavailability. The configured count is not a count
 of currently healthy tasks. Startup probes the database with a two-second
 application timeout; health does not perform a fresh live LLM request.
 
-The response's embedded `endpoints` map still lists the four historical
-operations; `/ingest` and DELETE are mounted and appear in OpenAPI despite
-those map omissions.
+The embedded `endpoints` map lists ingestion, document deletion, grounding, and health.
 
-### Existing explanation routes
+### POST /explain-with-grounding
 
-| Route | Input | Behavior |
-|---|---|---|
-| `POST /upload-note` | Multipart `file`, PDF only, maximum 50 MB | Legacy FAISS indexing; success includes filename, chunk count, and page count |
-| `POST /explain-concept` | Form `question` | Legacy FAISS retrieval and five-field explanation; returns `400` if notes are absent |
-| `POST /explain-with-grounding` | Form `question` | Gemini with Google Search; five-field explanation plus cited sources |
+Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`.
+Form field: `question`.
 
-The two FAISS routes remain available until Phase 2e. Do not build new
-integrations against them. Grounding is retained independently of ingestion.
-The local `akadverse_concept_faiss_index/` folder is generated legacy data and
-must not be committed. Removing it does not delete pgvector chunks or jobs.
-`[KAFKA MOCK]` logs do not implement Kafka or callback delivery.
+Uses `Depends(require_ingest_auth)`, the same shared secret and readiness checks
+as ingestion. Missing or incorrect auth returns 401 when ingestion is ready;
+missing configuration or unavailable ingestion returns 503. No new env var.
+Gemini with Google Search returns the five explanation fields and cited sources.
 
 ## Extraction and processing
 
@@ -322,8 +307,7 @@ of separator boundaries. Extraction and chunking run through `asyncio.to_thread`
 in the worker to keep blocking library work off the event loop.
 
 The worker downloads to `/tmp/<uuid>_<sanitized-basename>`, follows redirects,
-and enforces a 60-second download timeout and 20 MB byte limit. These limits
-belong to ingestion, separate from the legacy upload route's 50 MB limit.
+and enforces a 60-second download timeout and 20 MB byte limit. These limits belong to ingestion.
 The remote Supabase object is never deleted or modified. The temporary file
 is removed in `finally` on success or failure.
 
@@ -415,19 +399,11 @@ From this service directory:
 uv run pytest tests/ -q --tb=short --timeout=30
 ```
 
-Last successful full-suite verification on 26 October 2026: **164 passed**, with two
-existing deprecation warnings (Starlette/AnyIO and langchain-community).
-The callback suite has **54 tests**, the worker suite **31 tests**, and the pure
-extractor suite **20 tests**. These focused counts are part of the full suite;
-the callback suite was also run separately after its Pylance annotation fix.
-
-During the subsequent documentation verification on the same date, the full
-suite hit the 30-second timeout in
-`tests/test_db.py::test_pgvector_storage_round_trip`. That test also timed out
-when retried alone; the cause has not been established. The fresh independent
-callback/extractor run passed **74 tests**. The earlier 164-pass result is a
-historical successful baseline, not a claim that the latest full run passed.
-Recheck the database-backed suite before release or the next phase.
+Phase 2e full-suite verification is blocked by a 30-second timeout in the unchanged worker concurrency test; an isolated retry passed in 18.94 seconds.
+The suite removes three legacy cases and adds two grounding auth tests:
+164 - 1 obsolete API-key case - 2 legacy-wrapper cases + 2 auth cases = 163.
+The remaining run passed 162 tests with one deselected and one warning in
+201.23 seconds. All cases passed separately, but a full-suite pass is pending.
 
 Tests cover provider configuration, authentication, queue admission, embedding
 validation, extraction/dispatch, chunk boundaries, startup recovery, concurrent
@@ -451,8 +427,7 @@ service tables. `tests/conftest.py` sets the Windows selector policy.
 Always use `--tb=short`; traceback locals can expose secrets. If more detail is
 necessary, run only the failing test with `--tb=long` and redact before sharing.
 Automated tests do not establish live ADC access, model availability, Cloud
-quota, or actual callback delivery. Provider tests mock external generation;
-legacy FAISS behavior is not an end-to-end live-service acceptance test.
+quota, or actual callback delivery. Provider tests mock external generation.
 
 ## Troubleshooting
 
@@ -470,10 +445,8 @@ legacy FAISS behavior is not an end-to-end live-service acceptance test.
   do not switch to a synchronous driver to hide the loop configuration problem.
 - **Missing packages:** run `uv pip install -r requirements.txt` in the root uv
   environment. Locally installed Office packages do not replace declared pins.
-- **Database test timeout:** the latest documentation check timed out in the
-  real pgvector round-trip test, including an isolated retry. Check database
-  reachability and inspect the isolated test before treating the baseline as
-  freshly green; no application-code fix was made during the docs update.
+- **Database test timeout:** check database reachability and rerun the failing
+  test in isolation with short tracebacks before changing application code.
 - **Expired download URL:** a download `403` records
   `Signed URL expired, retry needed`. Reposting the same ID currently retains
   the old payload; coordinate URL refresh behavior rather than assuming it updates.
@@ -483,9 +456,6 @@ legacy FAISS behavior is not an end-to-end live-service acceptance test.
   location without exposing SDK exceptions or credentials.
 - **Port conflict:** stop the conflicting service on 8010 or consult the platform
   registry for an available testing port. Do not reuse another tool's reserved port.
-- **No legacy lecture notes:** `/explain-concept` requires its separate FAISS
-  upload path; successful `/ingest` processing does not satisfy it.
-
 ## Project structure
 
 ```text
@@ -500,7 +470,6 @@ akadverse-concept-explainer/
     ingest.py                  POST /ingest
     documents.py               Transactional DELETE /documents/{document_id}
     grounding.py               Retained Google Search Grounding route
-    legacy.py                  FAISS routes retained until Phase 2e
   workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
   services/
     embedding.py               Enterprise batch embeddings
@@ -527,6 +496,7 @@ akadverse-concept-explainer/
     test_embedding.py
     test_extractors.py
     test_gemini_provider.py
+    test_grounding.py
     test_ingest.py
     test_refactor.py
     test_worker.py
@@ -553,6 +523,5 @@ hosts, ADC/model access, and quotas without exposing credentials. Automated
 tests do not establish those live integration prerequisites or remote merge
 status. Rotate previously exposed secrets and exchange replacements privately.
 
-After Phase 2d is merged and the next scope is explicitly authorized, Phase 2e
-retires the FAISS endpoints. Phase 3 adds pgvector retrieval; Phase 4 adds
-Stewart chat history. Those later phases are not implemented by Phase 2d.
+Phase 2e retires the legacy endpoints and adds grounding auth. Phase 3 adds
+pgvector retrieval; Phase 4 adds Stewart chat history. Neither is implemented.

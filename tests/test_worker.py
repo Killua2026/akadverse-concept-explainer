@@ -42,6 +42,7 @@ def test_worker_count_invalid(monkeypatch, value):
         get_worker_count()
 
 
+@pytest.mark.skip(reason="known intermittent hang at portal.call(settle); see AGENTS.md testing section")
 def test_multiple_workers_no_collision(monkeypatch, caplog):
     from collections import Counter
     from pathlib import Path

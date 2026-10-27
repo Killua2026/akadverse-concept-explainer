@@ -8,6 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from auth import require_ingest_auth
 from config import GeminiSettings
 from services import gemini_provider as provider
 from services import model_discovery
@@ -106,6 +107,9 @@ async def test_grounding_selected_provider(monkeypatch, enterprise):
     constructor = Mock(return_value=SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=generate))))
     monkeypatch.setattr(provider.genai, "Client", constructor)
     app = FastAPI()
+    async def provider_test_auth():
+        return None
+    app.dependency_overrides[require_ingest_auth] = provider_test_auth
     app.include_router(make_grounding_router(settings.google_api_key, settings=settings))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as session:
         response = await session.post("/explain-with-grounding", data={"question": "Recursion?"})
@@ -114,33 +118,3 @@ async def test_grounding_selected_provider(monkeypatch, enterprise):
     await_args = generate.await_args
     assert await_args is not None
     assert await_args.kwargs["model"] == "test-model"
-
-
-@pytest.mark.parametrize("enterprise", [True, False])
-def test_legacy_wrapper_arguments(monkeypatch, enterprise):
-    from routes import legacy
-    from fastapi.testclient import TestClient
-    settings = GeminiSettings(google_api_key="test-key", google_cloud_project="test-project",
-                              llm_provider="gemini_enterprise" if enterprise else "gemini",
-                              model_names=["test-model"])
-    embeddings = Mock()
-    chat = Mock()
-    expected_answer = legacy.ExplanationResponse(**{name: "answer" for name in (
-        "concept", "simple_explanation", "analogy", "example", "worked_problem"
-    )})
-    chat.return_value.with_structured_output.return_value.invoke.return_value = expected_answer
-    monkeypatch.setattr(legacy, "ChatGoogleGenerativeAI", chat)
-    router = legacy.make_legacy_router(settings.google_api_key, settings=settings)
-    router.legacy_dependencies["embeddings"] = embeddings
-    store = Mock()
-    store.as_retriever.return_value.invoke.return_value = [SimpleNamespace(page_content="notes")]
-    router.legacy_dependencies["vector_store"] = lambda _: store
-    app = FastAPI()
-    app.include_router(router)
-    with TestClient(app) as client:
-        response = client.post("/explain-concept", data={"question": "Recursion?"})
-    assert response.status_code == 200
-    args = {"vertexai": True, "project": "test-project", "location": "global"} if enterprise else {"vertexai": False, "api_key": "test-key"}
-    # Gemini 3.x models are served at global; see docs.cloud.google.com/gemini-enterprise-agent-platform/resources/locations
-    embeddings.assert_called_once_with(model="models/gemini-embedding-001", **args)
-    chat.assert_called_once_with(model="test-model", temperature=0.3, **args)

@@ -70,24 +70,3 @@ def test_unknown_provider_fails_startup(monkeypatch):
     with pytest.raises(RuntimeError, match="LLM_PROVIDER"):
         with TestClient(service.app):
             pass
-
-
-def test_explain_concept_does_not_require_api_key_form_field(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-api-key")
-    service = _load_service()
-
-    class StubEmbeddings:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    monkeypatch.setattr(service, "GoogleGenerativeAIEmbeddings", StubEmbeddings)
-    monkeypatch.setattr(service, "_get_or_load_vector_store", lambda _: None)
-
-    with TestClient(service.app) as client:
-        response = client.post(
-            "/explain-concept",
-            data={"question": "Explain recursion."},
-        )
-
-    assert response.status_code == 400
-    assert "No lecture notes found" in response.json()["detail"]
