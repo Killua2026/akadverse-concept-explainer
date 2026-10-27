@@ -13,7 +13,8 @@ Two concerns live in this service:
 
 1. **Ingestion** (current focus): accept lecturer-uploaded course documents,
    chunk and embed them into pgvector, deliver completion/failure callbacks,
-   and delete document chunks and jobs. Phase 2d is implemented and tested.
+   and delete document chunks and jobs. Phases 2a through 2e are implemented;
+   one concurrency test is intentionally skipped pending investigation.
 2. **Retrieval** (future): given a course offering and week, retrieve chunks
    and answer student questions. NOT yet implemented. Do not build it unless
    explicitly asked.
@@ -38,12 +39,13 @@ Status:
 - [x] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
 - [x] Phase 2c: PDF / DOCX / PPTX extractors
 - [x] Phase 2d implementation: `/documents/{id}` delete + callback client (`9fbbf20`)
-- [ ] Phase 2e: retire old `/upload-note` and `/explain-concept`
+- [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
 - [ ] Phase 3: Retrieval endpoint (student queries in Study Zone)
 - [ ] Phase 4: Chat history storage for Stewart
 
-Phase 2d is merged, as confirmed by the developer. Phase 2e is implemented
-within the approved retirement/auth scope; completion remains blocked by full-suite verification.
+Phase 2d is merged, as confirmed by the developer. Phase 2e is implemented and
+committed locally in `54a6ecb`, with the developer-authorized concurrency-test
+skip documented below. Phase 2e remote merge and deployment are not verified.
 
 ## Current implementation: Phase 2e
 
@@ -73,16 +75,21 @@ within the approved retirement/auth scope; completion remains blocked by full-su
 
 ## Phase 2e verification (27 October 2026)
 
-- Baseline: 164 passed. Expected new count: 163 (remove three legacy cases,
-  add two grounding auth tests).
-- Full-suite runs timed out at 30 seconds in the unchanged worker concurrency
-  test; its isolated retry passed in 18.94 seconds. Do not mark 2e complete
-  until the full suite passes. Protected ingestion/worker code is unchanged.
-- Remaining suite: 162 passed, one deselected, one warning in 201.23 seconds.
-  Together with the isolated worker pass this covers all 163 cases separately;
-  it is not a successful full-suite run.
-- Requirements install and app import passed. Live Swagger returned 200;
-  OpenAPI exposes exactly ingestion, document deletion, grounding, and health.
+- Phase 2e is committed locally as `54a6ecb`. The suite contains 163 cases:
+  164 baseline cases minus one obsolete API-key case and two legacy-wrapper
+  cases, plus two grounding auth cases. One case is now intentionally skipped.
+- After the approved skip, three consecutive full-suite runs each finished
+  with 162 passed, one skipped, and one existing Starlette/AnyIO deprecation
+  warning. Pytest durations were 189.51, 184.04, and 193.38 seconds. The requested
+  under-60-second target was not achieved. These are recorded verification
+  results, not a claim that the suite is rerun for every documentation edit.
+- The skipped concurrency test reproduced its teardown timeout in one of
+  three diagnostic full-suite runs. Root cause remains unconfirmed; no
+  hanging-run pending-task snapshot was captured. See Testing below.
+- Requirements installation and app import passed during Phase 2e verification.
+  Live Swagger returned 200, and OpenAPI exposed exactly `POST /ingest`,
+  `DELETE /documents/{document_id}`, `POST /explain-with-grounding`, and
+  `GET /health`. These checks do not establish live model or callback access.
 
 ## Grounding boundary
 
@@ -147,7 +154,7 @@ Callback rejection details (HTTP 422):
 - `callback_url host not allowed`
 - `callback_url resolves to a disallowed address`
 
-Background worker steps per job (current Phase 2d):
+Background worker steps per job (unchanged by Phase 2e):
 
 1. Atomically claim a queued job, mark processing, and increment attempts.
 2. Download `file_url` to a UUID-prefixed temp path with a 60-second timeout.
@@ -490,7 +497,7 @@ akadverse-concept-explainer/
 |-- routes/
 |   |-- ingest.py                 # POST /ingest (2b)
 |   |-- documents.py              # DELETE /documents/{id} (2d)
-|   `-- grounding.py              # Grounding with the same HTTP contract
+|   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
 |   `-- ingestion.py              # Job loop, re-queue on startup (2b)
 |-- services/
@@ -508,7 +515,7 @@ akadverse-concept-explainer/
 |-- tests/
 |   |-- conftest.py               # Isolated DB and generated Office fixtures
 |   |-- test_api_key_env.py       # Provider startup checks
-|   |-- test_gemini_provider.py   # Discovery and wrapper mocks
+|   |-- test_gemini_provider.py   # SDK discovery, clients, and provider routing
 |   |-- test_db.py                # Real isolated storage checks
 |   |-- test_refactor.py          # Route registration
 |   |-- test_auth.py              # (2b)
@@ -575,7 +582,19 @@ dependency for ingestion chunking. Retrieval remains Phase 3.
 
 ## Testing
 
-`test_multiple_workers_no_collision` intermittently hangs under full-suite runs at `portal.call(settle)`. Root cause unconfirmed after a diagnostic session (reproduced 1/3; could not capture pending-task state). Test is skipped pending a dedicated investigation. The multi-worker feature itself is verified by `test_workers_share_callback_client_until_shutdown` and the 162 other passing tests.
+Current verified baseline: 162 passed, one skipped, and one warning in each of
+three consecutive full-suite runs. The runs took approximately three minutes;
+do not describe this suite as completing in under 60 seconds.
+
+`test_multiple_workers_no_collision` intermittently hangs under full-suite runs
+at `portal.call(settle)`. The diagnostic session reproduced it in one of three
+full-suite runs; root cause is unconfirmed, and a hanging-run pending-task
+snapshot could not be captured. The test is retained with a developer-approved
+skip pending a dedicated investigation. The passing
+`test_workers_share_callback_client_until_shutdown` verifies that three mocked
+workers share one callback client and finish cancellation before it closes.
+It does not replace the skipped test's real-database check for collision-free
+concurrent job claims. Keep that coverage gap explicit until the test is restored.
 
 Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
@@ -584,7 +603,8 @@ Preserve this policy in any future process launcher.
 - **Framework:** pytest + `httpx.AsyncClient` via `httpx.ASGITransport`
 - **Command:** `uv run pytest tests/ -q --tb=short --timeout=30`
 - **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
-- **Provider mocks:** synchronous SDK discovery, constructors, async generation, and LangChain wrappers. The database acceptance test is real.
+- **Provider mocks:** synchronous SDK discovery, client constructors, async generation, and grounding provider routing. The database acceptance test is real; legacy LangChain wrapper tests were removed with their implementation.
+- **Grounding auth coverage:** missing auth returns 401 when ingestion is ready; valid shared-secret auth proceeds to mocked Gemini generation.
 - **Current ingestion tests:** mocked downloads/embeddings/callbacks with real
   PDF/DOCX/PPTX extraction and isolated Postgres inserts. Embedding tests mock
   SDK calls; delivery tests use `httpx.MockTransport`, not real webhook traffic.
@@ -687,16 +707,21 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Phase 2e implements legacy retirement and grounding authentication. Retrieval
-(3), chat history (4), and ZIP remain outside scope. There is no job-status HTTP
-endpoint. Verify live Next.js callback integration before deployment.
+Phase 2e legacy retirement and grounding authentication are implemented and
+committed locally in `54a6ecb`. Verify remote merge status before starting the
+next implementation phase. Track the skipped concurrency test as a dedicated
+investigation; no root-cause fix has been made. Phase 3 retrieval requires its
+own explicit scope and authorization. Chat history (4) and ZIP remain outside
+scope. There is no job-status HTTP endpoint. Verify live Next.js callback
+integration, credentials/model access, and deployment readiness separately.
 
 ## Phase 2b0 decision record
 
 Provider selection is explicit, matching the orchestrator. Enterprise uses
 `genai.Client(enterprise=True, project=..., location=...)`; Developer uses
-`genai.Client(api_key=...)`. LangChain uses `vertexai=True` plus project and
-location, or `vertexai=False` plus the Developer key. Discovery runs
+`genai.Client(api_key=...)`. Historically, the legacy LangChain wrappers used
+`vertexai=True` plus project and location, or `vertexai=False` plus the Developer
+key; those wrappers and their tests were removed in Phase 2e. Discovery runs
 synchronously in settings loading and caches models. Enterprise discovery
 returns a ranked list, logs credential-safe fallback warnings, and returns
 priorities on failure. Developer discovery remains in `model_discovery.py`.

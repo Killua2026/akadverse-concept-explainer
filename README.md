@@ -3,11 +3,14 @@
 FastAPI microservice for the AkadVerse Study Zone, reserved port **8010**.
 The intended caller is the Next.js backend, not a browser client.
 
-## Current status: Phase 2e implemented
+## Current status: Phase 2e implemented and committed
 
 Phase 2e retires the legacy explanation endpoints and authenticates Google Search
 Grounding with the existing ingestion shared secret. Durable ingestion, document
-deletion, and callbacks remain unchanged. Retrieval is planned for Phase 3.
+deletion, and callbacks remain unchanged. The local Phase 2e commit is
+`54a6ecb`. Three consecutive full-suite runs each recorded 162 passed and one
+intentionally skipped concurrency test. Remote merge and deployment are not
+verified. Retrieval is planned for Phase 3 and has not started.
 
 | Capability | Current state |
 |---|---|
@@ -16,7 +19,8 @@ deletion, and callbacks remain unchanged. Retrieval is planned for Phase 3.
 | PDF / DOCX / PPTX extraction | Implemented |
 | Shared chunking and Enterprise embeddings | Implemented |
 | Delete endpoint and outbound callback client | Implemented; transactional deletion and bounded post-commit delivery |
-| Legacy endpoint retirement and grounding auth | Implemented in Phase 2e |
+| Legacy endpoint retirement and grounding auth | Implemented and committed in Phase 2e |
+| Concurrent job-claim collision test | Retained but skipped; dedicated investigation pending for intermittent teardown hang |
 | Retrieval over ingested pgvector chunks | Phase 3; not implemented |
 | Stewart chat history | Phase 4; not implemented |
 | ZIP ingestion | Rejected; deferred to a later phase |
@@ -329,7 +333,7 @@ it on `app.state.callback_client`, and passes it with `CallbackSettings` to
 every worker. Shutdown cancels and awaits all workers, closes that client,
 then disposes the database engine.
 
-| Status | Meaning in Phase 2d |
+| Status | Current meaning, unchanged by Phase 2e |
 |---|---|
 | `queued` | Waiting for a worker |
 | `processing` | Claimed; attempts incremented |
@@ -399,15 +403,36 @@ From this service directory:
 uv run pytest tests/ -q --tb=short --timeout=30
 ```
 
-Phase 2e full-suite verification is blocked by a 30-second timeout in the unchanged worker concurrency test; an isolated retry passed in 18.94 seconds.
-The suite removes three legacy cases and adds two grounding auth tests:
-164 - 1 obsolete API-key case - 2 legacy-wrapper cases + 2 auth cases = 163.
-The remaining run passed 162 tests with one deselected and one warning in
-201.23 seconds. All cases passed separately, but a full-suite pass is pending.
+Recorded verification on 27 October 2026, after the developer-approved skip:
+
+| Full-suite run | Result | Pytest duration |
+|---|---|---|
+| 1 | 162 passed, 1 skipped, 1 warning | 189.51 seconds |
+| 2 | 162 passed, 1 skipped, 1 warning | 184.04 seconds |
+| 3 | 162 passed, 1 skipped, 1 warning | 193.38 seconds |
+
+All three commands exited successfully. The warning is the existing
+Starlette/AnyIO `BlockingPortal` deprecation. None met the requested
+under-60-second target. These are recorded test results, not a claim that the
+suite is rerun for each documentation edit.
+
+There are 163 cases: 164 baseline cases minus one obsolete API-key case and
+two legacy-wrapper cases, plus two grounding auth cases. One case is skipped,
+not deselected or deleted.
+
+`tests/test_worker.py::test_multiple_workers_no_collision` has an approved skip
+for an intermittent hang at `portal.call(settle)`. Diagnosis reproduced the
+timeout in one of three full-suite runs. Root cause is unconfirmed, and no
+hanging-run pending-task snapshot was captured. The test remains pending a
+dedicated investigation. The passing
+`test_workers_share_callback_client_until_shutdown` covers callback-client
+sharing and shutdown order with three mocked workers; it does not replace
+the skipped test's collision-free concurrent job-claim coverage.
 
 Tests cover provider configuration, authentication, queue admission, embedding
-validation, extraction/dispatch, chunk boundaries, startup recovery, concurrent
-workers, document replacement, safe worker failures, transactional deletion,
+validation, extraction/dispatch, chunk boundaries, startup recovery, worker
+client sharing and shutdown, document replacement, safe worker failures,
+transactional deletion,
 strict callback response handling, retries, redirect refusal, and host
 authorization. Worker tests verify DB status at callback time, preserved status
 after delivery failure, and cancellation on both success and failure paths.
@@ -517,11 +542,14 @@ ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
 404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
 There is still no job-status HTTP endpoint.
 
-Phase 2d is implemented and tested in this checkout. Before deployment, verify
+Phase 2e is implemented and committed locally in `54a6ecb`. Before deployment, verify
 the real receiver, TLS/DNS configuration, both shared secrets, allowlisted
 hosts, ADC/model access, and quotas without exposing credentials. Automated
 tests do not establish those live integration prerequisites or remote merge
 status. Rotate previously exposed secrets and exchange replacements privately.
 
-Phase 2e retires the legacy endpoints and adds grounding auth. Phase 3 adds
-pgvector retrieval; Phase 4 adds Stewart chat history. Neither is implemented.
+Verify Phase 2e remote merge status before the next implementation phase.
+Investigate and restore the skipped concurrency test separately. Phase 3 adds
+pgvector retrieval and requires its own explicit scope and authorization;
+Phase 4 adds Stewart chat history. Neither phase is implemented. ZIP support
+remains deferred.
