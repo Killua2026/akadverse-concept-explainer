@@ -20,6 +20,10 @@ from services.callback import CallbackSettings
 logger = logging.getLogger(__name__)
 
 
+def get_ingestion_database(application: FastAPI) -> Database | None:
+    return getattr(application.state, "ingest_database", None)
+
+
 async def probe_ingestion_database(database: Database) -> None:
     async with database.engine.connect() as connection:
         await connection.execute(text("SELECT 1"))
@@ -82,13 +86,14 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         application.state.worker_status = "disabled (ingestion requires enterprise mode)"
     else:
         await configure_ingestion(application)
+        database = get_ingestion_database(application)
         application.state.worker_status = (
             "disabled (ingest not configured)" if application.state.ingest_status.startswith("disabled (missing ")
             else "stopped (db unavailable)"
         )
-        if application.state.ingest_status == "ready":
+        if application.state.ingest_status == "ready" and database is not None:
             try:
-                await recover_stuck_jobs(application.state.ingest_database)
+                await recover_stuck_jobs(database)
             except (SQLAlchemyError, OSError):
                 logger.error("worker.db_unavailable")
                 application.state.ingest_status = "disabled (db unreachable)"
@@ -96,7 +101,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
                 worker_logger.addFilter(worker_log_context)
                 worker_logging_enabled = True
                 application.state.worker_tasks = [
-                    asyncio.create_task(worker_loop(application.state.ingest_database, gemini_settings, callback_client, callback_settings))
+                    asyncio.create_task(worker_loop(database, gemini_settings, callback_client, callback_settings))
                     for _ in range(worker_count)
                 ]
                 application.state.worker_status = "running"
@@ -118,7 +123,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         await callback_client.aclose()
         if worker_logging_enabled:
             worker_logger.removeFilter(worker_log_context)
-        database = application.state.ingest_database
+        database = get_ingestion_database(application)
         if database is not None:
             await database.dispose()
     print("[Shutdown] AkadVerse Concept Explainer stopped.")
