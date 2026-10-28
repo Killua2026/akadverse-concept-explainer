@@ -600,6 +600,12 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
+For local development and testing on the developer's Windows PC, always set
+the server bind address to `host="127.0.0.1"`, never `host="0.0.0.0"`.
+The developer reports that `127.0.0.1` works on this PC and `0.0.0.0` does not.
+Apply this rule when creating or updating Uvicorn launchers and server commands;
+keep the service on its reserved port 8010.
+
 - **Framework:** pytest + `httpx.AsyncClient` via `httpx.ASGITransport`
 - **Command:** `uv run pytest tests/ -q --tb=short --timeout=30`
 - **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
