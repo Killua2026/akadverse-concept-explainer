@@ -43,15 +43,24 @@ async def configure_ingestion(application: FastAPI) -> None:
     if not any(host.strip() for host in os.getenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", "").split(",")):
         application.state.ingest_status = "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"
         return
-    try:
-        database = Database(StorageSettings.from_env())
-        application.state.ingest_database = database
-        await asyncio.wait_for(probe_ingestion_database(database), timeout=2.0)
-    except (TimeoutError, OSError, RuntimeError, SQLAlchemyError):
-        logger.warning("Ingestion startup probe failed: database unavailable.")
-        application.state.ingest_status = "disabled (db unreachable)"
-        return
-    application.state.ingest_status = "ready"
+    database = None
+    for attempt in range(1, 4):
+        try:
+            if database is None:
+                database = Database(StorageSettings.from_env())
+                application.state.ingest_database = database
+            await asyncio.wait_for(probe_ingestion_database(database), timeout=5.0)
+        except TimeoutError:
+            logger.warning("Startup DB probe attempt %s/3: timeout", attempt)
+        except (OSError, RuntimeError, SQLAlchemyError):
+            logger.warning("Startup DB probe attempt %s/3: error", attempt)
+        else:
+            logger.info("Startup DB probe attempt %s/3: success", attempt)
+            application.state.ingest_status = "ready"
+            return
+        if attempt < 3:
+            await asyncio.sleep(1)
+    application.state.ingest_status = "disabled (db unreachable)"
 
 from routes.grounding import make_grounding_router
 
@@ -167,7 +176,7 @@ async def health_check():
         "worker_status": getattr(app.state, "worker_status", "disabled (ingest not configured)"),
         "worker_count": getattr(app.state, "worker_count", 0),
         "version": "1.2",
-        "grounding_status": "Requires shared-secret auth and ready ingestion for /explain-with-grounding.",
+        "grounding_status": "Ready - requires shared-secret auth.",
         "endpoints": {
             "POST /ingest": "Queue a course document for ingestion.",
             "DELETE /documents/{id}": "Delete a document and its ingestion jobs.",
