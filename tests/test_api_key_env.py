@@ -1,4 +1,5 @@
 import importlib
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,8 +53,17 @@ def test_enterprise_starts_without_developer_key(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     service = _load_service()
+
+    async def disable_ingestion(application):
+        application.state.ingest_status = "disabled (missing DATABASE_URL)"
+        application.state.ingest_database = None
+
+    configure = AsyncMock(side_effect=disable_ingestion)
+    monkeypatch.setattr(service, "configure_ingestion", configure)
     with TestClient(service.app) as client:
         assert client.get("/health").json()["provider"] == "gemini_enterprise"
+        assert service.app.state.worker_tasks == []
+    configure.assert_awaited_once_with(service.app)
 
 
 def test_enterprise_requires_project(monkeypatch):

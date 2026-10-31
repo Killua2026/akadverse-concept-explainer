@@ -69,8 +69,8 @@ skip documented below. Phase 2e remote merge and deployment are not verified.
 - Callbacks run after commit and temp-file cleanup using one shared HTTP
   client. Delivery failure does not roll back chunks or alter job status.
   `done` means chunks committed, not callback receipt.
-- Legacy endpoints and local FAISS state are removed. Grounding shares
-  ingestion authentication and readiness checks.
+- Legacy endpoints and local FAISS state are removed. Grounding uses
+  shared-secret authentication independently of ingestion readiness.
 - `run.py` already provides the Windows selector-loop setup on port 8010.
 
 ## Phase 2e verification (27 October 2026)
@@ -200,9 +200,10 @@ Behavior:
 ### `POST /explain-with-grounding`
 
 Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`.
-Uses `Depends(require_ingest_auth)` with the same configured/ready-state checks
-as ingestion. Missing/wrong token returns 401 when ready; missing configuration
-or unavailable ingestion returns 503. Prompt, response, and citations are preserved.
+Uses `Depends(require_shared_secret_auth)` independently of ingestion readiness.
+Missing/wrong token returns 401 when `AI_SERVICE_API_KEY` is configured; an unset
+or blank shared secret returns 503. Database and callback configuration are not
+required. Prompt, response, and citations are preserved.
 
 ## Outbound callback (implemented)
 
@@ -269,8 +270,9 @@ delivery can lose the notification. Do not claim guaranteed delivery.
 - Current inbound behavior: missing ingestion configuration or unavailable
   ingestion returns 503. With ingestion ready, a missing or incorrect Bearer
   token returns `401 Unauthorized` with `{"detail":"Unauthorized"}`. Developer
-  mode rejects `/ingest` with 503 via middleware. DELETE and grounding share the ready-state
-  auth gate. Do not expose credential values.
+  mode rejects `/ingest` with 503 via middleware. DELETE shares the ingestion
+  ready-state gate. Grounding validates only the inbound shared secret and Bearer
+  token, independently of ingestion configuration/state. Do not expose credential values.
 
 ## Storage
 
@@ -472,7 +474,7 @@ In Enterprise mode `main.configure_ingestion` checks `DATABASE_URL`,
 `ingest_status="disabled (missing VARIABLE_NAME)"`; `/ingest` returns 503 and
 workers do not start. The allowlist must contain a non-empty entry, not only
 commas/whitespace. Database probing/recovery failures disable ingestion as
-unreachable. Grounding shares the ingestion configured/ready-state auth gates.
+unreachable. Grounding uses shared-secret authentication without ingestion readiness gates.
 
 Do not read or log secret values or inspect the user's `.env`. Do not commit
 `.env` or credential files. Rotate the previously shared callback secret
@@ -610,7 +612,7 @@ keep the service on its reserved port 8010.
 - **Command:** `uv run pytest tests/ -q --tb=short --timeout=30`
 - **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
 - **Provider mocks:** synchronous SDK discovery, client constructors, async generation, and grounding provider routing. The database acceptance test is real; legacy LangChain wrapper tests were removed with their implementation.
-- **Grounding auth coverage:** missing auth returns 401 when ingestion is ready; valid shared-secret auth proceeds to mocked Gemini generation.
+- **Grounding auth coverage:** missing/wrong auth returns 401 with ingestion ready or disabled; valid shared-secret auth proceeds to mocked Gemini generation without database/callback settings, including disabled ingestion states. Missing shared-secret configuration returns 503. Provider startup tests mock ingestion configuration to keep database/worker lifecycle coverage in dedicated tests.
 - **Current ingestion tests:** mocked downloads/embeddings/callbacks with real
   PDF/DOCX/PPTX extraction and isolated Postgres inserts. Embedding tests mock
   SDK calls; delivery tests use `httpx.MockTransport`, not real webhook traffic.

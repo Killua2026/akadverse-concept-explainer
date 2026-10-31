@@ -1,4 +1,4 @@
-"""Grounding uses the existing ingestion shared-secret dependency."""
+"""Grounding authenticates independently of ingestion readiness."""
 
 import json
 from types import SimpleNamespace
@@ -20,7 +20,9 @@ def anyio_backend():
 @pytest.fixture
 def grounding_app(monkeypatch):
     monkeypatch.setenv("AI_SERVICE_API_KEY", "test-grounding-secret")
-    monkeypatch.setenv("DATABASE_URL", "postgresql://unused-test-database")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("AI_SERVICE_CALLBACK_SECRET", raising=False)
+    monkeypatch.delenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", raising=False)
     app = FastAPI()
     app.state.ingest_status = "ready"
     app.include_router(grounding.make_grounding_router(
@@ -30,20 +32,31 @@ def grounding_app(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_grounding_requires_auth(grounding_app, monkeypatch):
+@pytest.mark.parametrize("state", ["ready", "disabled (db unreachable)"])
+@pytest.mark.parametrize("header", [None, "Bearer wrong", "Basic wrong"])
+async def test_grounding_requires_auth(grounding_app, monkeypatch, state, header):
+    grounding_app.state.ingest_status = state
     constructor = Mock()
     monkeypatch.setattr(grounding, "create_client", constructor)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=grounding_app), base_url="http://test"
     ) as client:
-        response = await client.post("/explain-with-grounding", data={"question": "Recursion?"})
+        response = await client.post(
+            "/explain-with-grounding", data={"question": "What is a binary search tree?"},
+            headers={"Authorization": header} if header else {},
+        )
     assert response.status_code == 401
     assert response.json() == {"detail": "Unauthorized"}
     constructor.assert_not_called()
 
 
 @pytest.mark.anyio
-async def test_grounding_accepts_valid_auth(grounding_app, monkeypatch):
+@pytest.mark.parametrize("state", [
+    "ready", "disabled (db unreachable)",
+    "disabled (missing DATABASE_URL)", "disabled (ingestion requires enterprise mode)",
+])
+async def test_grounding_accepts_valid_auth(grounding_app, monkeypatch, state):
+    grounding_app.state.ingest_status = state
     fields = {name: "Test explanation" for name in (
         "concept", "simple_explanation", "analogy", "example", "worked_problem"
     )}
@@ -64,3 +77,22 @@ async def test_grounding_accepts_valid_auth(grounding_app, monkeypatch):
     assert response.json() == {**fields, "sources": []}
     generate.assert_awaited_once()
     assert generate.await_args.kwargs["model"] == "test-model"
+
+
+@pytest.mark.anyio
+async def test_grounding_missing_shared_secret_returns_503(grounding_app, monkeypatch):
+    monkeypatch.delenv("AI_SERVICE_API_KEY")
+    constructor = Mock()
+    monkeypatch.setattr(grounding, "create_client", constructor)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=grounding_app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/explain-with-grounding", data={"question": "What is a binary search tree?"},
+            headers={"Authorization": "Bearer test-grounding-secret"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Shared-secret authentication is not configured on this service."
+    }
+    constructor.assert_not_called()

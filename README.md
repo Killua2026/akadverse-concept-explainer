@@ -130,7 +130,7 @@ consult the root `AGENTS.md` before choosing any other local testing port.
 | `AI_SERVICE_CALLBACK_ALLOWED_HOSTS` | Required comma-separated, exact callback hostnames; no wildcard matching |
 | `WORKER_COUNT` | Positive integer, default `1`; restart required after changes |
 
-Developer mode disables ingestion and workers; grounding shares the ingestion readiness gate. `/ingest` returns `503` with an Enterprise-mode requirement.
+Developer mode disables ingestion and workers; grounding requires shared-secret authentication independently of ingestion readiness. `/ingest` returns `503` with an Enterprise-mode requirement.
 A Cloud project setting alone does not select Enterprise mode. Unknown providers,
 missing required provider credentials/settings, and invalid worker counts fail
 startup validation.
@@ -140,7 +140,7 @@ In Enterprise mode, ingestion requires non-empty `DATABASE_URL`,
 `AI_SERVICE_CALLBACK_ALLOWED_HOSTS`. Missing settings report
 `disabled (missing VARIABLE_NAME)` through `ingest_status`; `/ingest` returns
 503 and workers do not start. An empty or comma/whitespace-only allowlist is
-missing configuration. Grounding shares the same configured/ready-state auth checks and returns 503 when ingestion is unavailable.
+missing configuration. Grounding requires only the inbound shared secret for authentication and remains available when ingestion is disabled.
 
 The implemented Enterprise path uses ADC with project and location. This
 service does not implement an Enterprise Express Mode API-key configuration.
@@ -279,9 +279,14 @@ The embedded `endpoints` map lists ingestion, document deletion, grounding, and 
 Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`.
 Form field: `question`.
 
-Uses `Depends(require_ingest_auth)`, the same shared secret and readiness checks
-as ingestion. Missing or incorrect auth returns 401 when ingestion is ready;
-missing configuration or unavailable ingestion returns 503. No new env var.
+In Swagger at `/docs`, click **Authorize**, enter the `AI_SERVICE_API_KEY`
+value without the `Bearer` prefix, and authorize. Swagger attaches the Bearer
+header to protected requests. The secret is never prefilled from the server environment.
+
+Uses `Depends(require_shared_secret_auth)` with the same inbound shared secret
+as ingestion. Missing or incorrect auth returns 401 when the secret is configured;
+an unset or blank `AI_SERVICE_API_KEY` returns 503. Database, callback configuration,
+and ingestion readiness do not gate this endpoint. No new env var.
 Gemini with Google Search returns the five explanation fields and cited sources.
 
 ## Extraction and processing

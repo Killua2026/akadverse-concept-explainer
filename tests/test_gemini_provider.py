@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from auth import require_ingest_auth
+from auth import require_shared_secret_auth
 from config import GeminiSettings
 from services import gemini_provider as provider
 from services import model_discovery
@@ -109,7 +109,7 @@ async def test_grounding_selected_provider(monkeypatch, enterprise):
     app = FastAPI()
     async def provider_test_auth():
         return None
-    app.dependency_overrides[require_ingest_auth] = provider_test_auth
+    app.dependency_overrides[require_shared_secret_auth] = provider_test_auth
     app.include_router(make_grounding_router(settings.google_api_key, settings=settings))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as session:
         response = await session.post("/explain-with-grounding", data={"question": "Recursion?"})

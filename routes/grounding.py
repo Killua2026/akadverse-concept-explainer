@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Form
 from pydantic import BaseModel, Field
 from google.genai import types
 
-from auth import require_ingest_auth
+from auth import require_shared_secret_auth
 from config import GeminiSettings
 from services.gemini_provider import create_client
 
@@ -114,7 +114,7 @@ def make_grounding_router(api_key, *, settings: GeminiSettings | None = None):
     router = GroundingRouter()
     provider_settings = settings or GeminiSettings(google_api_key=api_key or "")
 
-    @router.post("/explain-with-grounding", response_model=GroundedExplanationResponse, tags=["Q&A"], dependencies=[Depends(require_ingest_auth)])
+    @router.post("/explain-with-grounding", response_model=GroundedExplanationResponse, tags=["Q&A"], dependencies=[Depends(require_shared_secret_auth)])
     async def explain_with_grounding(
         question: str = Form(..., description="The concept or question you want explained from the web.")
     ):
@@ -122,7 +122,7 @@ def make_grounding_router(api_key, *, settings: GeminiSettings | None = None):
         Explains a concept using Gemini's native Google Search Grounding tool.
 
         Searches the live web and synthesises an answer from current sources.
-        Requires shared-secret authentication and ready ingestion configuration.
+        Requires shared-secret authentication independently of ingestion readiness.
 
         How it works:
         1. Sends the question to Gemini with google_search grounding enabled.
