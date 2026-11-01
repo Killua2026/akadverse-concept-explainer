@@ -1,781 +1,560 @@
 # AkadVerse Concept Explainer
-### Tier 5 Learning AI Tool | Microservice Port: `8010`
 
-> A RAG-powered study assistant that explains academic concepts in two modes:
-> from your own uploaded lecture notes, or from live web sources via
-> Google Search Grounding. Produces structured pedagogical responses
-> covering plain-language explanation, analogy, example, and worked problem.
+FastAPI microservice for the AkadVerse Study Zone, reserved port **8010**.
+The intended caller is the Next.js backend, not a browser client.
 
----
+## Current status: Phase 2e implemented and committed
 
-## Table of Contents
+Phase 2e retires the legacy explanation endpoints and authenticates Google Search
+Grounding with the existing ingestion shared secret. Durable ingestion, document
+deletion, and callbacks remain unchanged. The local Phase 2e commit is
+`54a6ecb`. Three consecutive full-suite runs each recorded 162 passed and one
+intentionally skipped concurrency test. Remote merge and deployment are not
+verified. Retrieval is planned for Phase 3 and has not started.
 
-1. [What This Microservice Does](#what-this-microservice-does)
-2. [The Two Explanation Modes](#the-two-explanation-modes)
-3. [Architecture Overview](#architecture-overview)
-4. [Prerequisites](#prerequisites)
-5. [Getting Your API Key](#getting-your-api-key)
-6. [Configuration](#configuration)
-7. [Installation](#installation)
-8. [Running the Server](#running-the-server)
-9. [API Endpoints](#api-endpoints)
-   - [POST /upload-note](#1-post-upload-note)
-   - [POST /explain-concept](#2-post-explain-concept)
-   - [POST /explain-with-grounding](#3-post-explain-with-grounding)
-   - [GET /health](#4-get-health)
-10. [Testing with Swagger UI](#testing-with-swagger-ui)
-11. [Example Test Inputs](#example-test-inputs)
-12. [Understanding the Responses](#understanding-the-responses)
-13. [Choosing the Right Mode](#choosing-the-right-mode)
-14. [Generated Files](#generated-files)
-15. [Common Errors and Fixes](#common-errors-and-fixes)
-16. [Project Structure](#project-structure)
+| Capability | Current state |
+|---|---|
+| Authenticated `POST /ingest` | Implemented; returns `202` after queue admission |
+| Durable jobs and configurable workers | Implemented; startup recovery and concurrent claims |
+| PDF / DOCX / PPTX extraction | Implemented |
+| Shared chunking and Enterprise embeddings | Implemented |
+| Delete endpoint and outbound callback client | Implemented; transactional deletion and bounded post-commit delivery |
+| Legacy endpoint retirement and grounding auth | Implemented and committed in Phase 2e |
+| Concurrent job-claim collision test | Retained but skipped; dedicated investigation pending for intermittent teardown hang |
+| Retrieval over ingested pgvector chunks | Phase 3; not implemented |
+| Stewart chat history | Phase 4; not implemented |
+| ZIP ingestion | Rejected; deferred to a later phase |
 
----
+`/ingest` writes pgvector chunks. Retrieval over these chunks is not implemented.
+Callbacks are posted after processing commits. A job marked `done` means its
+chunks were stored, not that a callback was delivered. Delivery failure does
+not change the committed job status or roll back chunks.
 
-## What This Microservice Does
+## Contents
 
-This service is a **Tier 5 component** of the AkadVerse AI-first e-learning
-platform. It lives inside the *My Learning* module and acts as a personal
-AI tutor for students.
+- [Architecture](#architecture)
+- [Installation and startup](#installation-and-startup)
+- [Configuration](#configuration)
+- [Database setup](#database-setup)
+- [API endpoints](#api-endpoints)
+- [Extraction and processing](#extraction-and-processing)
+- [Jobs and workers](#jobs-and-workers)
+- [Outbound callbacks](#outbound-callbacks)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Project structure](#project-structure)
+- [Integration and next steps](#integration-and-next-steps)
 
-A student can:
+## Architecture
 
-- **Upload their lecture notes as a PDF** and ask questions about the specific
-  content their lecturer taught. The AI answers strictly from those notes and
-  honestly says "I do not know" rather than hallucinating if the answer is not
-  in the document.
-- **Ask any academic question without uploading anything** and receive a
-  structured explanation sourced from the live web, complete with citations
-  so they can verify and explore further.
+Current ingestion flow:
 
-Every response, regardless of mode, is structured into five pedagogical
-components proven to aid understanding: a plain-language explanation, a
-relatable analogy, a concrete example, and a step-by-step worked problem.
-
----
-
-## The Two Explanation Modes
-
-| | Mode A: Notes-Based RAG | Mode B: Search Grounding |
-|---|---|---|
-| **Endpoint** | `POST /explain-concept` | `POST /explain-with-grounding` |
-| **Source of answers** | Student's uploaded PDF | Live Google Search |
-| **PDF required?** | Yes | No |
-| **Returns citations?** | No (answers from your own notes) | Yes (URLs to web sources) |
-| **If concept not in notes** | Honestly says "I do not know" | Searches the web for the answer |
-| **Best for** | Exam prep from lecturer's material | Filling gaps, deeper understanding |
-
-Both modes return the same five-field pedagogical structure. They are
-designed as complements -- use Mode A to study from your lecturer's
-exact material, then use Mode B to fill any gaps the notes do not cover.
-
----
-
-## Architecture Overview
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                     POST /upload-note                          │
-│  PDF → PyPDFLoader → Chunker (1000 chars) → Gemini Embeddings  │
-│                         → FAISS Index (saved to disk)          │
-└────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────┐
-│                    POST /explain-concept                        │
-│  Question → Load FAISS (from disk if needed) → Top-3 Retrieval │
-│           → Gemini LLM (no web access) → ExplanationResponse   │
-└────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────┐
-│                 POST /explain-with-grounding                    │
-│  Question → Gemini + Google Search Tool (live web retrieval)   │
-│           → Extract JSON block → GroundedExplanationResponse   │
-│           → + cited sources from grounding metadata            │
-└────────────────────────────────────────────────────────────────┘
+```text
+Next.js backend -> POST /ingest -> Postgres jobs -> background worker
+  -> signed-URL download -> MIME dispatcher -> PDF / DOCX / PPTX extraction
+  -> chunking (1000 characters, 200 overlap) -> Enterprise embeddings
+  -> transaction: replace document chunks and conditionally mark job done
+  -> temp-file cleanup -> outbound callback using the shared HTTP client
 ```
 
-**Key design decisions:**
+Processing failures commit a sanitized error before attempting a failed
+callback. DELETE removes document chunks and jobs in one transaction; workers
+detect cancellation during finalization and skip delivery.
 
-- The FAISS index is **saved to disk** after every upload and reloaded
-  automatically on first use after a server restart. Students never need
-  to re-upload their notes between sessions.
-- Uploaded PDFs are saved with a **UUID-prefixed temp filename** so two
-  concurrent uploads of files with the same name cannot corrupt each other.
-- **File size is checked before any processing begins.** Files over 50 MB
-  are rejected immediately with a clear 413 error.
-- The embedding model is **discovered dynamically at runtime** via
-  `ListModels` rather than hardcoded, so the service adapts automatically
-  if Google renames or deprecates models.
-- Search Grounding and `with_structured_output()` **cannot run together**
-  in one API call. The grounding endpoint solves this by prompting Gemini
-  to embed a JSON block in its free-text response, which is then extracted
-  by a regex-based helper with three fallback strategies.
+Grounding uses the selected Gemini provider and Google Search, returning an
+explanation with cited sources. It requires shared-secret authentication.
 
----
+Explanation responses contain `concept`, `simple_explanation`, `analogy`,
+`example`, and `worked_problem`. Grounding also returns `sources` entries
+with `title` and `url`. These response fields do not describe ingestion responses.
 
-## Prerequisites
+## Installation and startup
 
-- **Python 3.10 or higher**
-- **pip** (Python package manager)
-- A **Google Gemini API key** (one key covers both modes -- free tier available)
-- Internet connection (for embedding calls and grounding search)
+Use Python **3.12** and **uv**, matching the parent project's `pyproject.toml`.
+From the parent `akadverse-ai` directory, synchronize its environment:
 
-> **Windows users:** All commands below work in the VS Code integrated
-> terminal or Windows PowerShell. Use `python` instead of `python3` if needed.
-
----
-
-## Getting Your API Key
-
-1. Go to [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
-2. Sign in with a Google account.
-3. Click **Create API Key**.
-4. Copy the key and provide it to the service through the `GOOGLE_API_KEY`
-  environment variable.
-
-> The free tier includes access to Gemini 2.5 Flash, sufficient embedding
-> quota for lecture-sized PDFs, and Search Grounding support.
-
-> **Important for Search Grounding:** `/explain-with-grounding` uses
-> Google's native Search Grounding tool. This is available on the free tier
-> but may require billing to be configured on your Google Cloud account in
-> some regions. If you receive a `400` or `403` error on the grounding
-> endpoint specifically, check your quota settings at
-> [https://aistudio.google.com](https://aistudio.google.com).
-
-## Installation
-
-### Step 1 — Set up your project folder
-
-Place `concept_explainer.py` in a dedicated folder:
-
-```
-akadverse-concept-explainer/
-└── concept_explainer.py
+```powershell
+uv sync
 ```
 
-### Step 2 — Create a virtual environment (recommended)
+Then, from `akadverse-concept-explainer/`, install this service's requirements:
 
-```bash
-# Create the environment
-python -m venv venv
-
-# Activate — Windows
-venv\Scripts\activate
-
-# Activate — macOS/Linux
-source venv/bin/activate
+```powershell
+uv pip install -r requirements.txt
 ```
 
-### Step 3 — Install dependencies
+Run that install again after synchronizing or updating the root environment;
+`uv run` does not automatically install the service's requirements file.
+The root project supplies pytest, httpx, and multipart support.
+Its dev group pins `pytest-timeout==2.4.0` and
+`sqlalchemy[asyncio]==2.1.4`; the latter keeps async SQLAlchemy's `greenlet`
+dependency installed during `uv sync`. Keep that pin synchronized with the
+service requirements. The service requirements also list pytest and
+pytest-timeout; synchronization does not replace installing service dependencies.
 
-```bash
-pip install fastapi uvicorn "google-genai>=1.67.0" langchain-google-genai langchain-community langchain-text-splitters faiss-cpu pydantic pypdf
+Service requirements include FastAPI, Uvicorn, `google-genai>=1.67.0`,
+`langchain-text-splitters`, Pydantic,
+`pypdf`, `python-docx==1.2.0`, `python-pptx==1.0.2`,
+`sqlalchemy[asyncio]==2.1.4`, `psycopg[binary]==3.2.6`, and
+`python-dotenv==1.0.1`. `requirements.txt` is authoritative for service pins.
+
+Copy `.env.example` to your private `.env` and supply the required settings.
+Never commit or share credential values. Existing process variables take
+precedence over values loaded by python-dotenv.
+
+Start the service from this directory:
+
+```powershell
+uv run python run.py
 ```
 
-> **Why `google-genai>=1.67.0` specifically?** The Search Grounding tool
-> uses `types.Tool(google_search=types.GoogleSearch())` which requires
-> the unified SDK at version 1.67.0 or above. Older versions do not have
-> this API and will throw an `AttributeError`.
-
-Full dependency reference:
-
-| Package | Min Version | Purpose |
-|---|---|---|
-| `fastapi` | latest | Web framework for the API |
-| `uvicorn` | latest | ASGI server to run FastAPI |
-| `google-genai` | 1.67.0 | Gemini SDK: generation, embeddings, and Search Grounding |
-| `langchain-google-genai` | latest | LangChain wrapper for Gemini structured output |
-| `langchain-community` | latest | FAISS vector store integration |
-| `langchain-text-splitters` | latest | Recursive character text splitter for PDF chunking |
-| `faiss-cpu` | latest | Local vector similarity search index |
-| `pydantic` | latest | Data validation and response schemas |
-| `pypdf` | latest | PDF text extraction backend for PyPDFLoader |
-
----
-
-## Running the Server
-
-From inside your project folder with the virtual environment activated:
-
-```bash
-uvicorn concept_explainer:app --host 127.0.0.1 --port 8010 --reload
-```
-
-**Expected startup output (first run, no prior uploads):**
-
-```
-[Startup] AkadVerse Concept Explainer initializing...
-[Startup] FAISS index path: 'akadverse_concept_faiss_index'
-[Startup] Max upload size: 50 MB
-[Startup] No existing index found — awaiting first PDF upload.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
-```
-
-**Expected startup output (after a previous upload):**
-
-```
-[Startup] AkadVerse Concept Explainer initializing...
-[Startup] FAISS index path: 'akadverse_concept_faiss_index'
-[Startup] Max upload size: 50 MB
-[Startup] Existing FAISS index found on disk — will load on first request.
-INFO:     Application startup complete.
-```
-
-The second message confirms FAISS persistence is working -- the index from
-your last session is on disk and will be loaded automatically when a student
-asks their first question, without requiring a re-upload.
-
-Keep this terminal open while testing. The `--reload` flag restarts the
-server automatically when you edit the code.
-
----
+`run.py` sets the Windows SelectorEventLoop policy before Uvicorn starts,
+binds to `0.0.0.0:8010`, and selects the asyncio loop. It does not enable
+reload. Direct Uvicorn startup bypasses this Windows policy setup.
+Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the four current API
+operations and their request schemas. Port 8010 belongs to this service;
+consult the root `AGENTS.md` before choosing any other local testing port.
 
 ## Configuration
 
-The service reads the Gemini key once when `concept_explainer.py` is imported.
-The key is never accepted in an HTTP request, stored in the FAISS index, or
-shown in Swagger UI. Set it before starting Uvicorn.
+| Variable | Current use |
+|---|---|
+| `LLM_PROVIDER` | `gemini` by default; explicitly use `gemini_enterprise` for ingestion |
+| `GOOGLE_API_KEY` | Required for Developer mode; never an HTTP form field |
+| `GOOGLE_CLOUD_PROJECT` | Required for Enterprise mode |
+| `GOOGLE_CLOUD_LOCATION` | Enterprise generation/discovery location; default `global` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Optional path to an external ADC credential file; runtime ADC is also supported |
+| `DATABASE_URL` | Required for ingestion; private Postgres connection string |
+| `AI_SERVICE_API_KEY` | Shared secret for ingestion, deletion, and grounding authentication |
+| `AI_SERVICE_CALLBACK_SECRET` | Required Bearer secret for outbound callbacks |
+| `AI_SERVICE_CALLBACK_ALLOWED_HOSTS` | Required comma-separated, exact callback hostnames; no wildcard matching |
+| `WORKER_COUNT` | Positive integer, default `1`; restart required after changes |
 
-**Windows PowerShell, current terminal only:**
+Developer mode disables ingestion and workers; grounding requires shared-secret authentication independently of ingestion readiness. `/ingest` returns `503` with an Enterprise-mode requirement.
+A Cloud project setting alone does not select Enterprise mode. Unknown providers,
+missing required provider credentials/settings, and invalid worker counts fail
+startup validation.
 
-```powershell
-$env:GOOGLE_API_KEY = "your-gemini-api-key"
-```
+In Enterprise mode, ingestion requires non-empty `DATABASE_URL`,
+`AI_SERVICE_API_KEY`, `AI_SERVICE_CALLBACK_SECRET`, and
+`AI_SERVICE_CALLBACK_ALLOWED_HOSTS`. Missing settings report
+`disabled (missing VARIABLE_NAME)` through `ingest_status`; `/ingest` returns
+503 and workers do not start. An empty or comma/whitespace-only allowlist is
+missing configuration. Grounding requires only the inbound shared secret for authentication and remains available when ingestion is disabled.
 
-**Windows Command Prompt, current terminal only:**
+The implemented Enterprise path uses ADC with project and location. This
+service does not implement an Enterprise Express Mode API-key configuration.
+Configure credentials outside the repository and enable the necessary model
+access for the selected Cloud project. A successful health response is not
+proof of ADC permissions, billing, quota, or live model availability.
 
-```bat
-set GOOGLE_API_KEY=your-gemini-api-key
-```
+Generation models are discovered synchronously while loading settings and
+cached. Discovery failures retain the configured priority list. Request errors
+do not switch providers. Ingestion embeddings use the explicit constants in
+`config.py`: `gemini-embedding-2`, `global`, and 768 output dimensions. Their
+location is independent of `GOOGLE_CLOUD_LOCATION`; these are implementation
+settings, not a claim that a particular project can access the model.
 
-**Persist for future Windows terminals:**
+## Database setup
 
-```bat
-setx GOOGLE_API_KEY "your-gemini-api-key"
-```
+The service owns the `concept_explainer` schema in AkadVerse's Postgres instance.
+It does not own or modify another service's tables.
 
-After using `setx`, open a new terminal before starting the service. Startup
-fails immediately with a clear `RuntimeError` if the variable is missing or
-empty. Do not commit API keys to source control, README files, or `.env`
-files that are not excluded from version control.
+1. Configure a reachable Supabase Postgres connection with permissions to apply
+   the service migrations. Use the actual connection details from your dashboard.
+   The documented local setup uses the Session pooler on port 5432.
+2. Verify pgvector is enabled, using the Supabase dashboard or an authorized SQL
+   session: `SELECT extname FROM pg_extension WHERE extname = 'vector';`.
+3. Apply `migrations/001_pgvector_storage.sql`, then
+   `migrations/002_jobs_table.sql`, manually through the SQL editor or psql.
+   Run each complete transaction, including its local search path.
 
----
+Migration 001 creates the schema, pgvector prerequisite, chunks table, and
+indexes. Migration 002 creates durable jobs and the status/creation-time index.
+They are not automatically applied at application startup, and neither migrates
+data from retired local indexes. `IF NOT EXISTS` supports reruns but does not reconcile
+incompatible existing table definitions.
 
-## API Endpoints
+The `chunks` table stores a generated ID, document ID, content, `vector(768)`
+embedding, JSONB metadata, and creation time. The `jobs` table stores a UUID,
+unique document ID, status, JSONB payload, attempts, last error, and timestamps.
 
-### 1. `POST /upload-note`
+`DATABASE_URL` may use `postgresql://`; `db.py` selects `postgresql+psycopg`
+internally. URL-encode special characters in the password component only.
+The async engine uses `NullPool`, hidden SQL parameters, a 15-second driver
+connection timeout, and disabled automatic prepared statements. Hidden
+parameters do not make every possible traceback safe to share.
 
-**What it does:** Accepts a PDF lecture note, splits it into 1000-character
-overlapping chunks, generates embeddings using Gemini, and stores everything
-in a FAISS vector index on disk. This must be called before using
-`/explain-concept`.
+## API endpoints
 
-**Form fields:**
+### POST /ingest
 
-| Field | Required | Description | Example |
-|---|---|---|---|
-| `file` | Yes | A PDF file to index (max 50 MB) | `lecture_notes.pdf` |
+Backend-only queue admission, authenticated with `Authorization: Bearer <shared-secret>`.
+The token is compared using `secrets.compare_digest`. Provider authentication
+is configured on the server and is separate from this inbound shared secret.
 
-**Success response (200 OK):**
-
-```json
-{
-  "status": "success",
-  "message": "'lecture_notes.pdf' has been processed and indexed. You can now ask questions about its content.",
-  "filename": "lecture_notes.pdf",
-  "chunks_embedded": 64,
-  "pages_loaded": 64
-}
-```
-
-**File too large (413):**
-
-```json
-{
-  "detail": "File too large: 72.3 MB. Maximum allowed size is 50 MB. Please upload a focused set of lecture notes rather than a full textbook."
-}
-```
-
-**Non-PDF file (400):**
-
-```json
-{
-  "detail": "Only PDF files are supported."
-}
-```
-
-**Expected terminal output during upload:**
-
-```
-[Upload] Processing 'lecture_notes.pdf' (1470.0 KB)...
-[Upload] Loaded 64 pages from 'lecture_notes.pdf'.
-[Upload] Split into 64 chunks. Starting embedding...
-[Embedding] Trying model: models/gemini-embedding-001
-[Embedding] 11/64 chunks embedded...
-[Embedding] 21/64 chunks embedded...
-...
-[FAISS] Index saved to 'akadverse_concept_faiss_index'.
-[Embedding] All 64 chunks embedded successfully with models/gemini-embedding-001.
-[KAFKA MOCK] Published event 'note.uploaded'. Document indexed for student session.
-[Upload] Temp file 'a3f1b2c4_lecture_notes.pdf' cleaned up.
-```
-
-> **Note on upload time:** Embedding is rate-limited to 10 chunks per batch
-> with an 8-second pause between batches to stay within the Gemini API limit
-> of 100 requests per minute. A 64-chunk PDF takes approximately 55 seconds.
-> A progress log prints after every batch so you know it has not frozen.
-
-> **Note on the UUID prefix:** The `a3f1b2c4_` prefix in the temp filename
-> log is a randomly generated 8-character identifier that prevents filename
-> collisions when two users upload files with the same name simultaneously.
-
----
-
-### 2. `POST /explain-concept`
-
-**What it does:** Answers a question using only the content from your uploaded
-PDF. Retrieves the three most relevant chunks from the FAISS index and
-generates a structured pedagogical explanation. If the concept is not
-covered in the notes, it says so rather than hallucinating.
-
-Requires a prior call to `/upload-note`. If the server was restarted since
-the last upload, the index is loaded from disk automatically -- no
-re-upload needed.
-
-**Form fields:**
-
-| Field | Required | Description | Example |
-|---|---|---|---|
-| `question` | Yes | The concept or question to explain | `Explain the stepping-stone method` |
-
-**Success response (200 OK):**
+Example request with illustrative, non-secret values:
 
 ```json
 {
-  "concept": "Stepping-Stone Method for Transportation Problems",
-  "simple_explanation": "The Stepping-Stone Method is a technique used to optimise transportation problems...",
-  "analogy": "Imagine you're finding the quickest route through a series of islands to deliver packages...",
-  "example": "I do not know based on the provided notes. The notes describe the algorithm steps but do not provide a concrete numerical example.",
-  "worked_problem": "I do not know based on the provided notes. The notes outline the general steps but do not walk through a specific numerical problem."
-}
-```
-
-> The `"I do not know based on the provided notes"` responses above are
-> **correct, expected behaviour** -- not an error. The model is grounded
-> strictly in your uploaded notes and refuses to invent content. Use
-> `/explain-with-grounding` to supplement these gaps.
-
-**No notes uploaded (400):**
-
-```json
-{
-  "detail": "No lecture notes found. Please upload a PDF first via the /upload-note endpoint, then ask your question."
-}
-```
-
-**Expected terminal output:**
-
-```
-[FAISS] Loaded existing index from 'akadverse_concept_faiss_index'.
-[Model] Using generative model: gemini-2.5-flash
-[Explain] Generating explanation for: 'Explain the stepping-stone method...' using gemini-2.5-flash...
-[KAFKA MOCK] Published event 'session.ended' — study interaction logged.
-```
-
----
-
-### 3. `POST /explain-with-grounding`
-
-**What it does:** Answers a question by searching the live web using Gemini's
-native Google Search Grounding tool. No PDF upload is required. Returns a
-structured explanation plus the web sources Gemini cited so students can
-verify the information.
-
-**Form fields:**
-
-| Field | Required | Description | Example |
-|---|---|---|---|
-| `question` | Yes | Any academic concept or question | `Explain Dijkstra's shortest path algorithm` |
-
-**Success response (200 OK):**
-
-```json
-{
-  "concept": "Dijkstra's algorithm is a greedy algorithm used to find shortest paths...",
-  "simple_explanation": "Imagine you're finding the quickest way from your starting point to every location on a map...",
-  "analogy": "Consider a search-and-rescue operation in a city where rescue teams always go to the closest unrescued location...",
-  "example": "A common real-world application is GPS navigation systems. When you request directions, the GPS treats intersections as nodes and roads as weighted edges...",
-  "worked_problem": "Let's find the shortest path from node A to all other nodes...\n\n1. Initialization: distances = {A: 0, B: ∞, C: ∞, D: ∞, E: ∞}...\n2. Current Node A (distance 0): Update neighbors B: 4, C: 2...",
-  "sources": [
-    {
-      "title": "wikipedia.org",
-      "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/..."
-    },
-    {
-      "title": "stanford.edu",
-      "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/..."
-    },
-    {
-      "title": "freecodecamp.org",
-      "url": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/..."
-    }
-  ]
-}
-```
-
-> **About the source URLs:** The `vertexaisearch.cloud.google.com/grounding-api-redirect/...`
-> format is normal and expected. Google proxies all grounding citation URLs
-> through their redirect service. Clicking them in a browser takes you to
-> the original source page (Wikipedia, Stanford, FreeCodeCamp, etc.).
-
-**Expected terminal output:**
-
-```
-[Model] Using generative model: gemini-2.5-flash
-[Grounding] Using model: gemini-2.5-flash with Google Search grounding...
-[Grounding] Received grounded response (11325 chars).
-[Grounding] Extracted 7 cited source(s).
-[KAFKA MOCK] Published event 'session.ended' — grounded study interaction logged.
-```
-
----
-
-### 4. `GET /health`
-
-**What it does:** Reports service status, FAISS index state, and a map of
-all available endpoints. Call this first to confirm the service started
-correctly before testing other endpoints.
-
-**No parameters required.**
-
-**Success response (200 OK):**
-
-```json
-{
-  "status": "ok",
-  "version": "1.2",
-  "index_in_memory": false,
-  "index_on_disk": true,
-  "rag_status": "Ready — index on disk, loads on first question.",
-  "grounding_status": "Ready — no PDF required for /explain-with-grounding.",
-  "endpoints": {
-    "POST /upload-note": "Upload a PDF lecture note for RAG Q&A.",
-    "POST /explain-concept": "Ask a question answered from your uploaded notes.",
-    "POST /explain-with-grounding": "Ask any question answered from live web search.",
-    "GET  /health": "This endpoint."
+  "document_id": "lecture-001",
+  "file_url": "https://example.com/signed/lecture.docx",
+  "file_name": "lecture.docx",
+  "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "callback_url": "https://example.com/api/webhooks/ai-ingest",
+  "metadata": {
+    "course_code": "CSC 201",
+    "course_title": "Data Structures",
+    "course_offering_id": "offering-001",
+    "academic_session": "2025/2026",
+    "semester": "First",
+    "start_week": 1,
+    "end_week": 2,
+    "weeks": [1, 2],
+    "material_type": "NOTES",
+    "title": "Introduction",
+    "document_id": "lecture-001"
   }
 }
 ```
 
-**Reading the index status fields:**
+All displayed request and metadata fields are required. `file_url` is validated
+as an HTTP URL. Before queueing, `callback_url` must use HTTPS, have no embedded
+credentials, and match an explicitly listed hostname. Host comparison ignores
+case and trims whitespace around allowlist entries; it does not match wildcards
+or implicitly authorize subdomains. The example requires `example.com` in the
+operator's allowlist; it is not a default authorized destination.
 
-| `index_in_memory` | `index_on_disk` | What it means |
+Admission awaits DNS resolution with a two-second timeout. Listed hosts must
+resolve only to globally routable addresses, except explicitly listed
+`localhost` and `127.0.0.1`, which bypass the private-address guard for local
+development. HTTPS is still required for those local hosts. Invalid URLs,
+HTTP callbacks, unlisted hosts, and disallowed/unresolvable addresses return
+422 with a callback-specific detail. DNS is checked at admission, not pinned
+to the later connection, so this is not a guarantee against DNS rebinding.
+
+Success: HTTP `202`, `{"status":"queued","document_id":"lecture-001"}`.
+This confirms queue admission, not extraction or embedding success.
+
+| Response | Meaning |
+|---|---|
+| `401` | Missing or incorrect Bearer token when ingestion is otherwise ready |
+| `422` | Invalid request fields or unsupported MIME type, including ZIP |
+| `503` | Enterprise mode required, configuration missing, or database unavailable |
+
+A new document starts queued with attempts zero. A duplicate document ID
+requeues the existing job and increments attempts while preserving its original
+payload. The worker increments attempts again when claiming a job. Therefore,
+`attempts` is not purely a count of completed processing attempts. Reposting a
+changed signed URL does not replace the existing job's original URL today.
+
+### DELETE /documents/{document_id}
+
+Uses the same `require_ingest_auth` dependency and Bearer token as `/ingest`,
+including its configured/ready-state checks. The path parameter is a string.
+The request deletes matching chunks, then matching jobs, in one database
+transaction using async I/O. It does not enqueue work or delete the remote file.
+
+- `204 No Content`, with no body, if either table had matching rows.
+- `404 Not Found`, with `{"detail":"Document not found"}`, if neither did.
+- `401` for missing/wrong auth when ready; `503` for unavailable configuration
+  or database operations. Next.js treats both 204 and 404 as successful deletion.
+
+Other document IDs are untouched. An in-flight worker detects a removed job
+when its conditional finalization returns no row, as described below.
+
+### GET /health
+
+Returns status, provider, version, grounding status, available endpoints, plus `ingest_status`, `worker_status`,
+and `worker_count`. In ready Enterprise mode these include `ready`, `running`,
+and the configured count. Disabled states identify missing ingestion settings,
+Developer mode, or database unavailability. The configured count is not a count
+of currently healthy tasks. Startup probes the database with a two-second
+application timeout; health does not perform a fresh live LLM request.
+
+The embedded `endpoints` map lists ingestion, document deletion, grounding, and health.
+
+### POST /explain-with-grounding
+
+Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`.
+Form field: `question`.
+
+In Swagger at `/docs`, click **Authorize**, enter the `AI_SERVICE_API_KEY`
+value without the `Bearer` prefix, and authorize. Swagger attaches the Bearer
+header to protected requests. The secret is never prefilled from the server environment.
+
+Uses `Depends(require_shared_secret_auth)` with the same inbound shared secret
+as ingestion. Missing or incorrect auth returns 401 when the secret is configured;
+an unset or blank `AI_SERVICE_API_KEY` returns 503. Database, callback configuration,
+and ingestion readiness do not gate this endpoint. No new env var.
+Gemini with Google Search returns the five explanation fields and cited sources.
+
+## Extraction and processing
+
+| MIME type | Extractor | Extracted content |
 |---|---|---|
-| `false` | `false` | No PDF uploaded yet. Upload one before using `/explain-concept`. |
-| `false` | `true` | Index exists from a prior session. Will load on the first question. |
-| `true` | `true` | Index is loaded in memory and ready. `/explain-concept` responds immediately. |
+| `application/pdf` | pypdf `PdfReader` | Page text joined with newlines |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | python-docx | Paragraphs first, then table cells |
+| `application/vnd.openxmlformats-officedocument.presentationml.presentation` | python-pptx | Slide shape text frames and existing non-empty speaker notes |
 
----
+DOCX interleaved paragraph/table order is not preserved. The accepted policy is
+to upgrade traversal only if a real lecturer document demonstrates lost
+adjacency during chunking; see `AGENTS.md`. PDF OCR is not implemented, and
+image-only content does not become text automatically.
 
-## Testing with Swagger UI
+`services.extractors.extract_text(file_path, mime_type)` dispatches to the
+format modules. They share `ExtractionError`. Empty documents and corrupt
+files fail rather than silently producing empty output; error messages do not
+include the file path. Empty PDF text reports
+`No extractable text (scanned PDF?)`. Office formats identify DOCX or PPTX in
+their empty-text message. Unsupported dispatcher MIME types also raise
+`ExtractionError`; the HTTP route rejects unsupported types before enqueueing.
 
-FastAPI auto-generates an interactive testing interface. Once the server is
-running, open your browser and go to:
+`services.chunking.chunk_text(text)` preserves the splitter's 1000-character
+size and 200-character overlap settings. Actual chunks can be shorter because
+of separator boundaries. Extraction and chunking run through `asyncio.to_thread`
+in the worker to keep blocking library work off the event loop.
 
-```
-http://127.0.0.1:8010/docs
-```
+The worker downloads to `/tmp/<uuid>_<sanitized-basename>`, follows redirects,
+and enforces a 60-second download timeout and 20 MB byte limit. These limits belong to ingestion.
+The remote Supabase object is never deleted or modified. The temporary file
+is removed in `finally` on success or failure.
 
-You will see all four endpoints listed. To test any endpoint:
+Embeddings are requested in batches of at most 10 chunks with eight seconds
+between batches. The embedding service validates the number of vectors,
+768 dimensions, and finite values. It requests one SDK attempt and does not
+implement automatic retries. Failure marks the job failed with a safe message.
+No fixed worker count or throughput is guaranteed safe for every Cloud project;
+verify the applicable quota before increasing concurrency.
 
-1. Click the endpoint name to expand it.
-2. Click **"Try it out"** (top right of the endpoint card).
-3. Fill in the displayed request fields. The Gemini key is already configured
-  in the server environment and is not a request field. For file uploads,
-  click **"Choose File"**.
-4. Click **"Execute"**.
-5. The response appears below, along with the exact `curl` command used.
+## Jobs and workers
 
-> Keep your terminal visible alongside the browser to see server logs in
-> real time as requests come in.
+Startup recovers processing jobs older than five minutes by requeueing them,
+then launches `WORKER_COUNT` tasks. Each task claims one job at a time using
+`FOR UPDATE SKIP LOCKED`; an empty queue is polled every two seconds. Recovery
+runs at startup, not periodically. Lifespan creates one shared callback
+`httpx.AsyncClient` with `follow_redirects=False` and `trust_env=False`, stores
+it on `app.state.callback_client`, and passes it with `CallbackSettings` to
+every worker. Shutdown cancels and awaits all workers, closes that client,
+then disposes the database engine.
 
----
-
-## Example Test Inputs
-
-Run these in order for a complete end-to-end verification.
-
----
-
-### Test 1 — Health check
-
-Call `GET /health`. Confirm `"status": "ok"` and grounding status shows
-`"Ready"`. This verifies the server started correctly.
-
----
-
-### Test 2 — Search Grounding (no PDF needed)
-
-Call `POST /explain-with-grounding`:
-
-| Field | Value |
+| Status | Current meaning, unchanged by Phase 2e |
 |---|---|
-| `question` | `Explain Dijkstra's shortest path algorithm` |
+| `queued` | Waiting for a worker |
+| `processing` | Claimed; attempts incremented |
+| `done` | Document chunks replaced and job completion committed |
+| `failed` | Processing failed; safe `last_error` stored, at most 500 characters |
 
-**Expected:** All five explanation fields richly populated, plus a `sources`
-list with 3 to 8 citations from sites like Wikipedia, Stanford, FreeCodeCamp,
-and Brilliant. Response takes 5 to 15 seconds.
+Chunk deletion, insertion, and marking the job done occur in one transaction.
+A failed insert rolls back replacement so previously stored chunks survive.
+Both done and failed finalization use `WHERE id=:job_id AND status='processing'
+RETURNING id`. If no row is returned, the worker logs
+`job.cancelled_during_processing` and sends no callback or failed update.
+The success path also deletes chunks it just wrote for the document in that
+transaction. Cancellation is not an additional persistent job status.
 
----
+Errors use safe stage messages or extraction messages, normalize whitespace,
+and reject backslashes, `/home/`, `/tmp/`, `/var/`, or four consecutive
+whitespace-separated alphabetic tokens each longer than 20 characters. Rejected messages become
+`Processing failed (see server logs)`. Accepted messages are capped once at
+500 characters; DB `last_error` and the failed callback reuse the same value.
+Failed jobs are not automatically retried; another admission request can requeue
+them with the original payload. Worker database failures stop the affected task
+and disable ingestion; no automatic worker restart is implemented.
 
-### Test 3 — Upload a PDF
+## Outbound callbacks
 
-Call `POST /upload-note`:
+`services/callback.py` owns `CallbackSettings` and
+`post_callback(client, *, url, secret, document_id, status, chunk_count=None,
+error=None) -> bool`. The worker uses the stored job payload's `callback_url`.
+The client never constructs its own HTTP client or accesses the database.
+It rechecks HTTPS, absence of URL credentials, exact host authorization, and
+a non-empty secret at delivery time, including for previously queued jobs.
 
-| Field | Value |
-|---|---|
-| `file` | Any PDF lecture note you have (under 50 MB) |
+POST authentication is `Authorization: Bearer <AI_SERVICE_CALLBACK_SECRET>`.
+Success body: `{"document_id":"lecture-001","status":"ingested","chunk_count":42}`.
+Failure body: `{"document_id":"lecture-001","status":"failed","error":"Safe error"}`.
+Only the status-appropriate field is included, never both `chunk_count` and
+`error`. Callbacks run after the transaction and temp-file cleanup, outside the
+processing exception handler. The worker logs the Boolean delivery outcome.
 
-**Expected:** `200 OK` with `chunks_embedded` and `pages_loaded` counts.
-Progress logs appear in your terminal every 10 chunks. After completion,
-`GET /health` should show `index_on_disk: true`.
+- Success requires HTTP 200 with a JSON object containing literal `"ok": true`.
+  Additional fields, including `"ignored":"unknown document_id"`, are allowed.
+- Three total attempts use backoff sleeps of one second, then four seconds.
+  Each request uses HTTPX's five-second timeout setting; this is not a strict
+  overall delivery deadline.
+- Retry 5xx, timeouts/connection errors, 3xx, unexpected 2xx, and 200 responses
+  with malformed JSON or without literal `"ok": true`.
+- Never follow callback redirects, including when a supplied client enables
+  them. A 4xx response returns False immediately without retries.
+- Exhaustion logs `callback.failed_permanent` and returns False. Authorization
+  or body validation failures also return False without sending a request.
 
----
+Callback service logs contain document ID, hostname only, processing status, attempt,
+HTTP status when available, and reason. They do not include the secret,
+Authorization header, full URL, or response body. `job.callback_outcome` records
+delivery success/failure without changing the committed job or chunks.
 
-### Test 4 — Ask from your notes
+Delivery is best effort: there is no durable callback outbox or later redelivery
+after exhaustion. A crash after DB commit and before delivery can lose the
+notification. Admission-time DNS checks are not repeated or pinned by the
+callback client; the required host allowlist is rechecked at delivery time.
 
-Call `POST /explain-concept` with a question about a topic in your PDF:
+## Testing
 
-| Field | Value |
-|---|---|
-| `question` | A concept from your uploaded lecture note |
+From this service directory:
 
-**Expected:** A structured response grounded in your lecturer's material.
-If a concept is not explicitly covered in the notes, `"I do not know based
-on the provided notes"` will appear in the relevant fields. This is correct
-behaviour, not an error.
-
----
-
-### Test 5 — FAISS persistence across restarts
-
-Stop the server with `Ctrl+C`. Restart it. Without re-uploading any PDF,
-immediately call `POST /explain-concept` with the same question from Test 4.
-
-**Expected:** The same quality response. Terminal should show:
-
-```
-[FAISS] Loaded existing index from 'akadverse_concept_faiss_index'.
-```
-
-This confirms the FAISS persistence is working -- the index survived the
-server restart and was reloaded automatically.
-
----
-
-### Test 6 — Compare modes on the same question
-
-Use a topic from your uploaded PDF that the notes cover conceptually but
-without a worked example. Call both endpoints with the same question:
-
-**`/explain-concept` result:** `simple_explanation` and `analogy` populated
-from lecturer's notes; `example` and `worked_problem` may say "I do not know."
-
-**`/explain-with-grounding` result:** All five fields populated from the web;
-`sources` lists the sites used.
-
-This side-by-side comparison is the clearest demonstration of how the two
-modes complement each other in a real student workflow.
-
----
-
-### Test 7 — File size guard
-
-Attempt to upload a file over 50 MB via `/upload-note`.
-
-**Expected:** A `413 Request Entity Too Large` response showing the actual
-file size and the limit. No embedding or API calls should start.
-
----
-
-## Understanding the Responses
-
-### Why some fields say "I do not know"
-
-In `/explain-concept`, the model is explicitly instructed to ground its
-answer strictly in the uploaded notes and not to invent information. If
-your PDF describes a concept's procedure but does not include a numerical
-example or worked calculation, those fields return `"I do not know based
-on the provided notes"`. This is honest, safe behaviour -- not a bug.
-
-Use `/explain-with-grounding` to fill those gaps from the web.
-
-### About the grounding source URLs
-
-URLs in the `sources` array always look like:
-
-```
-https://vertexaisearch.cloud.google.com/grounding-api-redirect/AUZIYQ...
+```powershell
+uv run pytest tests/ -q --tb=short --timeout=30
 ```
 
-This is normal. Google routes all grounding citations through their redirect
-service. Clicking the URL in a browser takes you to the original page.
+Recorded verification on 27 October 2026, after the developer-approved skip:
 
-### Why uploads take time
+| Full-suite run | Result | Pytest duration |
+|---|---|---|
+| 1 | 162 passed, 1 skipped, 1 warning | 189.51 seconds |
+| 2 | 162 passed, 1 skipped, 1 warning | 184.04 seconds |
+| 3 | 162 passed, 1 skipped, 1 warning | 193.38 seconds |
 
-The Gemini embedding API is rate-limited to 100 requests per minute. The
-service sends 10 chunks at a time with an 8-second pause between batches.
-A 64-chunk PDF takes approximately 55 seconds. A progress line prints after
-each batch so you can track it. The service is not frozen -- it is waiting
-to respect the rate limit.
+All three commands exited successfully. The warning is the existing
+Starlette/AnyIO `BlockingPortal` deprecation. None met the requested
+under-60-second target. These are recorded test results, not a claim that the
+suite is rerun for each documentation edit.
 
-### Why grounding responses take longer than RAG responses
+There are 163 cases: 164 baseline cases minus one obsolete API-key case and
+two legacy-wrapper cases, plus two grounding auth cases. One case is skipped,
+not deselected or deleted.
 
-`/explain-with-grounding` performs a live Google Search and synthesises
-content from multiple web pages before responding. This takes 5 to 15
-seconds depending on the topic and Gemini's current load. RAG responses
-from `/explain-concept` are faster because all retrieval is local.
+`tests/test_worker.py::test_multiple_workers_no_collision` has an approved skip
+for an intermittent hang at `portal.call(settle)`. Diagnosis reproduced the
+timeout in one of three full-suite runs. Root cause is unconfirmed, and no
+hanging-run pending-task snapshot was captured. The test remains pending a
+dedicated investigation. The passing
+`test_workers_share_callback_client_until_shutdown` covers callback-client
+sharing and shutdown order with three mocked workers; it does not replace
+the skipped test's collision-free concurrent job-claim coverage.
 
----
+Tests cover provider configuration, authentication, queue admission, embedding
+validation, extraction/dispatch, chunk boundaries, startup recovery, worker
+client sharing and shutdown, document replacement, safe worker failures,
+transactional deletion,
+strict callback response handling, retries, redirect refusal, and host
+authorization. Worker tests verify DB status at callback time, preserved status
+after delivery failure, and cancellation on both success and failure paths.
+Cancellation uses `asyncio.Event` barriers rather than timing sleeps.
+Worker integration
+uses real isolated Postgres inserts, real file extraction, mocked downloads,
+and mocked embeddings/callbacks. Delivery tests use `httpx.MockTransport`, not
+live webhook requests. The PDF fixture is committed at
+`tests/fixtures/sample.pdf`; DOCX/PPTX fixtures are generated programmatically.
+The PDF ignore exception is intentional.
 
-## Choosing the Right Mode
+The test database must be reachable with pgvector enabled and permissions for
+isolated schemas. Tests create unique `concept_explainer_test_<uuid>` schemas
+and clean up or roll back their changes. Do not point test writes at production
+service tables. `tests/conftest.py` sets the Windows selector policy.
 
-| I want to... | Use this endpoint |
-|---|---|
-| Study content my lecturer specifically taught | `/explain-concept` after uploading their PDF |
-| Get a worked example my notes do not have | `/explain-with-grounding` |
-| Understand a concept not yet covered in class | `/explain-with-grounding` |
-| See where the AI's information came from | `/explain-with-grounding` (returns cited URLs) |
-| Prepare for an exam using my exact lecture material | `/explain-concept` |
-| Use the service without uploading anything | `/explain-with-grounding` |
+Always use `--tb=short`; traceback locals can expose secrets. If more detail is
+necessary, run only the failing test with `--tb=long` and redact before sharing.
+Automated tests do not establish live ADC access, model availability, Cloud
+quota, or actual callback delivery. Provider tests mock external generation.
 
----
+## Troubleshooting
 
-## Generated Files
+- **Ingestion unavailable:** check `/health`, Enterprise selection, private
+  database/auth configuration, callback secret, required host allowlist, both
+  migrations, and database reachability.
+- **Callback URL rejected:** check HTTPS, exact hostname membership, and DNS.
+  Localhost/127.0.0.1 must be explicitly listed and still require HTTPS. An
+  empty allowlist disables ingestion instead of permitting arbitrary hosts.
+- **Callback delivery failed:** inspect `callback.attempt`,
+  `callback.failed_permanent`, and `job.callback_outcome`. The receiver must
+  return HTTP 200 with `{"ok":true}`; redirects are not followed and 4xx is
+  not retried. A done job can still have an undelivered callback.
+- **Windows Psycopg/Proactor error:** launch through `uv run python run.py`;
+  do not switch to a synchronous driver to hide the loop configuration problem.
+- **Missing packages:** run `uv pip install -r requirements.txt` in the root uv
+  environment. Locally installed Office packages do not replace declared pins.
+- **Database test timeout:** check database reachability and rerun the failing
+  test in isolation with short tracebacks before changing application code.
+- **Expired download URL:** a download `403` records
+  `Signed URL expired, retry needed`. Reposting the same ID currently retains
+  the old payload; coordinate URL refresh behavior rather than assuming it updates.
+- **Empty/scanned/corrupt file:** inspect `jobs.last_error`; there is no OCR fallback.
+  Unlike queue validation errors, these failures happen after the `202` response.
+- **Embedding failure:** verify access and quota for the configured model and
+  location without exposing SDK exceptions or credentials.
+- **Port conflict:** stop the conflicting service on 8010 or consult the platform
+  registry for an available testing port. Do not reuse another tool's reserved port.
+## Project structure
 
-Running this service creates the following files in your project folder.
-**Do not commit these to version control** -- they are listed in `.gitignore`.
-
-| File / Folder | What it is |
-|---|---|
-| `akadverse_concept_faiss_index/` | FAISS vector index folder, created on first upload |
-| `akadverse_concept_faiss_index/index.faiss` | The binary FAISS index file |
-| `akadverse_concept_faiss_index/index.pkl` | Serialised document metadata |
-
-To reset to a clean state and wipe all uploaded notes:
-
-```bash
-# Windows
-rmdir /s /q akadverse_concept_faiss_index
-
-# macOS/Linux
-rm -rf akadverse_concept_faiss_index
-```
-
-After resetting, `GET /health` will show `index_on_disk: false` and you
-will need to upload a PDF again before using `/explain-concept`.
-
----
-
-## Common Errors and Fixes
-
-**`ModuleNotFoundError: No module named 'google.genai'`**
-```bash
-pip install "google-genai>=1.67.0"
-```
-
-**`ModuleNotFoundError: No module named 'faiss'`**
-```bash
-pip install faiss-cpu
-```
-
-**`ModuleNotFoundError: No module named 'pypdf'`**
-```bash
-pip install pypdf
-```
-
-**`AttributeError` related to `types.Tool` or `types.GoogleSearch`**
-
-Your `google-genai` version is below 1.67.0. Upgrade it:
-```bash
-pip install --upgrade "google-genai>=1.67.0"
-```
-
-**`400` or `403` on `/explain-with-grounding` mentioning grounding not supported**
-
-Your API key may need Google Search Grounding enabled or billing configured
-in your Google Cloud project. Check quota settings at
-[https://aistudio.google.com](https://aistudio.google.com). Grounding
-requires at least the Pay-as-you-go tier in some regions.
-
-**`413 Request Entity Too Large` on `/upload-note`**
-
-Your PDF exceeds 50 MB. Upload a focused set of lecture slides rather than
-a full textbook. To raise the limit, change `MAX_UPLOAD_SIZE_MB` at the
-top of `concept_explainer.py`.
-
-**`400 Bad Request`: "No lecture notes found"**
-
-You called `/explain-concept` before uploading a PDF, or the FAISS index
-was deleted. Call `GET /health` to check `index_on_disk`, then upload a
-PDF if needed.
-
-**`422 Unprocessable Entity`: "Could not extract any text from the PDF"**
-
-The PDF is likely a scanned image rather than a text-based document.
-Image-only PDFs cannot be processed -- the text must be selectable (you
-should be able to highlight and copy it in a PDF viewer).
-
-**Upload appears frozen in the terminal**
-
-This is normal during the 8-second sleep between embedding batches. Wait
-for the next batch log line to appear. For a 64-chunk document you will
-see roughly 7 batch logs in total before completion.
-
-**`Address already in use` on startup**
-
-Port 8010 is occupied by another process. Use a different port:
-```bash
-uvicorn concept_explainer:app --host 127.0.0.1 --port 8009 --reload
-```
-
----
-
-## Project Structure
-
-```
+```text
 akadverse-concept-explainer/
-│
-├── concept_explainer.py                  # Main microservice — all logic here
-├── requirements.txt                      # Python dependencies
-├── README.md                             # This file
-├── .gitignore                            # Excludes index folder and env files
-│
-└── akadverse_concept_faiss_index/        # Generated on first upload — DO NOT COMMIT
-    ├── index.faiss
-    └── index.pkl
+  main.py                      FastAPI lifespan, router wiring, health
+  run.py                       Windows-compatible launcher, port 8010
+  auth.py                      Ingestion shared-secret authentication
+  models.py                    Ingestion request/response schemas
+  config.py                    Provider/storage settings and worker constants
+  db.py                        Async Postgres engine and session factory
+  routes/
+    ingest.py                  POST /ingest
+    documents.py               Transactional DELETE /documents/{document_id}
+    grounding.py               Retained Google Search Grounding route
+  workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
+  services/
+    embedding.py               Enterprise batch embeddings
+    callback.py                CallbackSettings and bounded authorized delivery
+    chunking.py                Shared text splitting
+    gemini_provider.py         Provider clients and Enterprise discovery
+    model_discovery.py         Developer model discovery
+    extractors/
+      __init__.py              MIME dispatcher
+      errors.py                Shared ExtractionError
+      pdf.py                   PDF text
+      docx.py                  DOCX paragraphs and tables
+      pptx.py                  PPTX slides and speaker notes
+  migrations/
+    001_pgvector_storage.sql
+    002_jobs_table.sql
+  tests/
+    conftest.py                Isolated database and generated Office fixtures
+    test_api_key_env.py
+    test_auth.py
+    test_callback.py
+    test_db.py
+    test_delete.py
+    test_embedding.py
+    test_extractors.py
+    test_gemini_provider.py
+    test_grounding.py
+    test_ingest.py
+    test_refactor.py
+    test_worker.py
+    test_worker_extractors.py
+    fixtures/sample.pdf
+  AGENTS.md
+  README.md
+  requirements.txt
+  .env.example
 ```
 
----
+## Integration and next steps
 
-## Part of the AkadVerse Platform
+Next.js supplies a signed file URL and an HTTPS callback URL whose hostname
+the operator has explicitly authorized. The receiver validates the shared
+Bearer secret and responds with HTTP 200 and `{"ok":true}`, including for an
+ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
+404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
+There is still no job-status HTTP endpoint.
 
-This microservice is **Tier 5** in the AkadVerse AI architecture, operating
-within the E-Learning module alongside:
+Phase 2e is implemented and committed locally in `54a6ecb`. Before deployment, verify
+the real receiver, TLS/DNS configuration, both shared secrets, allowlisted
+hosts, ADC/model access, and quotas without exposing credentials. Automated
+tests do not establish those live integration prerequisites or remote merge
+status. Rotate previously exposed secrets and exchange replacements privately.
 
-- External Resources Puller (Port 8007)
-- Notes Creator (Port 8008)
-- Quiz Generator (Port 8009)
-- Slides Creator (Port 8010)
-
-All Tier 5 services communicate with the rest of the platform via Apache
-Kafka event bus (simulated locally with FastAPI webhooks during development).
-The `[KAFKA MOCK]` log lines in the terminal represent events that would be
-published to the real Kafka bus in production.
-
----
-
-*AkadVerse AI Architecture v1.0*
+Verify Phase 2e remote merge status before the next implementation phase.
+Investigate and restore the skipped concurrency test separately. Phase 3 adds
+pgvector retrieval and requires its own explicit scope and authorization;
+Phase 4 adds Stewart chat history. Neither phase is implemented. ZIP support
+remains deferred.
