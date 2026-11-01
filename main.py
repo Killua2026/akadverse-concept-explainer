@@ -49,7 +49,7 @@ async def configure_ingestion(application: FastAPI) -> None:
             if database is None:
                 database = Database(StorageSettings.from_env())
                 application.state.ingest_database = database
-            await asyncio.wait_for(probe_ingestion_database(database), timeout=5.0)
+            await asyncio.wait_for(probe_ingestion_database(database), timeout=20.0)
         except TimeoutError:
             logger.warning("Startup DB probe attempt %s/3: timeout", attempt)
         except (OSError, RuntimeError, SQLAlchemyError):

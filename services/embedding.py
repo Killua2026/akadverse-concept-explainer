@@ -24,22 +24,20 @@ async def embed_chunks(chunks: list[str], settings: GeminiSettings) -> list[list
         )
         async with client.aio as api:
             result: list[list[float]] = []
-            for offset in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
-                if offset:
+            for index, chunk in enumerate(chunks):
+                if index and index % EMBEDDING_BATCH_SIZE == 0:
                     await asyncio.sleep(EMBEDDING_BATCH_SLEEP_SECONDS)
-                batch = chunks[offset:offset + EMBEDDING_BATCH_SIZE]
                 response = await api.models.embed_content(
-                    model=EMBEDDING_MODEL, contents=batch,
+                    model=EMBEDDING_MODEL, contents=[chunk],
                     config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS),
                 )
                 embeddings = response.embeddings or []
-                if len(embeddings) != len(batch):
+                if len(embeddings) != 1:
                     raise ValueError("Incorrect embedding count")
-                for embedding in embeddings:
-                    values = [float(value) for value in (embedding.values or [])]
-                    if len(values) != EMBEDDING_DIMENSIONS or not all(map(math.isfinite, values)):
-                        raise ValueError("Invalid embedding dimensions or values")
-                    result.append(values)
+                values = [float(value) for value in (embeddings[0].values or [])]
+                if len(values) != EMBEDDING_DIMENSIONS or not all(map(math.isfinite, values)):
+                    raise ValueError("Invalid embedding dimensions or values")
+                result.append(values)
             return result
     except Exception:
         # Never expose SDK errors containing authentication or request data.

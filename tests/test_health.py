@@ -51,7 +51,7 @@ async def test_startup_database_probe_succeeds_on_third_attempt(monkeypatch, cap
         assert application.state.ingest_status == "ready"
         assert application.state.worker_status == "running"
         assert probe.await_args_list == [call(database)] * 3
-        assert [entry.kwargs for entry in wait_for.await_args_list] == [{"timeout": 5.0}] * 3
+        assert [entry.kwargs for entry in wait_for.await_args_list] == [{"timeout": 20.0}] * 3
         assert sleep.await_args_list == [call(1), call(1)]
         recover.assert_awaited_once_with(database)
         assert [record.getMessage() for record in caplog.records if record.name == main.__name__] == [
