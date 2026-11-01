@@ -109,11 +109,28 @@ uv run python run.py
 ```
 
 `run.py` sets the Windows SelectorEventLoop policy before Uvicorn starts,
-binds to `0.0.0.0:8010`, and selects the asyncio loop. It does not enable
-reload. Direct Uvicorn startup bypasses this Windows policy setup.
+selects the asyncio loop, and disables reload. Bind address is environment-aware:
+local development (no `$PORT`) uses `127.0.0.1:8010`; container deployment
+(`$PORT` set) uses `0.0.0.0:$PORT`.
+Direct Uvicorn startup bypasses this Windows policy setup.
 Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the four current API
 operations and their request schemas. Port 8010 belongs to this service;
 consult the root `AGENTS.md` before choosing any other local testing port.
+
+### Docker
+
+```bash
+cd akadverse-concept-explainer
+docker build -t akadverse-concept-explainer .
+docker run --rm -p 8010:8010 --env-file .env akadverse-concept-explainer
+```
+
+The image installs from `requirements.txt`, runs `run.py`, and respects
+`$PORT` when the platform injects it (Railway, Render, Fly). Credentials
+must be provided via `GOOGLE_APPLICATION_CREDENTIALS_JSON` (base64) rather
+than `GOOGLE_APPLICATION_CREDENTIALS` (file path) because the file path
+does not exist inside the container. For this local Docker command, set
+`PORT=8010` in the private `.env` so the server accepts container traffic.
 
 ## Configuration
 
