@@ -1,10 +1,36 @@
 """Storage settings loaded explicitly from the process environment."""
 
 #this prevents the need to set the environment variables in the system before running the application
+import os
+
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
+if credentials_json := os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
+    import base64
+    import json
+    import tempfile
+    from pathlib import Path
+
+    try:
+        credentials_bytes = base64.b64decode(credentials_json, validate=True)
+    except (ValueError, base64.binascii.Error):
+        credentials_bytes = credentials_json.encode("utf-8")
+    try:
+        json.loads(credentials_bytes)
+    except (ValueError, UnicodeDecodeError):
+        raise RuntimeError(
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid base64-encoded JSON"
+        ) from None
+
+    cred_path = Path(tempfile.gettempdir()) / "gcp-service-account.json"
+    cred_path.write_bytes(credentials_bytes)
+    try:
+        cred_path.chmod(0o600)
+    except OSError:
+        pass  # Permission modes are not supported on every platform.
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(cred_path)
+
 EMBEDDING_MODEL = "gemini-embedding-2"
 EMBEDDING_LOCATION = "global"
 EMBEDDING_DIMENSIONS = 768
