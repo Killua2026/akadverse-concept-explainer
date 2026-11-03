@@ -42,14 +42,16 @@ async def post_callback(
     context = {"document_id": document_id, "url_host": url_host, "status": status}
     # Recheck authorization at delivery time, including jobs queued before validation existed.
     if not valid_url or url_host.lower() not in allowed or not secret:
-        logger.warning("callback.failed_permanent", extra={**context, "attempt_number": 0, "reason": "unauthorized_destination"})
+        logger.warning("callback.failed_permanent reason=%s document_id=%s", "unauthorized_destination", document_id,
+                       extra={**context, "attempt_number": 0, "reason": "unauthorized_destination"})
         return False
     if status == "ingested" and isinstance(chunk_count, int) and not isinstance(chunk_count, bool) and chunk_count >= 0:
         body = {"document_id": document_id, "status": status, "chunk_count": chunk_count}
     elif status == "failed" and isinstance(error, str):
         body = {"document_id": document_id, "status": status, "error": error}
     else:
-        logger.warning("callback.failed_permanent", extra={**context, "attempt_number": 0, "reason": "bad_body"})
+        logger.warning("callback.failed_permanent reason=%s document_id=%s", "bad_body", document_id,
+                       extra={**context, "attempt_number": 0, "reason": "bad_body"})
         return False
     reason = "bad_body"
     for attempt_number, delay in enumerate((0, 1, 4), start=1):
@@ -77,8 +79,11 @@ async def post_callback(
                     return True
                 reason = "bad_body"
             elif 400 <= response.status_code < 500:
-                logger.warning("callback.attempt", extra={**details, "reason": "4xx"})
-                logger.warning("callback.failed_permanent", extra={**details, "reason": "4xx"})
+                reason = "4xx"
+                logger.warning("callback.attempt reason=%s http_status=%s attempt=%s", reason, details.get("http_status"), attempt_number,
+                               extra={**details, "reason": reason})
+                logger.warning("callback.failed_permanent reason=%s document_id=%s", reason, document_id,
+                               extra={**details, "reason": reason})
                 return False
             elif 300 <= response.status_code < 400:
                 reason = "redirect"
@@ -86,6 +91,8 @@ async def post_callback(
                 reason = "5xx"
             else:
                 reason = "bad_body"
-        logger.warning("callback.attempt", extra={**details, "reason": reason})
-    logger.warning("callback.failed_permanent", extra={**details, "reason": reason})
+        logger.warning("callback.attempt reason=%s http_status=%s attempt=%s", reason, details.get("http_status"), attempt_number,
+                       extra={**details, "reason": reason})
+    logger.warning("callback.failed_permanent reason=%s document_id=%s", reason, document_id,
+                   extra={**details, "reason": reason})
     return False
