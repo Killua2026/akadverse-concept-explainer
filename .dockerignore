@@ -15,5 +15,3 @@ __pycache__/
 tests/
 akadverse_concept_faiss_index/
 *.log
-Dockerfile
-.dockerignore
