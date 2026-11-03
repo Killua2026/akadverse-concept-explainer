@@ -40,12 +40,13 @@ Status:
 - [x] Phase 2c: PDF / DOCX / PPTX extractors
 - [x] Phase 2d implementation: `/documents/{id}` delete + callback client (`9fbbf20`)
 - [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
+- [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
 - [ ] Phase 3: Retrieval endpoint (student queries in Study Zone)
 - [ ] Phase 4: Chat history storage for Stewart
 
 Phase 2d is merged, as confirmed by the developer. Phase 2e is implemented and
 committed locally in `54a6ecb`, with the developer-authorized concurrency-test
-skip documented below. Phase 2e remote merge and deployment are not verified.
+skip documented below. Railway staging deployment is smoke-test verified; Phase 2e remote merge status is not verified.
 
 ## Current implementation: Phase 2e
 
@@ -584,7 +585,7 @@ dependency for ingestion chunking. Retrieval remains Phase 3.
 
 ## Testing
 
-Current verified baseline: 162 passed, one skipped, and one warning in each of
+Historical Phase 2e baseline: 162 passed, one skipped, and one warning in each of
 three consecutive full-suite runs. The runs took approximately three minutes;
 do not describe this suite as completing in under 60 seconds.
 
@@ -601,6 +602,8 @@ concurrent job claims. Keep that coverage gap explicit until the test is restore
 Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
+
+The full suite baseline after deployment changes: 183 passed, 1 skipped. Do not regress below this.
 
 `run.py` selects the bind address automatically. When `$PORT` is unset (local
 development on the developer's Windows PC), it binds `127.0.0.1:8010`. When
@@ -667,6 +670,10 @@ green:
 9. The commit message names the sub-phase, for example: `feat(2b): add
    /ingest endpoint and Postgres job worker`
 
+When `requirements.txt` gains a dependency, redeploy to staging and confirm
+`/health` still returns `ingest_status="ready"` before merging. The container is
+the authoritative test environment for dependency completeness.
+
 ## What NOT to do without asking first
 
 - Do not change the request or response shape of `/ingest`,
@@ -723,7 +730,28 @@ next implementation phase. Track the skipped concurrency test as a dedicated
 investigation; no root-cause fix has been made. Phase 3 retrieval requires its
 own explicit scope and authorization. Chat history (4) and ZIP remain outside
 scope. There is no job-status HTTP endpoint. Verify live Next.js callback
-integration, credentials/model access, and deployment readiness separately.
+integration separately. Railway staging ingestion is smoke-tested; production deployment remains a separate decision.
+
+## Deployment status
+
+- The service is deployed to Railway staging. Include the staging URL in the
+  README's FSE Integration Testing Guide, not in this file.
+- Deployment uses the service-root `Dockerfile` and `.dockerignore`, which
+  excludes `.env`.
+- Runtime dependencies must be in `requirements.txt`. The parent workspace
+  `pyproject.toml` is not present in the container; inheritance only works
+  locally via `uv sync`.
+- Production/container credentials use `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+  (base64 of the service-account JSON). Local development uses
+  `GOOGLE_APPLICATION_CREDENTIALS` (file path). Do not mix them.
+- The four ingestion-gate variables (`DATABASE_URL`, `AI_SERVICE_API_KEY`,
+  `AI_SERVICE_CALLBACK_SECRET`, `AI_SERVICE_CALLBACK_ALLOWED_HOSTS`) must be
+  set on the platform for `/health.ingest_status` to reach `"ready"`.
+- Railway trial covers approximately 30 days. Verify plan status before relying
+  on the URL long-term. Do not enable Serverless sleep: the ingestion worker
+  is inside the web process.
+- `callback.failed_permanent` in Deploy Logs while the FSE's endpoint is not
+  live is expected, not a bug. The job is still `done` with chunks committed.
 
 ## Phase 2b0 decision record
 

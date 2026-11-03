@@ -3,14 +3,17 @@
 FastAPI microservice for the AkadVerse Study Zone, reserved port **8010**.
 The intended caller is the Next.js backend, not a browser client.
 
-## Current status: Phase 2e implemented and committed
+## Current status
 
-Phase 2e retires the legacy explanation endpoints and authenticates Google Search
-Grounding with the existing ingestion shared secret. Durable ingestion, document
-deletion, and callbacks remain unchanged. The local Phase 2e commit is
-`54a6ecb`. Three consecutive full-suite runs each recorded 162 passed and one
-intentionally skipped concurrency test. Remote merge and deployment are not
-verified. Retrieval is planned for Phase 3 and has not started.
+- Phase 2e is committed (`54a6ecb`).
+- Service deployed to Railway at `<RAILWAY_URL>` (staging).
+- Smoke test verified end-to-end ingestion: 202, chunks in
+  `concept_explainer.chunks` (pgvector), and job `done`.
+- Callback delivery is outstanding until the FSE's `/api/webhooks/ai-ingest`
+  endpoint is live. This is expected, not a bug.
+- Retrieval (Phase 3) and Stewart chat history (Phase 4) are not implemented.
+- The known skipped concurrency test remains skipped.
+- The deployed URL is staging-only; production deploy is a separate decision.
 
 | Capability | Current state |
 |---|---|
@@ -34,9 +37,11 @@ not change the committed job status or roll back chunks.
 
 - [Architecture](#architecture)
 - [Installation and startup](#installation-and-startup)
+- [Deployment](#deployment)
 - [Configuration](#configuration)
 - [Database setup](#database-setup)
 - [API endpoints](#api-endpoints)
+- [FSE Integration Testing Guide](#fse-integration-testing-guide)
 - [Extraction and processing](#extraction-and-processing)
 - [Jobs and workers](#jobs-and-workers)
 - [Outbound callbacks](#outbound-callbacks)
@@ -96,7 +101,11 @@ Service requirements include FastAPI, Uvicorn, `google-genai>=1.67.0`,
 `langchain-text-splitters`, Pydantic,
 `pypdf`, `python-docx==1.2.0`, `python-pptx==1.0.2`,
 `sqlalchemy[asyncio]==2.1.4`, `psycopg[binary]==3.2.6`, and
-`python-dotenv==1.0.1`. `requirements.txt` is authoritative for service pins.
+`python-dotenv==1.0.1`, and `python-multipart>=0.0.9`.
+`requirements.txt` is authoritative for service pins.
+`python-multipart` is required by FastAPI's `Form(...)` parameter parsing. Must
+be in `requirements.txt`, not just the parent `pyproject.toml`, because the
+container installs only from `requirements.txt`.
 
 Copy `.env.example` to your private `.env` and supply the required settings.
 Never commit or share credential values. Existing process variables take
@@ -117,6 +126,13 @@ Use [Swagger UI](http://127.0.0.1:8010/docs) to inspect the four current API
 operations and their request schemas. Port 8010 belongs to this service;
 consult the root `AGENTS.md` before choosing any other local testing port.
 
+For container deployment, see [Deployment](#deployment). The `Dockerfile` at the
+service root installs from `requirements.txt` only; anything that runs at runtime
+must be listed there. This was surfaced in practice: `python-multipart` was
+missing from `requirements.txt` and only worked locally because the parent
+workspace `pyproject.toml` supplies it. The container had no parent workspace
+and crashed at import.
+
 ### Docker
 
 ```bash
@@ -131,6 +147,40 @@ must be provided via `GOOGLE_APPLICATION_CREDENTIALS_JSON` (base64) rather
 than `GOOGLE_APPLICATION_CREDENTIALS` (file path) because the file path
 does not exist inside the container. For this local Docker command, set
 `PORT=8010` in the private `.env` so the server accepts container traffic.
+
+## Deployment
+
+The ingestion worker is an `asyncio.Task` inside the FastAPI lifespan and must
+run continuously. Request-scoped serverless platforms cannot host it reliably:
+Vercel Functions end execution after requests, and Cloud Run without
+`min-instances=1` can stop the process between requests. Railway,
+[Fly.io](https://fly.io/), and Render Starter are suitable; Render Free and
+Vercel are not. Keep CPU allocated between requests on any chosen platform.
+
+The container build uses the `Dockerfile` at the service root. The image installs
+from `requirements.txt` only. The parent workspace `pyproject.toml` is not
+available in the container, so anything needed at runtime must be listed in
+`requirements.txt`, including `python-multipart` for `Form(...)` parameters.
+
+Environment variables are similar to local development: `AI_SERVICE_API_KEY`,
+`AI_SERVICE_CALLBACK_ALLOWED_HOSTS`, `AI_SERVICE_CALLBACK_SECRET`, `DATABASE_URL`,
+`GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS_JSON`, `GOOGLE_CLOUD_LOCATION`,
+`GOOGLE_CLOUD_PROJECT`, `LLM_PROVIDER`, `PORT`, and `WORKER_COUNT`, with two changes:
+
+- `GOOGLE_APPLICATION_CREDENTIALS_JSON` (base64 of the service-account JSON)
+  replaces `GOOGLE_APPLICATION_CREDENTIALS` (a local file path).
+- The platform injects `$PORT`, which `run.py` reads to bind `0.0.0.0:$PORT`.
+
+Apply both migrations to the target Supabase database before the first request.
+The deployed service does not run migrations on startup.
+
+Point the platform healthcheck at `/health` with a 120-second grace period.
+Startup runs up to three 20-second DB probes plus recovery and worker startup.
+Set the restart policy to **On Failure**. Do not disable restart; a worker crash
+should trigger a restart. This restarts an exited process; an individual task
+stopping does not itself guarantee process exit (see Jobs and workers).
+Do not enable scale-to-zero, Serverless sleep, or any serverless sleep setting.
+The worker stops when the process stops.
 
 ## Configuration
 
@@ -306,6 +356,132 @@ an unset or blank `AI_SERVICE_API_KEY` returns 503. Database, callback configura
 and ingestion readiness do not gate this endpoint. No new env var.
 Gemini with Google Search returns the five explanation fields and cited sources.
 
+## FSE Integration Testing Guide
+
+This section is for the AkadVerse backend team. It assumes you have received the staging base URL and the two shared secrets via password manager. The service is backend-only; callers must never expose `AI_SERVICE_API_KEY` to a browser.
+
+### Prerequisites
+
+- [ ] Staging base URL: `<RAILWAY_URL>`
+- [ ] `AI_SERVICE_API_KEY` value received
+- [ ] `AI_SERVICE_CALLBACK_SECRET` value received (must match this service's value)
+- [ ] Your `/api/webhooks/ai-ingest` endpoint deployed and reachable over HTTPS
+- [ ] A signed Supabase URL for a test PDF or DOCX
+
+### Verification steps
+
+Commands use Bash-compatible syntax and `jq`. Replace angle-bracket placeholders
+with your staging hostname, receiver hostname, secrets, and material values.
+In commands, `<RAILWAY_URL>` is the hostname without the `https://` prefix.
+Run these from your backend environment.
+
+1. **Confirm the service is healthy (no auth).**
+
+   ```bash
+   curl -s 'https://<RAILWAY_URL>/health' | jq
+   ```
+
+   Expect `status: "ok"`, `ingest_status: "ready"`, and `worker_status: "running"`.
+   If `ingest_status` is not `"ready"`, ingestion is misconfigured on our side.
+   Include both `ingest_status` and `worker_status` when reporting to the AI team.
+
+2. **Confirm your callback endpoint accepts a test POST.**
+
+   Before real ingestion, verify your endpoint responds with `{"ok": true}` to
+   a legitimate-looking callback body. Send from your own environment, not
+   through the AI service:
+
+   ```bash
+   curl -i -X POST 'https://<your-app>/api/webhooks/ai-ingest' \
+     -H 'Authorization: Bearer <AI_SERVICE_CALLBACK_SECRET>' \
+     -H 'Content-Type: application/json' \
+     -d '{"document_id": "test-ignore-me", "status": "ingested", "chunk_count": 1}'
+   ```
+
+   Expect `200 {"ok": true}` or
+   `200 {"ok": true, "ignored": "unknown document_id"}`.
+   A 4xx fails permanently immediately. Redirects, timeouts, and responses
+   without literal `"ok": true` exhaust after three attempts. Redirects are
+   never followed. See Outbound callbacks for the preserved delivery rules.
+
+3. **Submit a real ingestion.**
+
+   ```bash
+   curl -i -X POST 'https://<RAILWAY_URL>/ingest' \
+     -H 'Authorization: Bearer <AI_SERVICE_API_KEY>' \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "document_id": "your-material-uuid",
+       "file_url": "https://<project>.supabase.co/storage/v1/object/sign/...",
+       "file_name": "intro.pdf",
+       "mime_type": "application/pdf",
+       "callback_url": "https://<your-app>/api/webhooks/ai-ingest",
+       "metadata": {
+         "course_code": "CSC 201", "course_title": "Data Structures",
+         "course_offering_id": "offering-uuid", "academic_session": "2025/2026",
+         "semester": "First", "start_week": 3, "end_week": 5,
+         "weeks": [3, 4, 5], "material_type": "NOTES",
+         "title": "Week 3 notes", "document_id": "your-material-uuid"
+       }
+     }'
+   ```
+
+   Expect `202 {"status": "queued", "document_id": "your-material-uuid"}`.
+   The 202 means queue admission only. Processing and callback delivery happen
+   asynchronously. For DOCX, use its filename and supported DOCX MIME type
+   listed under Extraction and processing.
+
+4. **Watch your callback receive the notification.**
+
+   Within approximately 60 seconds for a small test document, your endpoint
+   should receive the following. This is an estimate, not a processing deadline;
+   document size, queue load, and provider latency can increase it.
+
+   - `Authorization: Bearer <AI_SERVICE_CALLBACK_SECRET>`
+   - Success: `{"document_id": "your-material-uuid", "status": "ingested", "chunk_count": N}`
+   - Processing failure: `{"document_id": "your-material-uuid", "status": "failed", "error": "..."}`
+     (error is capped at 500 characters and path-sanitized)
+
+   Respond `200 {"ok": true}`. Anything else triggers retry or permanent failure
+   according to the callback rules above.
+
+5. **Verify and clean up.**
+
+   Verify the received document ID and outcome, then send a delete:
+
+   ```bash
+   curl -i -X DELETE 'https://<RAILWAY_URL>/documents/your-material-uuid' \
+     -H 'Authorization: Bearer <AI_SERVICE_API_KEY>'
+   ```
+
+   Expect `204` if the document existed, `404` if not. Your contract treats both
+   as success. Chunks and the job row are removed in one transaction.
+
+### Expected behaviours during integration
+
+- The first callback after deployment may fail if your endpoint is not yet live.
+  Retries exhaust in roughly 21 seconds for repeated timeouts, not a guaranteed
+  deadline; 4xx fails immediately. The job is still `done` with chunks committed.
+  You will not receive a second callback after exhaustion. Resubmit the same
+  `document_id` to re-queue with the original payload. Resubmitting currently
+  keeps the original signed URL, so if it expired, ask the AI team about URL
+  refresh behavior before relying on retry.
+- `422 callback_url host not allowed`: your hostname is not in
+  `AI_SERVICE_CALLBACK_ALLOWED_HOSTS`. Confirm your hostname to the AI team.
+- `503 Ingestion is not configured on this service`: one of the four required
+  ingestion-gate environment variables may be missing on our side. Include
+  `/health.ingest_status` in the report. Provider/database readiness can also
+  cause 503 (see API endpoints).
+- `401 Unauthorized`: the token is wrong or your environment is not sending the
+  header. Confirm through `/health` (no auth needed) that the service is up.
+
+### Do not
+
+- Expose `AI_SERVICE_API_KEY` to any browser or client-side code.
+- Retry `/ingest` automatically on 5xx; contact the AI team first.
+- Assume a `done` job implies a delivered callback. Delivery is best-effort with
+  bounded retries.
+
 ## Extraction and processing
 
 | MIME type | Extractor | Extracted content |
@@ -478,6 +654,18 @@ quota, or actual callback delivery. Provider tests mock external generation.
 
 ## Troubleshooting
 
+- **First deploy fails at container start with `RuntimeError: Form data requires "python-multipart"`:**
+  a package used at runtime is not in `requirements.txt`. Verify all runtime
+  dependencies are listed. Docker layer caching may serve a stale image;
+  force a no-cache rebuild.
+- **Healthcheck fails for 120s, "service unavailable":** the container is not
+  listening on `$PORT` or is bound to `127.0.0.1`. Confirm `run.py` reads `$PORT`
+  and binds `0.0.0.0`. Or the container crashed on startup: check Deploy Logs,
+  not Build Logs.
+- **`callback.failed_permanent` in logs but job is `done` in DB:** expected when
+  the FSE's endpoint is not live or returns something other than `200 {"ok": true}`.
+  Delivery is best-effort; the job succeeded. Check the receiver, not the AI service.
+
 - **Ingestion unavailable:** check `/health`, Enterprise selection, private
   database/auth configuration, callback secret, required host allowlist, both
   migrations, and database reachability.
@@ -507,6 +695,8 @@ quota, or actual callback delivery. Provider tests mock external generation.
 
 ```text
 akadverse-concept-explainer/
+  Dockerfile                   Container build from service requirements
+  .dockerignore                Build exclusions, including .env
   main.py                      FastAPI lifespan, router wiring, health
   run.py                       Windows-compatible launcher, port 8010
   auth.py                      Ingestion shared-secret authentication
@@ -564,11 +754,13 @@ ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
 404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
 There is still no job-status HTTP endpoint.
 
-Phase 2e is implemented and committed locally in `54a6ecb`. Before deployment, verify
-the real receiver, TLS/DNS configuration, both shared secrets, allowlisted
-hosts, ADC/model access, and quotas without exposing credentials. Automated
-tests do not establish those live integration prerequisites or remote merge
-status. Rotate previously exposed secrets and exchange replacements privately.
+Phase 2e is committed and Railway staging ingestion is smoke-tested: 202,
+pgvector chunks, and job done. Callback delivery remains outstanding until
+the FSE receiver is live. Use the FSE Integration Testing Guide to verify the
+receiver, TLS/DNS configuration, both shared secrets, and allowlisted hostname
+without exposing credentials. Automated tests do not establish live integration
+prerequisites or remote merge status. Exchange secrets privately. Production
+deployment remains a separate decision.
 
 Verify Phase 2e remote merge status before the next implementation phase.
 Investigate and restore the skipped concurrency test separately. Phase 3 adds
