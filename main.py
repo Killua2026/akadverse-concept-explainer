@@ -21,6 +21,8 @@ from routes.ingest import router as ingest_router
 from routes.documents import router as documents_router
 from services.callback import CallbackSettings
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
+
 logger = logging.getLogger(__name__)
 
 _WORKER_TEMP_FILE_PATTERN = re.compile(r"^[0-9a-f]{32}_")
