@@ -232,7 +232,8 @@ async def test_exhaustion_returns_false(monkeypatch, caplog):
     result, requests, _ = await deliver(monkeypatch, [httpx.Response(500)])
     assert result is False and len(requests) == 3
     records = [record for record in caplog.records if record.name == "services.callback"]
-    assert records[-1].message == "callback.failed_permanent"
+    assert records[-1].message.startswith("callback.failed_permanent")
+    assert all(record.message.startswith("callback.attempt") for record in records[:-1])
     assert records[-1].document_id == "doc-1" and records[-1].reason == "5xx"
     for record in records:
         assert record.url_host == "example.com"

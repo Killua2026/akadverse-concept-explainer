@@ -1,5 +1,6 @@
 """Inbound ingestion contract."""
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, HttpUrl
@@ -31,3 +32,13 @@ class IngestRequest(BaseModel):
 class IngestResponse(BaseModel):
     status: Literal["queued"]
     document_id: str
+
+
+class DocumentStatusResponse(BaseModel):
+    document_id: str
+    status: Literal["queued", "processing", "done", "failed"]
+    chunk_count: int
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime

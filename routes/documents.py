@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from auth import UNAVAILABLE, require_ingest_auth
+from models import DocumentStatusResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -30,3 +31,25 @@ async def delete_document(document_id: str, request: Request) -> Response:
     if not deleted:
         raise HTTPException(404, "Document not found")
     return Response(status_code=204)
+
+
+@router.get("/documents/{document_id}/status", response_model=DocumentStatusResponse,
+            dependencies=[Depends(require_ingest_auth)])
+async def document_status(document_id: str, request: Request) -> DocumentStatusResponse:
+    try:
+        async with request.app.state.ingest_database.sessions() as session:
+            result = await session.execute(text(
+                "SELECT id, document_id, status, attempts, last_error, created_at, updated_at "
+                "FROM concept_explainer.jobs WHERE document_id = :document_id"
+            ), {"document_id": document_id})
+            job = result.mappings().first()
+            if job is None:
+                raise HTTPException(404, "Document not found")
+            chunk_count = await session.scalar(text(
+                "SELECT count(*) FROM concept_explainer.chunks WHERE document_id = :document_id"
+            ), {"document_id": document_id})
+    except (SQLAlchemyError, OSError):
+        logger.warning("document.status_failed")
+        raise HTTPException(503, UNAVAILABLE) from None
+    return DocumentStatusResponse(**{key: value for key, value in job.items() if key != "id"},
+                                  chunk_count=chunk_count)

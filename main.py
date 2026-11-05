@@ -1,6 +1,10 @@
 import os
 import asyncio
 import logging
+import re
+import tempfile
+import time
+from pathlib import Path
 import httpx
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -18,6 +22,38 @@ from routes.documents import router as documents_router
 from services.callback import CallbackSettings
 
 logger = logging.getLogger(__name__)
+
+_WORKER_TEMP_FILE_PATTERN = re.compile(r"^[0-9a-f]{32}_")
+
+
+def sweep_stale_temp_files(max_age_seconds: int = 3600) -> int:
+    """Remove orphaned worker temp files left by a previous crashed run.
+
+    The worker writes /tmp/{uuid4().hex}_{filename} and deletes it in a
+    finally block on every code path except SIGKILL. On Railway, /tmp
+    is ephemeral and cleared on container restart, so this sweep is
+    defensive insurance for the case where a worker crashes mid-job but
+    the container keeps running.
+    """
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    tmp_dir = Path(tempfile.gettempdir())
+    try:
+        for tmp_file in tmp_dir.iterdir():
+            if not tmp_file.is_file():
+                continue
+            if not _WORKER_TEMP_FILE_PATTERN.match(tmp_file.name):
+                continue
+            try:
+                if tmp_file.stat().st_mtime < cutoff:
+                    tmp_file.unlink()
+                    removed += 1
+            except OSError:
+                # File already gone, or permission denied: ignore and continue.
+                continue
+    except OSError:
+        logger.warning("temp_sweep_dir_unreadable")
+    return removed
 
 
 def get_ingestion_database(application: FastAPI) -> Database | None:
@@ -90,6 +126,9 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         return True
     worker_logging_enabled = False
     application.state.ingest_database = None
+    swept = await asyncio.to_thread(sweep_stale_temp_files)
+    if swept:
+        logger.info("temp_sweep_removed count=%s", swept)
     if not gemini_settings.use_enterprise:
         application.state.ingest_status = "disabled (ingestion requires enterprise mode)"
         application.state.worker_status = "disabled (ingestion requires enterprise mode)"
