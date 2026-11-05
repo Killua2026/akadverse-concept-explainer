@@ -330,6 +330,35 @@ transaction using async I/O. It does not enqueue work or delete the remote file.
 Other document IDs are untouched. An in-flight worker detects a removed job
 when its conditional finalization returns no row, as described below.
 
+### GET /documents/{document_id}/status
+
+Returns the current state of an ingestion job. Authenticated with the same
+Bearer token as `/ingest` and `DELETE`. Use this to reconcile missed callbacks:
+after a `POST /ingest`, poll every 10 seconds for up to 5 minutes. If the
+callback arrives first, stop polling.
+
+Response:
+
+```json
+{
+  "document_id": "lecture-001",
+  "status": "done",
+  "chunk_count": 42,
+  "attempts": 1,
+  "last_error": null,
+  "created_at": "2026-11-04T16:20:00Z",
+  "updated_at": "2026-11-04T16:21:00Z"
+}
+```
+
+- `200` if the job exists.
+- `404 {"detail": "Document not found"}` if the job does not exist. Retry after
+  5s if the `POST /ingest` 202 was just received. This is rare: the row is
+  committed synchronously before 202 returns, so 404 usually means the document
+  was never submitted to this service. Worker claiming is not required for visibility.
+- `401` if auth is missing or wrong.
+- `503` if the database is unavailable.
+
 ### GET /health
 
 Returns status, provider, version, grounding status, available endpoints, plus `ingest_status`, `worker_status`,
@@ -474,6 +503,19 @@ Run these from your backend environment.
   cause 503 (see API endpoints).
 - `401 Unauthorized`: the token is wrong or your environment is not sending the
   header. Confirm through `/health` (no auth needed) that the service is up.
+
+6. **Reconcile with the status endpoint if callbacks were missed.**
+
+   ```bash
+   curl https://<RAILWAY_URL>/documents/your-material-uuid/status \
+     -H "Authorization: Bearer <AI_SERVICE_API_KEY>"
+   ```
+
+   Poll every 10 seconds for the first 5 minutes after `POST /ingest`. When the
+   response status is `done` or `failed`, stop polling: the callback may have
+   been missed, but the truth is in this response. `chunk_count > 0` when
+   `status="done"` confirms chunks landed. Reconcile before Step 5 cleanup,
+   which removes the job and makes status return 404.
 
 ### Do not
 

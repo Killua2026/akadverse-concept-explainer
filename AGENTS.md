@@ -50,6 +50,14 @@ skip documented below. Railway staging deployment is smoke-test verified; Phase 
 
 ## Current implementation: Phase 2e
 
+`GET /documents/{document_id}/status` provides read-only reconciliation for
+missed callbacks. It uses the same auth as `/ingest` and DELETE
+`/documents/{document_id}`. It does not trigger any work. Startup runs a
+temp-file sweep that removes orphaned `[0-9a-f]{32}_*` files older than one hour
+from `tempfile.gettempdir()`; this is defensive insurance for the SIGKILL case
+that bypasses the worker's `finally` block. On container platforms with
+ephemeral `/tmp`, this sweep rarely has anything to remove.
+
 - `/ingest` requires Enterprise mode, a ready database, inbound/outbound shared
   secrets, and a non-empty callback host allowlist.
   It returns 202 after durable queue admission, before document processing.
@@ -223,6 +231,12 @@ Body (failure): {"document_id": "...", "status": "failed", "error": "short messa
 ```
 
 Rules:
+
+- The `callback.attempt` failure messages inline `reason`, `http_status`, and
+  the attempt number (`attempt` in plain text, `attempt_number` in `extra`);
+  `callback.failed_permanent` inlines `reason` and `document_id`. Failures are
+  visible in Railway's plain-formatter Deploy Logs. The `extra` fields are
+  preserved for structured-logging environments.
 
 - Success requires HTTP 200 and a JSON object containing literal `"ok": true`.
   Additional fields are allowed, including `"ignored":"unknown document_id"`.
@@ -729,7 +743,8 @@ committed locally in `54a6ecb`. Verify remote merge status before starting the
 next implementation phase. Track the skipped concurrency test as a dedicated
 investigation; no root-cause fix has been made. Phase 3 retrieval requires its
 own explicit scope and authorization. Chat history (4) and ZIP remain outside
-scope. There is no job-status HTTP endpoint. Verify live Next.js callback
+scope. The job-status HTTP endpoint supports missed-callback reconciliation;
+the durable callback outbox remains deferred. Verify live Next.js callback
 integration separately. Railway staging ingestion is smoke-tested; production deployment remains a separate decision.
 
 ## Deployment status

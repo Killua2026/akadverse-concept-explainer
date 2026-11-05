@@ -17,6 +17,34 @@ from db import Database
 from workers import ingestion
 
 
+def test_sweep_removes_stale_worker_temp_files():
+    import os
+    import tempfile
+    import time
+    from pathlib import Path
+    from uuid import uuid4
+    from main import sweep_stale_temp_files
+
+    tmp_dir = Path(tempfile.gettempdir())
+    stale = tmp_dir / f"{uuid4().hex}_stale-test.pdf"
+    fresh = tmp_dir / f"{uuid4().hex}_fresh-test.pdf"
+    unrelated = tmp_dir / f"sweep-test-{uuid4().hex}.pdf"
+    files = (stale, fresh, unrelated)
+    try:
+        for path in files:
+            path.touch()
+        old = time.time() - 7200
+        for path in (stale, unrelated):
+            os.utime(path, (old, old))
+        assert sweep_stale_temp_files() >= 1
+        assert not stale.exists()
+        assert fresh.exists()
+        assert unrelated.exists()
+    finally:
+        for path in files:
+            path.unlink(missing_ok=True)
+
+
 @pytest.fixture(autouse=True)
 def callback_mock(monkeypatch):
     callback = AsyncMock(return_value=True)
