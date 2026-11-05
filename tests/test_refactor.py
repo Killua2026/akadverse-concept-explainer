@@ -8,7 +8,8 @@ def test_main_app_has_all_expected_routes():
     assert "/documents/{document_id}/status" in paths
     assert "/explain-with-grounding" in paths
     assert "/health" in paths
+    assert "/explain" in paths
     assert set(main.app.openapi()["paths"]) == {
         "/ingest", "/documents/{document_id}", "/documents/{document_id}/status",
-        "/explain-with-grounding", "/health"
+        "/explain-with-grounding", "/explain", "/health"
     }

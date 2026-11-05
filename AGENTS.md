@@ -15,9 +15,8 @@ Two concerns live in this service:
    chunk and embed them into pgvector, deliver completion/failure callbacks,
    and delete document chunks and jobs. Phases 2a through 2e are implemented;
    one concurrency test is intentionally skipped pending investigation.
-2. **Retrieval** (future): given a course offering and week, retrieve chunks
-   and answer student questions. NOT yet implemented. Do not build it unless
-   explicitly asked.
+2. **Retrieval**: synchronous `/explain` retrieves course material by offering
+   and JSONB weeks membership and answers student questions. Phase 3 only.
 
 The source of truth for the ingestion contract is the FSE's document at
 `docs/elearning/systems/ai-ingestion-contract.md` in the Next.js repo. This
@@ -26,7 +25,7 @@ and you should surface the conflict to the developer before proceeding.
 
 ## Current phase
 
-**Phase 2: Ingestion rewrite.** Legacy endpoints are retired in Phase 2e.
+**Phase 3: Course material retrieval.** Legacy endpoints are retired in Phase 2e.
 Grounding uses the existing shared-secret authentication dependency.
 
 Status:
@@ -41,14 +40,42 @@ Status:
 - [x] Phase 2d implementation: `/documents/{id}` delete + callback client (`9fbbf20`)
 - [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
 - [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
-- [ ] Phase 3: Retrieval endpoint (student queries in Study Zone)
+- [x] Phase 3: Retrieval endpoint (student queries in Study Zone)
 - [ ] Phase 4: Chat history storage for Stewart
 
-Phase 2d is merged, as confirmed by the developer. Phase 2e is implemented and
-committed locally in `54a6ecb`, with the developer-authorized concurrency-test
-skip documented below. Railway staging deployment is smoke-test verified; Phase 2e remote merge status is not verified.
+Phase 2e is merged and deployed on Railway, as confirmed by the developer.
+Phase 3 is implemented locally; this does not claim a Phase 3 deployment.
 
-## Current implementation: Phase 2e
+## Current implementation: Phase 3
+
+- `/explain` uses `require_shared_secret_auth` and the inbound API key only.
+- Database initialization checks DATABASE_URL, probes up to three times with
+  20-second waits and one-second sleeps, then publishes the database state.
+  Exhaustion disposes the partial database and clears the state. API key,
+  callback secret, and allowlist checks follow successful database initialization.
+  Ingestion and workers still require ready status; retrieval ignores callback state.
+- Rate limiting is not implemented in Phase 3. Callers are responsible.
+- `routes/explain.py` owns HTTP validation and 503 handling, outside the ingestion middleware.
+- `services/retrieval.py` owns question embedding, two parameterized SQL queries,
+  the module-level EXPLAIN_PROMPT_TEMPLATE, and answer generation. SQL uses
+  sqlalchemy text directly to support isolated test schemas.
+- Retrieve by offering and weeks containment, cosine distance at most 0.6,
+  similarity threshold 0.4, and top eight chunks. Return counts and source previews
+  capped at 200 characters. Empty or unrelated material avoids the LLM call.
+- Generation uses the first discovered model at temperature 0.3 and returns a
+  safe fallback for provider failures, missing candidates, or empty text.
+- Attachments, screenshots, conversation history, and practice mode remain deferred.
+
+### Phase 3 verification (5 November 2026)
+
+After removing the shell DATABASE_URL override so dotenv can load the configured
+database, the full suite passed: 217 passed, 1 skipped, 1 existing deprecation
+warning in 366.05 seconds. The third-attempt startup probe and health-status
+tests passed unchanged. Ingestion/worker configuration tests received only
+disposable database and successful probe mocks; their assertions are unchanged.
+The real-database callback-configuration independence acceptance test passed.
+Route inspection confirmed six application paths including `/explain`, and
+retrieval imports passed. Phase 3 changes are uncommitted and not deployed.
 
 `GET /documents/{document_id}/status` provides read-only reconciliation for
 missed callbacks. It uses the same auth as `/ingest` and DELETE
@@ -693,7 +720,7 @@ the authoritative test environment for dependency completeness.
 - Do not change the request or response shape of `/ingest`,
   `/documents/{id}`, or the callback. The FSE has already built against
   these. If they need a change, surface it to the developer first
-- Do not add a `/query` or `/explain` endpoint yet. That is Phase 3
+- Preserve the approved Phase 3 `/explain` contract. Do not add `/query`.
 - Do not add ZIP support without an explicitly approved later phase
 - Preserve grounding business logic and HTTP behavior unless explicitly authorized
 - Do not add JWT verification or any user auth to this service. The Next.js
@@ -738,14 +765,10 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Phase 2e legacy retirement and grounding authentication are implemented and
-committed locally in `54a6ecb`. Verify remote merge status before starting the
-next implementation phase. Track the skipped concurrency test as a dedicated
-investigation; no root-cause fix has been made. Phase 3 retrieval requires its
-own explicit scope and authorization. Chat history (4) and ZIP remain outside
-scope. The job-status HTTP endpoint supports missed-callback reconciliation;
-the durable callback outbox remains deferred. Verify live Next.js callback
-integration separately. Railway staging ingestion is smoke-tested; production deployment remains a separate decision.
+Phase 2e is merged and deployed. Phase 3 course retrieval is implemented locally.
+Verify live Next.js integration separately. The skipped concurrency investigation,
+attachments, screenshots, conversation history, practice mode, ZIP support, and a
+durable callback outbox remain outside Phase 3 scope.
 
 ## Deployment status
 
