@@ -123,7 +123,7 @@ async def test_health_ingest_status(configured, monkeypatch, missing, expected):
 async def test_startup_probe_timeout(configured, monkeypatch):
     import main
 
-    monkeypatch.setattr(main, "Database", Mock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(main, "Database", Mock(return_value=SimpleNamespace(dispose=AsyncMock())))
     monkeypatch.setattr(main, "probe_ingestion_database", AsyncMock(side_effect=TimeoutError))
     await main.configure_ingestion(main.app)
     assert main.app.state.ingest_status == "disabled (db unreachable)"
@@ -159,6 +159,8 @@ async def test_missing_callback_allowlist_disables_ingestion(configured, body, m
     import main
     from config import GeminiSettings
 
+    monkeypatch.setattr(main, "Database", Mock(return_value=SimpleNamespace(dispose=AsyncMock())))
+    monkeypatch.setattr(main, "probe_ingestion_database", AsyncMock())
     if allowed is None:
         monkeypatch.delenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", raising=False)
     else:

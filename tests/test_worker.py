@@ -508,6 +508,8 @@ def test_delete_during_processing_cancels_job(worker_database, monkeypatch, capl
 @pytest.mark.anyio
 async def test_missing_callback_secret_disables_ingestion(monkeypatch):
     import main
+    monkeypatch.setattr(main, "Database", Mock(return_value=SimpleNamespace(dispose=AsyncMock())))
+    monkeypatch.setattr(main, "probe_ingestion_database", AsyncMock())
     monkeypatch.setattr(main, "gemini_settings", GeminiSettings(
         llm_provider="gemini_enterprise", google_cloud_project="test"
     ))

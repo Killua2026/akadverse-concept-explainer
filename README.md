@@ -5,13 +5,13 @@ The intended caller is the Next.js backend, not a browser client.
 
 ## Current status
 
-- Phase 2e is committed (`54a6ecb`).
+- Phase 2e is merged. Phase 3 retrieval is implemented locally.
 - Service deployed to Railway at `<RAILWAY_URL>` (staging).
 - Smoke test verified end-to-end ingestion: 202, chunks in
   `concept_explainer.chunks` (pgvector), and job `done`.
 - Callback delivery is outstanding until the FSE's `/api/webhooks/ai-ingest`
   endpoint is live. This is expected, not a bug.
-- Retrieval (Phase 3) and Stewart chat history (Phase 4) are not implemented.
+- Phase 3 retrieval is implemented. Stewart attachments, screenshots, history, and practice mode remain out of scope.
 - The known skipped concurrency test remains skipped.
 - The deployed URL is staging-only; production deploy is a separate decision.
 
@@ -24,11 +24,11 @@ The intended caller is the Next.js backend, not a browser client.
 | Delete endpoint and outbound callback client | Implemented; transactional deletion and bounded post-commit delivery |
 | Legacy endpoint retirement and grounding auth | Implemented and committed in Phase 2e |
 | Concurrent job-claim collision test | Retained but skipped; dedicated investigation pending for intermittent teardown hang |
-| Retrieval over ingested pgvector chunks | Phase 3; not implemented |
+| Retrieval over ingested pgvector chunks | Implemented: authenticated synchronous `POST /explain` |
 | Stewart chat history | Phase 4; not implemented |
 | ZIP ingestion | Rejected; deferred to a later phase |
 
-`/ingest` writes pgvector chunks. Retrieval over these chunks is not implemented.
+`/ingest` writes pgvector chunks. `/explain` retrieves from these chunks.
 Callbacks are posted after processing commits. A job marked `done` means its
 chunks were stored, not that a callback was delivered. Delivery failure does
 not change the committed job status or roll back chunks.
@@ -794,7 +794,7 @@ the operator has explicitly authorized. The receiver validates the shared
 Bearer secret and responds with HTTP 200 and `{"ok":true}`, including for an
 ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
 404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
-There is still no job-status HTTP endpoint.
+`GET /documents/{id}/status` reconciles missed callbacks.
 
 Phase 2e is committed and Railway staging ingestion is smoke-tested: 202,
 pgvector chunks, and job done. Callback delivery remains outstanding until
@@ -804,8 +804,34 @@ without exposing credentials. Automated tests do not establish live integration
 prerequisites or remote merge status. Exchange secrets privately. Production
 deployment remains a separate decision.
 
-Verify Phase 2e remote merge status before the next implementation phase.
-Investigate and restore the skipped concurrency test separately. Phase 3 adds
-pgvector retrieval and requires its own explicit scope and authorization;
-Phase 4 adds Stewart chat history. Neither phase is implemented. ZIP support
-remains deferred.
+Phase 2e is merged. Phase 3 implements course-material retrieval. Investigate
+the skipped concurrency test separately. Attachments, screenshots, history,
+practice mode, and ZIP support remain deferred.
+
+
+## Phase 3: course material explanations
+
+`POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
+and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
+Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
+The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
+`chunk_preview`, the first 200 content characters), and `retrieval_info`
+(`chunks_available`, `chunks_above_threshold`, `similarity_threshold`).
+
+The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
+768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,
+counts available/qualifying chunks, and retrieves up to eight at cosine distance
+at most 0.6 (similarity at least 0.4). Gemini uses the first discovered model and
+temperature 0.3 with Stewart's course-only prompt. Empty weeks and below-threshold
+results return 200 with an explanatory answer and no sources, without generation.
+Generation failures or empty output return a graceful fallback answer; embedding
+failures return sanitized 503. Database failures and Developer mode return 503.
+Missing or wrong Bearer credentials return 401 when the shared secret is configured.
+
+Database initialization and its existing retry/probe policy precede shared-secret
+and callback configuration checks. A reachable database remains available for
+retrieval when callbacks are disabled. Failed probes dispose the partial database
+and clear its state. Ingestion and workers still require ready status.
+No callback secret or allowlist is required by retrieval. Rate limiting is not
+implemented in Phase 3; callers are responsible. Attachments, screenshots,
+conversation history, and practice-question mode are outside this endpoint.

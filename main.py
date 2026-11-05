@@ -70,6 +70,28 @@ async def configure_ingestion(application: FastAPI) -> None:
     if not os.getenv("DATABASE_URL", "").strip():
         application.state.ingest_status = "disabled (missing DATABASE_URL)"
         return
+    database = None
+    for attempt in range(1, 4):
+        try:
+            if database is None:
+                database = Database(StorageSettings.from_env())
+            await asyncio.wait_for(probe_ingestion_database(database), timeout=20.0)
+        except TimeoutError:
+            logger.warning("Startup DB probe attempt %s/3: timeout", attempt)
+        except (OSError, RuntimeError, SQLAlchemyError):
+            logger.warning("Startup DB probe attempt %s/3: error", attempt)
+        else:
+            logger.info("Startup DB probe attempt %s/3: success", attempt)
+            break
+        if attempt < 3:
+            await asyncio.sleep(1)
+    else:
+        if database is not None:
+            await database.dispose()
+        application.state.ingest_database = None
+        application.state.ingest_status = "disabled (db unreachable)"
+        return
+    application.state.ingest_database = database
     if not os.getenv("AI_SERVICE_API_KEY", "").strip():
         application.state.ingest_status = "disabled (missing AI_SERVICE_API_KEY)"
         return
@@ -79,26 +101,10 @@ async def configure_ingestion(application: FastAPI) -> None:
     if not any(host.strip() for host in os.getenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", "").split(",")):
         application.state.ingest_status = "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"
         return
-    database = None
-    for attempt in range(1, 4):
-        try:
-            if database is None:
-                database = Database(StorageSettings.from_env())
-                application.state.ingest_database = database
-            await asyncio.wait_for(probe_ingestion_database(database), timeout=20.0)
-        except TimeoutError:
-            logger.warning("Startup DB probe attempt %s/3: timeout", attempt)
-        except (OSError, RuntimeError, SQLAlchemyError):
-            logger.warning("Startup DB probe attempt %s/3: error", attempt)
-        else:
-            logger.info("Startup DB probe attempt %s/3: success", attempt)
-            application.state.ingest_status = "ready"
-            return
-        if attempt < 3:
-            await asyncio.sleep(1)
-    application.state.ingest_status = "disabled (db unreachable)"
+    application.state.ingest_status = "ready"
 
 from routes.grounding import make_grounding_router
+from routes.explain import make_explain_router
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
@@ -181,7 +187,7 @@ app = FastAPI(
     title="AkadVerse Concept Explainer API",
     description=(
         "Study assistant with durable PDF, DOCX, and PPTX ingestion. "
-        "Document retrieval is planned for Phase 3. "
+        "Course material retrieval is available via /explain. "
         "Also supports web-grounded explanations via /explain-with-grounding."
     ),
     version="1.2",
@@ -190,6 +196,7 @@ app = FastAPI(
 
 grounding_router = make_grounding_router(GOOGLE_API_KEY, settings=gemini_settings)
 app.include_router(grounding_router)
+app.include_router(make_explain_router(gemini_settings))
 app.include_router(ingest_router)
 app.include_router(documents_router)
 
@@ -217,6 +224,8 @@ async def health_check():
         "version": "1.2",
         "grounding_status": "Ready - requires shared-secret auth.",
         "endpoints": {
+            "POST /explain": "Answer from course material for an offering and week.",
+            "GET /documents/{id}/status": "Read ingestion status.",
             "POST /ingest": "Queue a course document for ingestion.",
             "DELETE /documents/{id}": "Delete a document and its ingestion jobs.",
             "POST /explain-with-grounding": "Ask any question answered from live web search.",

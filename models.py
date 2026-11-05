@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class IngestMetadata(BaseModel):
@@ -42,3 +42,28 @@ class DocumentStatusResponse(BaseModel):
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class ExplainRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=4000)
+    course_offering_id: str = Field(..., min_length=1)
+    week: int = Field(..., ge=1)
+
+
+class ExplainSource(BaseModel):
+    document_id: str
+    title: str
+    material_type: str
+    chunk_preview: str
+
+
+class RetrievalInfo(BaseModel):
+    chunks_available: int
+    chunks_above_threshold: int
+    similarity_threshold: float
+
+
+class ExplainResponse(BaseModel):
+    answer: str
+    sources: list[ExplainSource]
+    retrieval_info: RetrievalInfo
