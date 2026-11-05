@@ -637,6 +637,8 @@ callback client; the required host allowlist is rechecked at delivery time.
 
 ## Testing
 
+Before running `uv run pytest`, run `Remove-Item Env:DATABASE_URL` in the same shell.
+
 From this service directory:
 
 ```powershell

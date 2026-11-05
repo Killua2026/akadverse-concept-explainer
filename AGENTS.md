@@ -626,6 +626,8 @@ dependency for ingestion chunking. Retrieval remains Phase 3.
 
 ## Testing
 
+Before running `uv run pytest`, run `Remove-Item Env:DATABASE_URL` in the same shell.
+
 Historical Phase 2e baseline: 162 passed, one skipped, and one warning in each of
 three consecutive full-suite runs. The runs took approximately three minutes;
 do not describe this suite as completing in under 60 seconds.
