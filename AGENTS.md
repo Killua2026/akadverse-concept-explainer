@@ -40,13 +40,22 @@ Status:
 - [x] Phase 2d implementation: `/documents/{id}` delete + callback client (`9fbbf20`)
 - [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
 - [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
-- [x] Phase 3: Retrieval endpoint (student queries in Study Zone)
+- [x] Phase 3: POST /explain retrieval endpoint (verified on Railway with PDF and PPTX)
 - [ ] Phase 4: Chat history storage for Stewart
 
 Phase 2e is merged and deployed on Railway, as confirmed by the developer.
-Phase 3 is implemented locally; this does not claim a Phase 3 deployment.
+Phase 3 is committed and verified end-to-end on Railway with real PDF and PPTX
+lecture documents. Callbacks are landing on the FSE's side (HTTP 200).
 
 ## Current implementation: Phase 3
+
+`POST /explain` retrieves from `concept_explainer.chunks` filtered by
+`course_offering_id` and `weeks` membership, with cosine distance ceiling 0.6
+(similarity floor 0.4) and K=8. It embeds the question through
+`services.embedding.embed_chunks` so ingestion and retrieval embeddings stay
+configuration-identical. LLM answers are grounded-only and use
+`EXPLAIN_PROMPT_TEMPLATE` with the Stewart persona. Attachments, screenshots,
+and conversation history belong to Phase 3.5 / Phase 4. Rate limiting is caller-owned.
 
 - `/explain` uses `require_shared_secret_auth` and the inbound API key only.
 - Database initialization checks DATABASE_URL, probes up to three times with
@@ -75,7 +84,8 @@ tests passed unchanged. Ingestion/worker configuration tests received only
 disposable database and successful probe mocks; their assertions are unchanged.
 The real-database callback-configuration independence acceptance test passed.
 Route inspection confirmed six application paths including `/explain`, and
-retrieval imports passed. Phase 3 changes are uncommitted and not deployed.
+retrieval imports passed. Phase 3 is now committed and deployed; see Deployment
+status for the subsequent Railway smoke-test verification.
 
 `GET /documents/{document_id}/status` provides read-only reconciliation for
 missed callbacks. It uses the same auth as `/ingest` and DELETE
@@ -767,13 +777,24 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Phase 2e is merged and deployed. Phase 3 course retrieval is implemented locally.
-Verify live Next.js integration separately. The skipped concurrency investigation,
-attachments, screenshots, conversation history, practice mode, ZIP support, and a
-durable callback outbox remain outside Phase 3 scope.
+- Wait for FSE direction on Stewart's next integration need: attachments,
+  history, streaming, or outbox.
+- Investigate and restore the skipped concurrency test.
+- Plan Railway subscription renewal when the one-month trial expires in early
+  December 2026, or arrange migration.
+- Durable callback outbox remains deferred until the FSE reports an actual
+  delivery problem.
 
 ## Deployment status
 
+- Phase 3 is committed and verified on Railway: INS412 PDF produced 28 chunks
+  and CSC424 PPTX produced 17 chunks. `/explain` returned grounded answers,
+  correct source citations, and correct not-covered behaviour. FSE callbacks
+  returned HTTP 200.
+- Logging routes to stdout with `logging.basicConfig(stream=sys.stdout)`;
+  routine logs appear as `[info]` in Railway instead of `[error]`. `httpx` is
+  set to `WARNING` to prevent signed-URL leakage through INFO logs.
+- Smoke-test data for INS412 and CSC424 has not been cleaned up from Supabase.
 - The service is deployed to Railway staging. Include the staging URL in the
   README's FSE Integration Testing Guide, not in this file.
 - Deployment uses the service-root `Dockerfile` and `.dockerignore`, which
@@ -787,8 +808,8 @@ durable callback outbox remain outside Phase 3 scope.
 - The four ingestion-gate variables (`DATABASE_URL`, `AI_SERVICE_API_KEY`,
   `AI_SERVICE_CALLBACK_SECRET`, `AI_SERVICE_CALLBACK_ALLOWED_HOSTS`) must be
   set on the platform for `/health.ingest_status` to reach `"ready"`.
-- Railway trial covers approximately 30 days. Verify plan status before relying
-  on the URL long-term. Do not enable Serverless sleep: the ingestion worker
+- Railway trial expires early December 2026. Plan renewal or migration before
+  relying on the URL long-term. Do not enable Serverless sleep: the ingestion worker
   is inside the web process.
 - `callback.failed_permanent` in Deploy Logs while the FSE's endpoint is not
   live is expected, not a bug. The job is still `done` with chunks committed.
