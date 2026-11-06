@@ -41,7 +41,13 @@ Status:
 - [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
 - [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
 - [x] Phase 3: POST /explain retrieval endpoint (verified on Railway with PDF and PPTX)
-- [ ] Phase 4: Chat history storage for Stewart
+- [x] Phase 3.5a: Attachment subsystem (upload/get/delete, Postgres BYTEA storage, 6-hour expiry, ownership by API key)
+- [ ] Phase 3.5b: /explain accepts text attachments (PDF, DOCX, PPTX, TXT, MD) and merges retrieval with course material
+- [ ] Phase 3.5c: /explain handles image attachments (PNG, JPG, WebP) via Gemini vision
+- [ ] Phase 4a: Conversation history storage for Stewart (multi-turn context)
+- [ ] Phase 4b: Streaming responses for /explain
+- [ ] Phase 4c: Durable callback outbox (deferred until an observed delivery problem)
+- [ ] Phase 4d: Investigation and restoration of skipped test_multiple_workers_no_collision
 
 Phase 2e is merged and deployed on Railway, as confirmed by the developer.
 Phase 3 is committed and verified end-to-end on Railway with real PDF and PPTX
@@ -636,6 +642,9 @@ dependency for ingestion chunking. Retrieval remains Phase 3.
 
 ## Testing
 
+`tests/test_refactor.py` assertions may change when the route surface changes.
+Changing any other test's assertions requires specific approval for that case.
+
 Before running `uv run pytest`, run `Remove-Item Env:DATABASE_URL` in the same shell.
 
 Historical Phase 2e baseline: 162 passed, one skipped, and one warning in each of
@@ -777,13 +786,7 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-- Wait for FSE direction on Stewart's next integration need: attachments,
-  history, streaming, or outbox.
-- Investigate and restore the skipped concurrency test.
-- Plan Railway subscription renewal when the one-month trial expires in early
-  December 2026, or arrange migration.
-- Durable callback outbox remains deferred until the FSE reports an actual
-  delivery problem.
+Phase 3.5a is the next sub-phase: attachment subsystem. The FSE has requested Stewart's document and screenshot attachments and the frontend is already built. Chat history (4a) follows and will reuse the attachment IDs from 3.5a. Streaming, outbox, and the skipped-test investigation are deferred until a driver appears.
 
 ## Deployment status
 
@@ -842,3 +845,25 @@ mocked SDK responses. They do not prove live project model access or quota.
 Verify those operational prerequisites before deployment. The old pre-2b2
 embedding-verification instruction is historical, not a blocker to reimplement
 already completed ingestion.
+
+## Phase 3.5a attachments
+
+Attachments use Postgres BYTEA in `concept_explainer.attachments`, with an
+application-controlled six-hour TTL and a 4 MiB per-file limit. Migration 003
+must be applied before starting the updated service. Startup sweeps expired
+rows before workers start; an hourly task repeats cleanup and is cancelled
+and awaited before database disposal.
+
+Ownership is consciously API-key-only: there is no `owner_id` column and no
+per-student isolation. Any valid `AI_SERVICE_API_KEY` can access any attachment
+ID. Tests verify access after rotating the configured API key. The trusted FSE
+backend enforces file counts; this service adds no rate limiting or aggregate
+storage quota. GET returns metadata only. Byte access is an internal service
+function reserved for Phase 3.5b; there is no content HTTP endpoint.
+Phase 3.5a does not change `/explain` or perform image-specific processing.
+
+Verified 6 November 2026: attachment suite 33 passed; full suite 250 passed,
+1 skipped, and 1 existing deprecation warning in 493.80 seconds. Lifecycle
+tests mock the startup attachment sweep without changing existing assertions.
+The route-surface test includes the two new attachment paths. No deployment
+or commit was performed as part of this implementation.

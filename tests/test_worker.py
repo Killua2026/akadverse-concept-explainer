@@ -361,6 +361,7 @@ async def test_health_worker_running(monkeypatch):
     loop = AsyncMock(side_effect=asyncio.CancelledError)
     monkeypatch.setattr(main, "gemini_settings", GeminiSettings(llm_provider="gemini_enterprise", google_cloud_project="test"))
     monkeypatch.setattr(main, "configure_ingestion", configure)
+    monkeypatch.setattr(main, "sweep_expired_attachments", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "recover_stuck_jobs", AsyncMock())
     monkeypatch.setattr(main, "worker_loop", loop)
     async with main.lifespan(main.app):
@@ -517,6 +518,7 @@ async def test_missing_callback_secret_disables_ingestion(monkeypatch):
     monkeypatch.setenv("AI_SERVICE_API_KEY", "test-inbound")
     monkeypatch.delenv("AI_SERVICE_CALLBACK_SECRET", raising=False)
     recover = AsyncMock()
+    monkeypatch.setattr(main, "sweep_expired_attachments", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "recover_stuck_jobs", recover)
     async with main.lifespan(main.app):
         assert main.app.state.ingest_status == "disabled (missing AI_SERVICE_CALLBACK_SECRET)"
@@ -554,6 +556,7 @@ async def test_workers_share_callback_client_until_shutdown(monkeypatch):
         llm_provider="gemini_enterprise", google_cloud_project="test"
     ))
     monkeypatch.setattr(main, "configure_ingestion", configure)
+    monkeypatch.setattr(main, "sweep_expired_attachments", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "recover_stuck_jobs", AsyncMock())
     monkeypatch.setattr(main, "worker_loop", worker)
     async with main.lifespan(main.app):

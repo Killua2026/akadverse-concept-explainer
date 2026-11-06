@@ -21,6 +21,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from routes.ingest import router as ingest_router
 from routes.documents import router as documents_router
 from services.callback import CallbackSettings
+from services.attachments import sweep_expired_attachments
+from routes.attachments import make_attachments_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +119,15 @@ from routes.explain import make_explain_router
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
 
+async def _periodic_attachment_sweep(database):
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await sweep_expired_attachments(database)
+        except Exception as exc:
+            logger.warning("attachments.sweep_failed error_type=%s", type(exc).__name__)
+
+
 @asynccontextmanager
 async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     """
@@ -124,6 +135,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     Replaces the deprecated @app.on_event("startup") pattern.
     """
     gemini_settings.validate()
+    application.state.gemini_settings = gemini_settings
     worker_count = get_worker_count()
     application.state.worker_count = worker_count
     application.state.worker_tasks = []
@@ -149,6 +161,11 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     else:
         await configure_ingestion(application)
         database = get_ingestion_database(application)
+        if database is not None:
+            swept = await sweep_expired_attachments(database)
+            if swept:
+                logger.info("attachments.swept count=%s", swept)
+            application.state.attachment_sweep_task = asyncio.create_task(_periodic_attachment_sweep(database))
         application.state.worker_status = (
             "disabled (ingest not configured)" if application.state.ingest_status.startswith("disabled (missing ")
             else "stopped (db unavailable)"
@@ -182,6 +199,10 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        attachment_sweep_task = getattr(application.state, "attachment_sweep_task", None)
+        if attachment_sweep_task is not None:
+            attachment_sweep_task.cancel()
+            await asyncio.gather(attachment_sweep_task, return_exceptions=True)
         await callback_client.aclose()
         if worker_logging_enabled:
             worker_logger.removeFilter(worker_log_context)
@@ -207,6 +228,7 @@ app.include_router(grounding_router)
 app.include_router(make_explain_router(gemini_settings))
 app.include_router(ingest_router)
 app.include_router(documents_router)
+app.include_router(make_attachments_router())
 
 
 @app.middleware("http")

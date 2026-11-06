@@ -169,6 +169,7 @@ async def test_missing_callback_allowlist_disables_ingestion(configured, body, m
         llm_provider="gemini_enterprise", google_cloud_project="test"
     ))
     recover = AsyncMock()
+    monkeypatch.setattr(main, "sweep_expired_attachments", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "recover_stuck_jobs", recover)
     async with main.lifespan(main.app):
         assert main.app.state.ingest_status == "disabled (missing AI_SERVICE_CALLBACK_ALLOWED_HOSTS)"

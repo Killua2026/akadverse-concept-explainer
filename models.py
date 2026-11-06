@@ -6,6 +6,15 @@ from typing import Literal
 from pydantic import BaseModel, Field, HttpUrl
 
 
+class AttachmentResponse(BaseModel):
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    created_at: datetime
+    expires_at: datetime
+
+
 class IngestMetadata(BaseModel):
     course_code: str
     course_title: str

@@ -42,7 +42,7 @@ def storage_session():
         schema = f"concept_explainer_test_{uuid4().hex}"
         migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
         migrations = []
-        for name in ("001_pgvector_storage.sql", "002_jobs_table.sql"):
+        for name in ("001_pgvector_storage.sql", "002_jobs_table.sql", "003_attachments_table.sql"):
             migrations.append(await asyncio.to_thread(
                 (migrations_dir / name).read_text, encoding="utf-8"
             ))
