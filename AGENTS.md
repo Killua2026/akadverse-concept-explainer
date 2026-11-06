@@ -790,6 +790,8 @@ Phase 3.5a is the next sub-phase: attachment subsystem. The FSE has requested St
 
 ## Deployment status
 
+Before deploying any commit that adds or modifies a file under `migrations/`, verify all migrations are applied to the target database: `SELECT tablename FROM pg_tables WHERE schemaname = 'concept_explainer';` should list every table the migrations create. The container does not run migrations on startup.
+
 - Phase 3 is committed and verified on Railway: INS412 PDF produced 28 chunks
   and CSC424 PPTX produced 17 chunks. `/explain` returned grounded answers,
   correct source citations, and correct not-covered behaviour. FSE callbacks
