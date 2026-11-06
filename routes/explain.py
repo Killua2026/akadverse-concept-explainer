@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def make_explain_router(settings: GeminiSettings) -> APIRouter:
     router = APIRouter()
 
-    @router.post("/explain", response_model=ExplainResponse,
+    @router.post("/explain", response_model=ExplainResponse, tags=["Q&A"],
                  dependencies=[Depends(require_shared_secret_auth)])
     async def explain_endpoint(body: ExplainRequest, request: Request) -> ExplainResponse:
         database = getattr(request.app.state, "ingest_database", None)
