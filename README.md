@@ -5,12 +5,19 @@ The intended caller is the Next.js backend, not a browser client.
 
 ## Current status
 
-- Phase 2e is merged. Phase 3 retrieval is implemented locally.
+- Phase 3 (`POST /explain`) is committed and verified end-to-end on Railway
+  with real PDF and PPTX lecture documents.
 - Service deployed to Railway at `<RAILWAY_URL>` (staging).
 - Smoke test verified end-to-end ingestion: 202, chunks in
   `concept_explainer.chunks` (pgvector), and job `done`.
-- Callback delivery is outstanding until the FSE's `/api/webhooks/ai-ingest`
-  endpoint is live. This is expected, not a bug.
+- Callback delivery to `https://akadverse.vercel.app/api/webhooks/ai-ingest`
+  is verified working (200 OK).
+- Two smoke tests passed: INS412 PDF produced 28 chunks; CSC424 PPTX produced
+  17 chunks. `/explain` returned grounded answers with correct source citations
+  and correct "not covered" behaviour for questions outside the material.
+- App logs route to stdout, appearing as `[info]` in Railway instead of
+  `[error]`. `httpx` INFO logging is suppressed to prevent signed URL leakage.
+- Railway trial expires early December 2026: plan an upgrade or migration.
 - Phase 3 retrieval is implemented. Stewart attachments, screenshots, history, and practice mode remain out of scope.
 - The known skipped concurrency test remains skipped.
 - The deployed URL is staging-only; production deploy is a separate decision.
@@ -359,6 +366,46 @@ Response:
 - `401` if auth is missing or wrong.
 - `503` if the database is unavailable.
 
+### POST /explain
+
+`POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
+and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
+Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
+The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
+`chunk_preview`, the first 200 content characters), and `retrieval_info`
+(`chunks_available`, `chunks_above_threshold`, `similarity_threshold`).
+
+The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
+768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,
+counts available/qualifying chunks, and retrieves up to eight at cosine distance
+at most 0.6 (similarity at least 0.4). Gemini uses the first discovered model and
+temperature 0.3 with Stewart's course-only prompt. Empty weeks and below-threshold
+results return 200 with an explanatory answer and no sources, without generation.
+Generation failures or empty output return a graceful fallback answer; embedding
+failures return sanitized 503. Database failures and Developer mode return 503.
+Missing or wrong Bearer credentials return 401 when the shared secret is configured.
+
+Database initialization and its existing retry/probe policy precede shared-secret
+and callback configuration checks. A reachable database remains available for
+retrieval when callbacks are disabled. Failed probes dispose the partial database
+and clear its state. Ingestion and workers still require ready status.
+No callback secret or allowlist is required by retrieval. Rate limiting is not
+implemented in Phase 3; callers are responsible. Attachments, screenshots,
+conversation history, and practice-question mode are outside this endpoint.
+
+Short-circuit branches return HTTP 200 with `sources: []` and skip LLM generation:
+
+- No material (`chunks_available == 0`): exact canned answer is
+  `No course material has been ingested for Week {week} of this offering yet.`
+  Its prefix is `No course material has been ingested`.
+- Not covered (`chunks_available > 0` and `chunks_above_threshold == 0`): exact
+  canned answer is `The course material for Week {week} does not cover this question.`
+  Its prefix is `The course material for Week {week}`.
+
+`{week}` is replaced with the requested week. The LLM generates a grounded
+answer using only the retrieved chunks. This endpoint is synchronous; the caller
+handles timeouts and rate limiting.
+
 ### GET /health
 
 Returns status, provider, version, grounding status, available endpoints, plus `ingest_status`, `worker_status`,
@@ -516,6 +563,25 @@ Run these from your backend environment.
    been missed, but the truth is in this response. `chunk_count > 0` when
    `status="done"` confirms chunks landed. Reconcile before Step 5 cleanup,
    which removes the job and makes status return 404.
+
+7. **Step 7: verify retrieval answers a question about ingested material.**
+
+   After an ingestion completes (`status="done"`), send:
+
+   ```bash
+   curl -X POST 'https://<RAILWAY_URL>/explain' \
+     -H "Authorization: Bearer <AI_SERVICE_API_KEY>" \
+     -H "Content-Type: application/json" \
+     -d '{"question": "Explain the main concept from this material", "course_offering_id": "your-offering-uuid", "week": 1}'
+   ```
+
+   Use the ingested offering ID and a week included in its metadata. Run this
+   before Step 5 cleanup, or ingest a new document if it was already deleted.
+   Expect `answer` grounded in the ingested material with `sources` citing the
+   `document_id`. If `retrieval_info.chunks_above_threshold == 0` but
+   `chunks_available > 0`, the material does not cover the question: route to
+   `/explain-with-grounding` as a fallback and show the student the source-type
+   difference (course material versus Google Search grounding).
 
 ### Do not
 
@@ -698,6 +764,17 @@ quota, or actual callback delivery. Provider tests mock external generation.
 
 ## Troubleshooting
 
+- **`/explain` returns "does not cover this question":** material exists for
+  that offering/week but no chunk passed the similarity threshold. The question
+  may be outside the material's scope or use vocabulary that does not match
+  the document. Do not lower the threshold; route to `/explain-with-grounding`.
+- **`/explain` returns "No course material has been ingested":** no chunks exist
+  for that `course_offering_id` + `week` combination. Verify the ingestion
+  metadata's `weeks` array includes the queried week.
+- **Railway Deploy Logs show `[error] INFO:` for routine events:** upgrade to
+  the committed logging configuration (`2f3baee`) documented in this update;
+  logs must route to stdout via `logging.basicConfig(stream=sys.stdout)`.
+
 - **First deploy fails at container start with `RuntimeError: Form data requires "python-multipart"`:**
   a package used at runtime is not in `requirements.txt`. Verify all runtime
   dependencies are listed. Docker layer caching may serve a stale image;
@@ -748,11 +825,13 @@ akadverse-concept-explainer/
   config.py                    Provider/storage settings and worker constants
   db.py                        Async Postgres engine and session factory
   routes/
+    explain.py                 Authenticated synchronous POST /explain
     ingest.py                  POST /ingest
     documents.py               Transactional DELETE /documents/{document_id}
     grounding.py               Retained Google Search Grounding route
   workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
   services/
+    retrieval.py               Course-scoped retrieval and grounded answers
     embedding.py               Enterprise batch embeddings
     callback.py                CallbackSettings and bounded authorized delivery
     chunking.py                Shared text splitting
@@ -775,6 +854,7 @@ akadverse-concept-explainer/
     test_db.py
     test_delete.py
     test_embedding.py
+    test_explain.py
     test_extractors.py
     test_gemini_provider.py
     test_grounding.py
@@ -798,42 +878,13 @@ ignored unknown document. Use DELETE to remove chunks and jobs; treat 204 and
 404 as success. Enable PDF/DOCX/PPTX in lecturer integrations and reject ZIP.
 `GET /documents/{id}/status` reconciles missed callbacks.
 
-Phase 2e is committed and Railway staging ingestion is smoke-tested: 202,
-pgvector chunks, and job done. Callback delivery remains outstanding until
-the FSE receiver is live. Use the FSE Integration Testing Guide to verify the
-receiver, TLS/DNS configuration, both shared secrets, and allowlisted hostname
-without exposing credentials. Automated tests do not establish live integration
-prerequisites or remote merge status. Exchange secrets privately. Production
-deployment remains a separate decision.
+Phase 3 is committed and verified end-to-end on Railway with real INS412 PDF
+(28 chunks) and CSC424 PPTX (17 chunks) lecture documents. Retrieval returned
+grounded answers, correct citations, and correct not-covered responses.
+Callbacks to `https://akadverse.vercel.app/api/webhooks/ai-ingest` returned 200 OK.
+Exchange secrets privately. Production deployment remains a separate decision.
 
-Phase 2e is merged. Phase 3 implements course-material retrieval. Investigate
-the skipped concurrency test separately. Attachments, screenshots, history,
-practice mode, and ZIP support remain deferred.
-
-
-## Phase 3: course material explanations
-
-`POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
-and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
-Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
-The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
-`chunk_preview`, the first 200 content characters), and `retrieval_info`
-(`chunks_available`, `chunks_above_threshold`, `similarity_threshold`).
-
-The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
-768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,
-counts available/qualifying chunks, and retrieves up to eight at cosine distance
-at most 0.6 (similarity at least 0.4). Gemini uses the first discovered model and
-temperature 0.3 with Stewart's course-only prompt. Empty weeks and below-threshold
-results return 200 with an explanatory answer and no sources, without generation.
-Generation failures or empty output return a graceful fallback answer; embedding
-failures return sanitized 503. Database failures and Developer mode return 503.
-Missing or wrong Bearer credentials return 401 when the shared secret is configured.
-
-Database initialization and its existing retry/probe policy precede shared-secret
-and callback configuration checks. A reachable database remains available for
-retrieval when callbacks are disabled. Failed probes dispose the partial database
-and clear its state. Ingestion and workers still require ready status.
-No callback secret or allowlist is required by retrieval. Rate limiting is not
-implemented in Phase 3; callers are responsible. Attachments, screenshots,
-conversation history, and practice-question mode are outside this endpoint.
+Wait for FSE direction on attachments, history, streaming, or outbox. Investigate
+and restore the skipped concurrency test separately. Durable callback outbox
+remains deferred until the FSE reports an actual delivery problem. Plan a Railway
+upgrade or migration before the trial expires early December 2026.
