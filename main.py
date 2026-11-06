@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import sys
 import re
 import tempfile
 import time
@@ -21,7 +22,12 @@ from routes.ingest import router as ingest_router
 from routes.documents import router as documents_router
 from services.callback import CallbackSettings
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:     %(name)s - %(message)s",
+    stream=sys.stdout,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
