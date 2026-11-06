@@ -39,6 +39,18 @@ EMBEDDING_BATCH_SLEEP_SECONDS = 8
 WORKER_POLL_SECONDS = 2
 WORKER_COUNT_DEFAULT = 1
 STUCK_JOB_MINUTES = 5
+ATTACHMENT_TTL_HOURS = 6
+ATTACHMENT_MAX_SIZE_BYTES = 4 * 1024 * 1024
+ATTACHMENT_ALLOWED_MIME_TYPES = frozenset({
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain",
+    "text/markdown",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+})
 from dataclasses import dataclass, field
 
 from pydantic import SecretStr

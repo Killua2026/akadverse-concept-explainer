@@ -205,6 +205,7 @@ async def test_explain_available_when_callback_config_missing(configured, seeded
     monkeypatch.delenv("AI_SERVICE_CALLBACK_ALLOWED_HOSTS", raising=False)
     monkeypatch.setattr(main, "gemini_settings", configured.settings)
     recover = AsyncMock()
+    monkeypatch.setattr(main, "sweep_expired_attachments", AsyncMock(return_value=0))
     monkeypatch.setattr(main, "recover_stuck_jobs", recover)
     async with seeded() as database:
         monkeypatch.setattr(main, "Database", Mock(return_value=database))
