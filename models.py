@@ -57,19 +57,25 @@ class ExplainRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     course_offering_id: str = Field(..., min_length=1)
     week: int = Field(..., ge=1)
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class ExplainSource(BaseModel):
-    document_id: str
+    document_id: str | None = None
     title: str
     material_type: str
     chunk_preview: str
+    source_type: Literal["course_material", "attachment"] = "course_material"
+    attachment_id: str | None = None
+    filename: str | None = None
 
 
 class RetrievalInfo(BaseModel):
     chunks_available: int
     chunks_above_threshold: int
     similarity_threshold: float
+    attachment_chunks_available: int = 0
+    attachment_chunks_above_threshold: int = 0
 
 
 class ExplainResponse(BaseModel):
