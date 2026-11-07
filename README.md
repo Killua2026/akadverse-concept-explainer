@@ -18,7 +18,7 @@ The intended caller is the Next.js backend, not a browser client.
 - App logs route to stdout, appearing as `[info]` in Railway instead of
   `[error]`. `httpx` INFO logging is suppressed to prevent signed URL leakage.
 - Railway trial expires early December 2026: plan an upgrade or migration.
-- Phase 3 retrieval is implemented. Stewart attachments, screenshots, history, and practice mode remain out of scope.
+- Phase 3.5b adds text attachments to Stewart retrieval. Screenshots, history, and practice mode remain out of scope.
 - The known skipped concurrency test remains skipped.
 - The deployed URL is staging-only; production deploy is a separate decision.
 
@@ -371,16 +371,29 @@ Response:
 `POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
 and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
 Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
+Optionally include `attachment_ids`, an array of up to eight IDs from
+`POST /attachments`. PDF, DOCX, PPTX, TXT, and MD attachments are supported.
+An image, missing or expired ID, or extraction failure returns 422 for the entire request.
+
 The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
 `chunk_preview`, the first 200 content characters), and `retrieval_info`
 (`chunks_available`, `chunks_above_threshold`, `similarity_threshold`).
+With attachment IDs, sources also include `source_type` (`course_material` or
+`attachment`), `attachment_id`, and `filename`. Attachment sources have a null
+`document_id`. The retrieval info adds `attachment_chunks_available` (all chunks
+before the cap) and `attachment_chunks_above_threshold` (capped chunks meeting
+the threshold before the top-eight cutoff). An omitted or empty `attachment_ids`
+array preserves the course-only JSON shape.
 
 The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
 768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,
 counts available/qualifying chunks, and retrieves up to eight at cosine distance
-at most 0.6 (similarity at least 0.4). Gemini uses the first discovered model and
-temperature 0.3 with Stewart's course-only prompt. Empty weeks and below-threshold
-results return 200 with an explanatory answer and no sources, without generation.
+at most 0.6 (similarity at least 0.4). Attachments share a total budget of 100
+embedded chunks, allocated proportionally across files with at least one per
+nonempty file. The same question embedding retrieves up to eight attachment
+chunks at the same threshold. Attachment chunks stay in memory for the request.
+Gemini uses the first discovered model and temperature 0.3, with separate course
+material and attached-file context when both have qualifying chunks.
 Generation failures or empty output return a graceful fallback answer; embedding
 failures return sanitized 503. Database failures and Developer mode return 503.
 Missing or wrong Bearer credentials return 401 when the shared secret is configured.
@@ -389,22 +402,27 @@ Database initialization and its existing retry/probe policy precede shared-secre
 and callback configuration checks. A reachable database remains available for
 retrieval when callbacks are disabled. Failed probes dispose the partial database
 and clear its state. Ingestion and workers still require ready status.
-No callback secret or allowlist is required by retrieval. Rate limiting is not
-implemented in Phase 3; callers are responsible. Attachments, screenshots,
-conversation history, and practice-question mode are outside this endpoint.
+No callback secret or allowlist is required by retrieval. Callers handle rate
+limiting.
 
 Short-circuit branches return HTTP 200 with `sources: []` and skip LLM generation:
 
-- No material (`chunks_available == 0`): exact canned answer is
+- No attachment IDs and no material (`chunks_available == 0`): exact canned answer is
   `No course material has been ingested for Week {week} of this offering yet.`
   Its prefix is `No course material has been ingested`.
-- Not covered (`chunks_available > 0` and `chunks_above_threshold == 0`): exact
+- Neither course material nor attachments has a qualifying chunk, in all other cases: exact
   canned answer is `The course material for Week {week} does not cover this question.`
   Its prefix is `The course material for Week {week}`.
 
-`{week}` is replaced with the requested week. The LLM generates a grounded
-answer using only the retrieved chunks. This endpoint is synchronous; the caller
-handles timeouts and rate limiting.
+`{week}` is replaced with the requested week. When attachment chunks qualify
+and course chunks do not, Stewart can answer using only those attachments and
+cite their filenames.
+
+When the 100-chunk total cap is active, each attachment contributes only its first N chunks in document order, where N is its proportional allocation. For very large files, this means only the beginning of the document is retrievable. Callers with large source documents should either split them into topic-scoped uploads or accept that questions about later sections will not find supporting chunks.
+
+Latency budget for /explain: requests without attachments typically complete in 10-20 seconds (course material retrieval + LLM generation). Requests with attachments add the embedding cost of the attached chunks: a small attachment (10-20 chunks) adds ~10-15 seconds; a request hitting the 100-chunk cap adds ~80 seconds of inter-batch sleeps plus embedding compute, for a worst case of roughly 2 minutes end-to-end. Frontend clients must set a request timeout of at least 150 seconds to accommodate the worst case. Callers needing faster responses for large attachments should use smaller attachments, or wait for the asynchronous /explain variant planned for Phase 4.
+
+Attachment ownership is enforced by the FSE backend before calling this service. The microservice stores and serves any attachment by ID to any caller presenting a valid `AI_SERVICE_API_KEY`. The FSE backend must verify that a student is authorized to view a course/material before including its `attachment_ids` in an `/explain` request, and must verify student identity before calling `/attachments` or `/explain` at all.
 
 ### GET /health
 

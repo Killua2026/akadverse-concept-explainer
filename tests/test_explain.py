@@ -1,9 +1,13 @@
 """Real pgvector retrieval with deterministic embeddings and mocked generation."""
 
+import asyncio
 import json
+from collections import Counter
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -13,8 +17,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from config import GeminiSettings
+from routes.attachments import make_attachments_router
 from routes.explain import make_explain_router
-from services import retrieval
+from services import attachments, retrieval
 
 
 @pytest.fixture
@@ -78,10 +83,13 @@ def seeded(storage_session, monkeypatch, configured):
     return seed
 
 
-async def post(app, *, question="Explain the topic", week=1, offering="offering", token="test-secret"):
+async def post(app, *, question="Explain the topic", week=1, offering="offering", token="test-secret",
+               attachment_ids=None):
+    body = {"question": question, "week": week, "course_offering_id": offering}
+    if attachment_ids is not None:
+        body["attachment_ids"] = attachment_ids
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        return await client.post("/explain", json={"question": question, "week": week,
-                                 "course_offering_id": offering},
+        return await client.post("/explain", json=body,
                                  headers={"Authorization": f"Bearer {token}"} if token else {})
 
 
@@ -256,3 +264,210 @@ async def test_generate_answer_resilience(configured, result):
         {"metadata": {"title": "Notes"}, "content": "Material"}
     ], configured.settings)
     assert answer == ("An answer." if result == "answer" else retrieval.FALLBACK_ANSWER)
+
+
+@pytest.fixture
+def attachment_api(configured, worker_database, monkeypatch):
+    @asynccontextmanager
+    async def setup(course_vector=None):
+        async with worker_database() as (database, schema):
+            def isolated_text(sql):
+                return text(sql.replace("concept_explainer", schema))
+
+            monkeypatch.setattr(attachments, "text", isolated_text)
+            monkeypatch.setattr(retrieval, "text", isolated_text)
+            app = configured.app
+            app.include_router(make_attachments_router())
+            app.state.ingest_database = database
+            app.state.gemini_settings = configured.settings
+            if course_vector is not None:
+                async with database.sessions() as session, session.begin():
+                    await session.execute(text(f"""
+                        INSERT INTO {schema}.chunks (document_id, content, embedding, metadata)
+                        VALUES ('lecture', 'Course lecture content', CAST(:vector AS vector),
+                                CAST(:metadata AS jsonb))
+                    """), {
+                        "vector": json.dumps(course_vector + [0] * (768 - len(course_vector))),
+                        "metadata": json.dumps({"course_offering_id": "offering", "weeks": [1],
+                                                "title": "Lecture", "material_type": "NOTES"}),
+                    })
+            configured.embed.side_effect = lambda chunks, settings: [[1.0] + [0.0] * 767 for _ in chunks]
+            yield database, schema
+    return setup
+
+
+async def upload(app, filename, content, mime_type):
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/attachments", files={"file": (filename, content, mime_type)},
+                                     headers={"Authorization": "Bearer test-secret"})
+    assert response.status_code == 200
+    return response.json()["attachment_id"]
+
+
+@pytest.mark.anyio
+async def test_explain_with_one_text_attachment(configured, attachment_api):
+    pdf = Path(__file__).parent / "fixtures" / "sample.pdf"
+    configured.generate.return_value.text = "Lecture PDF content is in notes.pdf."
+    async with attachment_api() as (database, schema):
+        identifier = await upload(configured.app, "notes.pdf", await asyncio.to_thread(pdf.read_bytes),
+                                  "application/pdf")
+        response = await post(configured.app, attachment_ids=[identifier])
+        async with database.sessions() as session:
+            assert await session.scalar(text(f"SELECT count(*) FROM {schema}.chunks")) == 0
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "Lecture PDF content is in notes.pdf."
+    assert body["sources"] == [{
+        "document_id": None, "title": "notes.pdf", "material_type": "ATTACHMENT",
+        "chunk_preview": "Lecture PDF content", "source_type": "attachment",
+        "attachment_id": identifier, "filename": "notes.pdf",
+    }]
+    assert body["retrieval_info"]["chunks_available"] == 0
+    assert body["retrieval_info"]["attachment_chunks_available"] == 1
+    assert body["retrieval_info"]["attachment_chunks_above_threshold"] == 1
+    assert [call.args[0] for call in configured.embed.await_args_list] == [
+        ["Explain the topic"], ["Lecture PDF content"],
+    ]
+    assert "--- Attached files ---\n--- Attachment: notes.pdf ---\nLecture PDF content" in (
+        configured.generate.await_args.kwargs["contents"]
+    )
+
+
+@pytest.mark.anyio
+async def test_explain_with_attachment_answers_when_material_does_not(configured, attachment_api):
+    configured.generate.return_value.text = "The answer comes from notes.txt."
+    async with attachment_api(course_vector=[0, 1]):
+        identifier = await upload(configured.app, "notes.txt", b"Useful attachment content", "text/plain")
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "The answer comes from notes.txt."
+    assert [source["source_type"] for source in body["sources"]] == ["attachment"]
+    assert body["retrieval_info"]["chunks_available"] == 1
+    assert body["retrieval_info"]["chunks_above_threshold"] == 0
+    assert "Course lecture content" not in configured.generate.await_args.kwargs["contents"]
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_image_attachment(configured, attachment_api):
+    async with attachment_api():
+        identifier = await upload(configured.app, "image.png", b"\x89PNG\r\n\x1a\n", "image/png")
+        response = await post(configured.app, attachment_ids=[identifier, str(uuid4())])
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": f"Image attachments not supported in Phase 3.5b. Attachment {identifier} "
+                  "has mime_type image/png. Image support arrives in Phase 3.5c."
+    }
+    configured.embed.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_expired_attachment(configured, attachment_api):
+    async with attachment_api() as (database, schema):
+        identifier = await upload(configured.app, "notes.txt", b"Expired content", "text/plain")
+        async with database.sessions() as session, session.begin():
+            await session.execute(text(f"""
+                UPDATE {schema}.attachments SET expires_at = now() - interval '1 minute'
+                WHERE id = :id
+            """), {"id": identifier})
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 422
+    assert response.json() == {"detail": f"Attachment {identifier} not found or expired"}
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_unknown_attachment_id(configured, attachment_api):
+    identifier = str(uuid4())
+    async with attachment_api():
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 422
+    assert response.json() == {"detail": f"Attachment {identifier} not found or expired"}
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_more_than_eight_attachments(configured):
+    response = await post(configured.app, attachment_ids=[str(uuid4()) for _ in range(9)])
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Maximum 8 attachments per request"}
+
+
+@pytest.mark.anyio
+async def test_explain_rejects_extraction_failure(configured, attachment_api, monkeypatch):
+    paths = []
+    extract_text = retrieval.extract_text
+
+    def record_path(path, mime_type):
+        paths.append(Path(path))
+        return extract_text(path, mime_type)
+
+    monkeypatch.setattr(retrieval, "extract_text", record_path)
+    async with attachment_api():
+        identifier = await upload(configured.app, "broken.pdf", b"%PDF-1.7\ncorrupt", "application/pdf")
+        image = await upload(configured.app, "image.png", b"\x89PNG\r\n\x1a\n", "image/png")
+        response = await post(configured.app, attachment_ids=[identifier, image])
+    assert response.status_code == 422
+    assert response.json() == {"detail": f"Attachment {identifier}: Unable to extract text from PDF"}
+    assert len(paths) == 1
+    assert not await asyncio.to_thread(paths[0].exists)
+    configured.embed.assert_not_awaited()
+
+
+def test_explain_attachment_chunk_cap_distribution():
+    files = [(str(i), f"{i}.txt", [f"{i}-{j}" for j in range(count)])
+             for i, count in enumerate([100, 200, 300])]
+    selected = retrieval._allocate_chunks(files)
+    assert len(selected) == 100
+    assert selected == [(identifier, filename, chunk)
+                        for (identifier, filename, chunks), count in zip(files, [17, 33, 50])
+                        for chunk in chunks[:count]]
+
+    files = [(str(i), f"{i}.txt", ["chunk"] * count)
+             for i, count in enumerate([490, 490, 1, 1, 1, 1, 1, 1])]
+    selected = retrieval._allocate_chunks(files)
+    assert Counter(identifier for identifier, _, _ in selected) == {
+        "0": 49, "1": 45, "2": 1, "3": 1, "4": 1, "5": 1, "6": 1, "7": 1,
+    }
+
+
+def test_explain_attachment_chunk_cap_under_threshold():
+    files = [("a", "a.txt", ["a"] * 10), ("b", "b.txt", ["b"] * 15), ("c", "c.txt", ["c"] * 25)]
+    assert retrieval._allocate_chunks(files) == [
+        (identifier, filename, chunk) for identifier, filename, chunks in files for chunk in chunks
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("filename", "mime_type", "label"), [
+    ("notes.txt", "text/plain", "TXT"), ("notes.md", "text/markdown", "MD"),
+])
+async def test_explain_txt_and_md_attachments(configured, attachment_api, filename, mime_type, label):
+    async with attachment_api():
+        identifier = await upload(configured.app, filename, b"  # Useful notes\xff\n", mime_type)
+        response = await post(configured.app, attachment_ids=[identifier])
+        empty = await upload(configured.app, filename, b" \n\t", mime_type)
+        rejected = await post(configured.app, attachment_ids=[empty])
+    assert response.status_code == 200
+    assert response.json()["sources"][0]["filename"] == filename
+    assert response.json()["sources"][0]["chunk_preview"] == "# Useful notes\ufffd"
+    assert rejected.status_code == 422
+    assert rejected.json() == {"detail": f"Attachment {empty}: No extractable text in {label}"}
+
+
+@pytest.mark.anyio
+async def test_explain_mixed_material_and_attachment(configured, attachment_api):
+    content = "\n".join(f"Attachment paragraph {i} " + "content " * 120 for i in range(105))
+    async with attachment_api(course_vector=[1]):
+        identifier = await upload(configured.app, "notes.md", content.encode(), "text/markdown")
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    body = response.json()
+    assert [source["source_type"] for source in body["sources"]] == ["course_material"] + ["attachment"] * 8
+    assert body["sources"][0]["document_id"] == "lecture"
+    assert all(source["attachment_id"] == identifier for source in body["sources"][1:])
+    info = body["retrieval_info"]
+    assert info["attachment_chunks_available"] == 105
+    assert info["attachment_chunks_above_threshold"] == 100
+    assert len(configured.embed.await_args_list[1].args[0]) == 100
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert "--- Course material ---\n--- Source: Lecture ---\nCourse lecture content" in prompt
+    assert "--- Attached files ---\n--- Attachment: notes.md ---\nAttachment paragraph 0" in prompt

@@ -42,7 +42,7 @@ Status:
 - [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
 - [x] Phase 3: POST /explain retrieval endpoint (verified on Railway with PDF and PPTX)
 - [x] Phase 3.5a: Attachment subsystem (upload/get/delete, Postgres BYTEA storage, 6-hour expiry, ownership by API key)
-- [ ] Phase 3.5b: /explain accepts text attachments (PDF, DOCX, PPTX, TXT, MD) and merges retrieval with course material
+- [x] Phase 3.5b: /explain accepts text attachments (PDF, DOCX, PPTX, TXT, MD) and merges retrieval with course material
 - [ ] Phase 3.5c: /explain handles image attachments (PNG, JPG, WebP) via Gemini vision
 - [ ] Phase 4a: Conversation history storage for Stewart (multi-turn context)
 - [ ] Phase 4b: Streaming responses for /explain
@@ -60,8 +60,8 @@ lecture documents. Callbacks are landing on the FSE's side (HTTP 200).
 (similarity floor 0.4) and K=8. It embeds the question through
 `services.embedding.embed_chunks` so ingestion and retrieval embeddings stay
 configuration-identical. LLM answers are grounded-only and use
-`EXPLAIN_PROMPT_TEMPLATE` with the Stewart persona. Attachments, screenshots,
-and conversation history belong to Phase 3.5 / Phase 4. Rate limiting is caller-owned.
+`EXPLAIN_PROMPT_TEMPLATE` with the Stewart persona. Phase 3.5b adds text
+attachments as described below. Rate limiting is caller-owned.
 
 - `/explain` uses `require_shared_secret_auth` and the inbound API key only.
 - Database initialization checks DATABASE_URL, probes up to three times with
@@ -79,7 +79,7 @@ and conversation history belong to Phase 3.5 / Phase 4. Rate limiting is caller-
   capped at 200 characters. Empty or unrelated material avoids the LLM call.
 - Generation uses the first discovered model at temperature 0.3 and returns a
   safe fallback for provider failures, missing candidates, or empty text.
-- Attachments, screenshots, conversation history, and practice mode remain deferred.
+- Screenshots, conversation history, and practice mode remain deferred.
 
 ### Phase 3 verification (5 November 2026)
 
@@ -848,7 +848,7 @@ Verify those operational prerequisites before deployment. The old pre-2b2
 embedding-verification instruction is historical, not a blocker to reimplement
 already completed ingestion.
 
-## Phase 3.5a attachments
+## Phase 3.5 attachments
 
 Attachments use Postgres BYTEA in `concept_explainer.attachments`, with an
 application-controlled six-hour TTL and a 4 MiB per-file limit. Migration 003
@@ -861,11 +861,30 @@ per-student isolation. Any valid `AI_SERVICE_API_KEY` can access any attachment
 ID. Tests verify access after rotating the configured API key. The trusted FSE
 backend enforces file counts; this service adds no rate limiting or aggregate
 storage quota. GET returns metadata only. Byte access is an internal service
-function reserved for Phase 3.5b; there is no content HTTP endpoint.
-Phase 3.5a does not change `/explain` or perform image-specific processing.
+function used by `/explain`.
 
 Verified 6 November 2026: attachment suite 33 passed; full suite 250 passed,
 1 skipped, and 1 existing deprecation warning in 493.80 seconds. Lifecycle
 tests mock the startup attachment sweep without changing existing assertions.
 The route-surface test includes the two new attachment paths. No deployment
 or commit was performed as part of this implementation.
+
+Phase 3.5b accepts up to eight PDF, DOCX, PPTX, TXT, or MD attachment IDs per
+`/explain` request. Image attachments return 422. Attachment chunks are extracted,
+chunked, embedded, and scored in request memory and are never persisted to
+`concept_explainer.chunks`. The same question embedding ranks up to eight course
+chunks and eight attachment chunks at similarity 0.4 or higher. The attachment
+embedding budget is 100 chunks total. Above the cap, each file gets its floored
+proportional share, bounded by its chunk count and with at least one chunk per
+nonempty file. Remaining slots go to the largest `share - alloc`, with ties in
+request order.
+
+When the 100-chunk total cap is active, each attachment contributes only its first N chunks in document order, where N is its proportional allocation. For very large files, this means only the beginning of the document is retrievable. Callers with large source documents should either split them into topic-scoped uploads or accept that questions about later sections will not find supporting chunks.
+
+The 100-chunk cap's decrement step (used when floor-1 minimum allocations push the total above 100) reduces the eligible attachment with the smallest `alloc - share` value, preserving the floor-1 rule and concentrating reductions on the largest allocations. On ties it prefers the later-attached file, which continues to bear the reduction while eligible. This is a deliberate trade-off: decrementing a one-chunk allocation would violate the floor-1 rule. Overshoot requires a mix of larger and tiny files, so equal-sized attachments alone do not trigger it.
+
+Latency budget for /explain: requests without attachments typically complete in 10-20 seconds (course material retrieval + LLM generation). Requests with attachments add the embedding cost of the attached chunks: a small attachment (10-20 chunks) adds ~10-15 seconds; a request hitting the 100-chunk cap adds ~80 seconds of inter-batch sleeps plus embedding compute, for a worst case of roughly 2 minutes end-to-end. Frontend clients must set a request timeout of at least 150 seconds to accommodate the worst case. Callers needing faster responses for large attachments should use smaller attachments, or wait for the asynchronous /explain variant planned for Phase 4.
+
+### Attachment trust boundary
+
+Attachment ownership is enforced by the FSE backend before calling this service. The microservice stores and serves any attachment by ID to any caller presenting a valid `AI_SERVICE_API_KEY`. The FSE backend must verify that a student is authorized to view a course/material before including its `attachment_ids` in an `/explain` request, and must verify student identity before calling `/attachments` or `/explain` at all.
