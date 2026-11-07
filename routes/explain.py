@@ -8,7 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from auth import UNAVAILABLE, require_shared_secret_auth
 from config import GeminiSettings
 from models import ExplainRequest, ExplainResponse
-from services.retrieval import AttachmentError, AttachmentStorageError, explain
+from services.retrieval import AttachmentError, AttachmentStorageError, ImageProcessingError, explain
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,10 @@ def make_explain_router(settings: GeminiSettings) -> APIRouter:
             )
         except AttachmentError as error:
             raise HTTPException(422, str(error)) from None
+        except ImageProcessingError as error:
+            raise HTTPException(
+                422, f"Image processing failed. Attachment {error.attachment_id} could not be read by the vision model.",
+            ) from None
         except AttachmentStorageError:
             logger.warning("retrieval.attachment_storage_unavailable")
             raise HTTPException(503, UNAVAILABLE) from None
