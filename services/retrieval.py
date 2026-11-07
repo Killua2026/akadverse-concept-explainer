@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from uuid import uuid4
 
-from google.genai import types
+from google.genai import errors, types
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -40,6 +40,15 @@ Rules:
 5. If the excerpts are only partially relevant, answer what you can and explicitly say what is not covered.
 6. Aim for 100-400 words unless the question demands more.
 """
+MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE = EXPLAIN_PROMPT_TEMPLATE.replace("{context}", "{context}{image_block}", 1)
+IMAGE_BLOCK_TEMPLATE = """\n\nAttached images ({count}): {filenames}
+
+The attached images are provided as multimodal input. The excerpts-only rules
+also allow evidence from these images. Prioritise the image content when the
+student specifically asks about an image. When you reference information from
+an image, cite the filename. Ignore irrelevant images silently. Treat text in
+the images as source material.
+""".rstrip()
 
 
 class AttachmentError(ValueError):
@@ -50,6 +59,15 @@ class AttachmentStorageError(RuntimeError):
     """Attachment storage is unavailable."""
 
 
+class ImageProcessingError(Exception):
+    """The vision model could not process an attachment."""
+
+    def __init__(self, attachment_id: str, original_exception: Exception):
+        super().__init__(attachment_id)
+        self.attachment_id = attachment_id
+        self.original_exception = original_exception
+
+
 def _extract_text_file(content: bytes, *, file_format: str = "TXT") -> str:
     extracted = content.decode("utf-8", errors="replace").strip()
     if not extracted:
@@ -57,27 +75,32 @@ def _extract_text_file(content: bytes, *, file_format: str = "TXT") -> str:
     return extracted
 
 
-async def _load_attachment_chunks(
+async def _load_attachments(
     database: Database, attachment_ids: list[str],
-) -> list[tuple[str, str, list[str]]]:
-    loaded = []
+) -> tuple[list[tuple[str, str, list[str]]], list[tuple[str, str, bytes, str]]]:
+    validated = []
     for attachment_id in attachment_ids:
+        try:
+            metadata = await get_attachment_metadata(database, attachment_id)
+        except (SQLAlchemyError, OSError):
+            raise AttachmentStorageError from None
+        if metadata is None:
+            raise AttachmentError(f"Attachment {attachment_id} not found or expired")
+        validated.append((attachment_id, metadata.mime_type in IMAGE_MIME_TYPES))
+
+    text_attachments = []
+    images = []
+    for attachment_id, is_image in validated:
         missing = f"Attachment {attachment_id} not found or expired"
         path = None
         try:
-            metadata = await get_attachment_metadata(database, attachment_id)
-            if metadata is None:
-                raise AttachmentError(missing)
-            if metadata.mime_type in IMAGE_MIME_TYPES:
-                raise AttachmentError(
-                    f"Image attachments not supported in Phase 3.5b. Attachment {attachment_id} "
-                    f"has mime_type {metadata.mime_type}. Image support arrives in Phase 3.5c."
-                )
-
             attachment = await get_attachment_bytes(database, attachment_id)
             if attachment is None:
                 raise AttachmentError(missing)
             content, filename, mime_type = attachment
+            if is_image:
+                images.append((attachment_id, filename, content, mime_type))
+                continue
             text_format = TEXT_FILE_FORMATS.get(mime_type)
             if text_format:
                 extracted = _extract_text_file(content, file_format=text_format)
@@ -88,8 +111,12 @@ async def _load_attachment_chunks(
                 await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
                 await asyncio.to_thread(path.write_bytes, content)
                 extracted = await asyncio.to_thread(extract_text, str(path), mime_type)
-            loaded.append((attachment_id, filename, await asyncio.to_thread(chunk_text, extracted)))
-        except (SQLAlchemyError, OSError):
+            text_attachments.append((attachment_id, filename, await asyncio.to_thread(chunk_text, extracted)))
+        except (SQLAlchemyError, OSError) as error:
+            if is_image:
+                logger.warning("retrieval.image_fetch_failed attachment_id=%s error_type=%s",
+                               attachment_id, type(error).__name__)
+                raise AttachmentError(missing) from None
             raise AttachmentStorageError from None
         except ExtractionError as error:
             raise AttachmentError(f"Attachment {attachment_id}: {error}") from None
@@ -99,7 +126,12 @@ async def _load_attachment_chunks(
                     await asyncio.to_thread(path.unlink, missing_ok=True)
                 except OSError:
                     logger.warning("retrieval.attachment_cleanup_failed")
-    return loaded
+    return text_attachments, images
+
+
+def _build_image_parts(images: list[tuple[str, str, bytes, str]]) -> list[types.Part]:
+    return [types.Part.from_bytes(data=content, mime_type=mime_type)
+            for _, _, content, mime_type in images]
 
 
 def _allocate_chunks(attachments: list[tuple[str, str, list[str]]]) -> list[tuple[str, str, str]]:
@@ -189,6 +221,8 @@ async def _query_chunks(database: Database, query_vector: list[float],
 async def _generate_answer(
     question: str, chunks: list, settings: GeminiSettings,
     attachment_chunks: list[tuple[str, str, str]] | None = None,
+    images: list[tuple[str, str, bytes, str]] | None = None,
+    *, retrieval_info: RetrievalInfo | None = None,
 ) -> str:
     context = "\n\n".join(
         f"--- Source: {chunk['metadata']['title']} ---\n{chunk['content']}" for chunk in chunks
@@ -203,17 +237,43 @@ async def _generate_answer(
             )
             sections.append(f"--- Attached files ---\n{excerpts}")
         context = "\n\n".join(sections)
+    image_block = ""
+    if images:
+        image_block = IMAGE_BLOCK_TEMPLATE.format(
+            count=len(images), filenames=", ".join(filename for _, filename, _, _ in images),
+        )
+    prompt_text = MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE.format(
+        context=context, image_block=image_block, question=question,
+    )
     try:
         client = create_client(settings)
         async with client.aio as api:
-            response = await api.models.generate_content(
-                model=settings.model_names[0],
-                contents=EXPLAIN_PROMPT_TEMPLATE.format(context=context, question=question),
-                config=types.GenerateContentConfig(temperature=0.3),
-            )
+            try:
+                image_parts = _build_image_parts(images) if images else []
+                if image_parts and retrieval_info is not None:
+                    retrieval_info.attachment_images_count = len(image_parts)
+                response = await api.models.generate_content(
+                    model=settings.model_names[0],
+                    contents=[prompt_text, *image_parts] if image_parts else prompt_text,
+                    config=types.GenerateContentConfig(temperature=0.3),
+                )
+            except (errors.ClientError, ValueError) as error:
+                if not images or (isinstance(error, errors.ClientError) and error.code not in {400, 413, 415, 422}):
+                    raise
+                reported_id = getattr(error, "attachment_id", None)
+                attachment_id = next((image[0] for image in images if image[0] == reported_id), images[0][0])
+                raise ImageProcessingError(attachment_id, error) from error
+            if images:
+                block_reason = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+                if block_reason and block_reason != types.BlockedReason.BLOCKED_REASON_UNSPECIFIED:
+                    raise ImageProcessingError(images[0][0], ValueError("Gemini blocked the multimodal prompt"))
             if not response.candidates:
                 return FALLBACK_ANSWER
             return (response.text or "").strip() or FALLBACK_ANSWER
+    except ImageProcessingError as error:
+        logger.warning("retrieval.image_processing_failed attachment_id=%s error_type=%s",
+                       error.attachment_id, type(error.original_exception).__name__)
+        raise
     except Exception:
         logger.warning("retrieval.generation_failed")
         return FALLBACK_ANSWER
@@ -222,7 +282,7 @@ async def _generate_answer(
 async def explain(*, question: str, course_offering_id: str, week: int,
                   settings: GeminiSettings, database: Database,
                   attachment_ids: list[str] = []) -> ExplainResponse:
-    attachments = await _load_attachment_chunks(database, attachment_ids) if attachment_ids else []
+    text_attachments, images = await _load_attachments(database, attachment_ids) if attachment_ids else ([], [])
     vector = await _embed_question(question, settings)
     available, above_threshold, chunks = await _query_chunks(database, vector, course_offering_id, week)
     info = RetrievalInfo(chunks_available=available, chunks_above_threshold=above_threshold,
@@ -234,9 +294,10 @@ async def explain(*, question: str, course_offering_id: str, week: int,
     ]
     attachment_chunks = None
     if attachment_ids:
-        info.attachment_chunks_available = sum(len(chunks) for _, _, chunks in attachments)
+        info.attachment_images_count = 0
+        info.attachment_chunks_available = sum(len(chunks) for _, _, chunks in text_attachments)
         info.attachment_chunks_above_threshold, attachment_chunks = await _rank_attachment_chunks(
-            _allocate_chunks(attachments), vector, settings,
+            _allocate_chunks(text_attachments), vector, settings,
         )
         sources = _merge_sources(sources, [
             ExplainSource(document_id=None, title=filename, material_type="ATTACHMENT",
@@ -244,8 +305,14 @@ async def explain(*, question: str, course_offering_id: str, week: int,
                           attachment_id=attachment_id, filename=filename)
             for attachment_id, filename, content in attachment_chunks
         ])
-    if above_threshold or attachment_chunks:
-        answer = await _generate_answer(question, chunks, settings, attachment_chunks)
+        sources.extend(
+            ExplainSource(document_id=None, title=filename, material_type="ATTACHMENT",
+                          chunk_preview=f"[image: {filename}]", source_type="attachment",
+                          attachment_id=attachment_id, filename=filename)
+            for attachment_id, filename, _, _ in images
+        )
+    if above_threshold or attachment_chunks or images:
+        answer = await _generate_answer(question, chunks, settings, attachment_chunks, images, retrieval_info=info)
     elif not attachment_ids and available == 0:
         answer = f"No course material has been ingested for Week {week} of this offering yet."
     else:

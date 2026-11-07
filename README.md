@@ -18,7 +18,7 @@ The intended caller is the Next.js backend, not a browser client.
 - App logs route to stdout, appearing as `[info]` in Railway instead of
   `[error]`. `httpx` INFO logging is suppressed to prevent signed URL leakage.
 - Railway trial expires early December 2026: plan an upgrade or migration.
-- Phase 3.5b adds text attachments to Stewart retrieval. Screenshots, history, and practice mode remain out of scope.
+- Phase 3.5c adds image attachments to Stewart retrieval alongside the Phase 3.5b text attachments.
 - The known skipped concurrency test remains skipped.
 - The deployed URL is staging-only; production deploy is a separate decision.
 
@@ -373,7 +373,16 @@ and a body such as `{"question":"Explain recursion","course_offering_id":"offeri
 Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
 Optionally include `attachment_ids`, an array of up to eight IDs from
 `POST /attachments`. PDF, DOCX, PPTX, TXT, and MD attachments are supported.
-An image, missing or expired ID, or extraction failure returns 422 for the entire request.
+A missing or expired ID or an extraction failure returns 422 for the entire request.
+
+Image attachments support `image/png`, `image/jpeg`, and `image/webp` and can be mixed
+with text files. The cap is 4 MiB per image and eight total attachments, with no
+aggregate image byte cap. Each image appears after the text attachment sources, in
+request order, with `source_type="attachment"`, `document_id=null`, `attachment_id`,
+`filename`, and `chunk_preview="[image: filename]"`. A vision rejection returns a
+sanitized 422 for the entire request.
+
+Per-model inline limits can be lower than the API-wide limit. Smoke-test a real 4 MiB image on the deployed model (`gemini-3.5-flash-lite` or higher).
 
 The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
 `chunk_preview`, the first 200 content characters), and `retrieval_info`
@@ -382,8 +391,10 @@ With attachment IDs, sources also include `source_type` (`course_material` or
 `attachment`), `attachment_id`, and `filename`. Attachment sources have a null
 `document_id`. The retrieval info adds `attachment_chunks_available` (all chunks
 before the cap) and `attachment_chunks_above_threshold` (capped chunks meeting
-the threshold before the top-eight cutoff). An omitted or empty `attachment_ids`
-array preserves the course-only JSON shape.
+the threshold before the top-eight cutoff). These counters cover text attachments.
+`attachment_images_count` reports how many images were sent to Gemini and is zero
+for requests with only text attachments. An omitted or empty `attachment_ids` array
+preserves the course-only JSON shape.
 
 The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
 768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,
@@ -394,7 +405,7 @@ nonempty file. The same question embedding retrieves up to eight attachment
 chunks at the same threshold. Attachment chunks stay in memory for the request.
 Gemini uses the first discovered model and temperature 0.3, with separate course
 material and attached-file context when both have qualifying chunks.
-Generation failures or empty output return a graceful fallback answer; embedding
+Other generation failures or empty output return a fallback answer. Embedding
 failures return sanitized 503. Database failures and Developer mode return 503.
 Missing or wrong Bearer credentials return 401 when the shared secret is configured.
 
@@ -405,7 +416,8 @@ and clear its state. Ingestion and workers still require ready status.
 No callback secret or allowlist is required by retrieval. Callers handle rate
 limiting.
 
-Short-circuit branches return HTTP 200 with `sources: []` and skip LLM generation:
+With no images, these short-circuit branches return HTTP 200 with `sources: []`
+and skip LLM generation:
 
 - No attachment IDs and no material (`chunks_available == 0`): exact canned answer is
   `No course material has been ingested for Week {week} of this offering yet.`

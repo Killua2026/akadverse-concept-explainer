@@ -12,6 +12,8 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from google.genai import errors, types
+from PIL import Image
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -304,6 +306,20 @@ async def upload(app, filename, content, mime_type):
     return response.json()["attachment_id"]
 
 
+@pytest.fixture
+def image_file(tmp_path):
+    async def make(filename):
+        def save_and_read():
+            path = tmp_path / filename
+            with Image.new("RGB", (2, 2), "blue") as image:
+                image.save(path)
+            return path.read_bytes(), Image.MIME[Image.EXTENSION[path.suffix]]
+
+        return await asyncio.to_thread(save_and_read)
+
+    return make
+
+
 @pytest.mark.anyio
 async def test_explain_with_one_text_attachment(configured, attachment_api):
     pdf = Path(__file__).parent / "fixtures" / "sample.pdf"
@@ -349,16 +365,140 @@ async def test_explain_with_attachment_answers_when_material_does_not(configured
 
 
 @pytest.mark.anyio
-async def test_explain_rejects_image_attachment(configured, attachment_api):
+async def test_explain_with_image_attachment_succeeds(configured, attachment_api, image_file):
+    async with attachment_api(course_vector=[1]):
+        identifier = await upload(configured.app, "image.png", *(await image_file("image.png")))
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    course_source, image_source = response.json()["sources"]
+    assert course_source["source_type"] == "course_material"
+    assert image_source == {
+        "document_id": None, "title": "image.png", "material_type": "ATTACHMENT",
+        "chunk_preview": "[image: image.png]", "source_type": "attachment",
+        "attachment_id": identifier, "filename": "image.png",
+    }
+
+
+@pytest.mark.anyio
+async def test_explain_image_only_request_succeeds(configured, attachment_api, image_file):
     async with attachment_api():
-        identifier = await upload(configured.app, "image.png", b"\x89PNG\r\n\x1a\n", "image/png")
-        response = await post(configured.app, attachment_ids=[identifier, str(uuid4())])
+        identifier = await upload(configured.app, "image.png", *(await image_file("image.png")))
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "A grounded answer."
+    assert body["retrieval_info"]["chunks_available"] == 0
+    assert body["retrieval_info"]["attachment_chunks_available"] == 0
+    source, = body["sources"]
+    assert source["attachment_id"] == identifier
+    assert source["chunk_preview"] == "[image: image.png]"
+    configured.embed.assert_awaited_once_with(["Explain the topic"], configured.settings)
+
+
+@pytest.mark.anyio
+async def test_explain_mixed_text_and_image_request(configured, attachment_api, image_file):
+    async with attachment_api():
+        text_id = await upload(configured.app, "z-notes.txt", b"Useful notes", "text/plain")
+        image_id = await upload(configured.app, "diagram.webp", *(await image_file("diagram.webp")))
+        second_text_id = await upload(configured.app, "a-notes.txt", b"More notes", "text/plain")
+        response = await post(configured.app, attachment_ids=[text_id, image_id, second_text_id])
+    assert response.status_code == 200
+    body = response.json()
+    assert [source["attachment_id"] for source in body["sources"]] == [text_id, second_text_id, image_id]
+    assert [source["chunk_preview"] for source in body["sources"]] == [
+        "Useful notes", "More notes", "[image: diagram.webp]",
+    ]
+    assert body["retrieval_info"]["attachment_chunks_available"] == 2
+    assert body["retrieval_info"]["attachment_images_count"] == 1
+
+
+@pytest.mark.anyio
+async def test_explain_multiple_images(configured, attachment_api, image_file):
+    filenames = ["z-figure.webp", "m-chart.jpg", "a-diagram.png"]
+    async with attachment_api():
+        identifiers = [await upload(configured.app, name, *(await image_file(name))) for name in filenames]
+        response = await post(configured.app, attachment_ids=identifiers)
+    assert response.status_code == 200
+    body = response.json()
+    assert [source["attachment_id"] for source in body["sources"]] == identifiers
+    assert [source["chunk_preview"] for source in body["sources"]] == [f"[image: {name}]" for name in filenames]
+    assert body["retrieval_info"]["attachment_images_count"] == 3
+
+
+@pytest.mark.anyio
+async def test_explain_image_passed_to_gemini_as_multimodal_part(configured, attachment_api, image_file, monkeypatch):
+    content, mime_type = await image_file("diagram.jpg")
+    from_bytes = Mock(wraps=types.Part.from_bytes)
+    monkeypatch.setattr(types.Part, "from_bytes", from_bytes)
+    async with attachment_api():
+        identifier = await upload(configured.app, "diagram.jpg", content, mime_type)
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    contents = configured.generate.await_args.kwargs["contents"]
+    assert isinstance(contents, list)
+    prompt, part = contents
+    assert isinstance(prompt, str)
+    assert "Explain the topic" in prompt
+    assert "diagram.jpg" in prompt
+    assert "Attached images" in prompt
+    assert isinstance(part, types.Part)
+    assert part.inline_data.mime_type == "image/jpeg"
+    assert part.inline_data.data == content
+    from_bytes.assert_called_once_with(data=content, mime_type=mime_type)
+
+
+@pytest.mark.anyio
+async def test_explain_image_prompt_includes_filenames(configured, attachment_api, image_file):
+    filenames = ["diagram.png", "chart.webp"]
+    async with attachment_api():
+        identifiers = [await upload(configured.app, name, *(await image_file(name))) for name in filenames]
+        response = await post(configured.app, attachment_ids=identifiers)
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"][0]
+    assert "Attached images (2): diagram.png, chart.webp" in prompt
+    assert "cite the filename" in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_gemini_vision_failure_returns_422(configured, attachment_api, image_file, caplog):
+    private_message = "Gemini rejected the image: private image metadata"
+    configured.generate.side_effect = errors.ClientError(400, {"error": {"message": private_message}})
+    async with attachment_api():
+        first = await upload(configured.app, "first.png", *(await image_file("first.png")))
+        second = await upload(configured.app, "second.png", *(await image_file("second.png")))
+        response = await post(configured.app, attachment_ids=[first, second])
     assert response.status_code == 422
     assert response.json() == {
-        "detail": f"Image attachments not supported in Phase 3.5b. Attachment {identifier} "
-                  "has mime_type image/png. Image support arrives in Phase 3.5c."
+        "detail": f"Image processing failed. Attachment {first} could not be read by the vision model.",
     }
-    configured.embed.assert_not_awaited()
+    assert f"attachment_id={first} error_type=ClientError" in caplog.text
+    assert private_message not in caplog.text
+    configured.generate.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_explain_text_only_request_prompt_omits_image_block(configured, attachment_api):
+    async with attachment_api():
+        identifier = await upload(configured.app, "notes.txt", b"Useful notes", "text/plain")
+        response = await post(configured.app, attachment_ids=[identifier])
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert isinstance(prompt, str)
+    assert "Attached images" not in prompt
+    assert "Useful notes\n\nStudent's question:" in prompt
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("image_count", [0, 1, 3])
+async def test_explain_image_count_in_retrieval_info(configured, attachment_api, image_file, image_count):
+    async with attachment_api():
+        identifiers = [await upload(configured.app, "notes.txt", b"Useful notes", "text/plain")]
+        for index in range(image_count):
+            filename = f"image-{index}.png"
+            identifiers.append(await upload(configured.app, filename, *(await image_file(filename))))
+        response = await post(configured.app, attachment_ids=identifiers)
+    assert response.status_code == 200
+    assert response.json()["retrieval_info"]["attachment_images_count"] == image_count
 
 
 @pytest.mark.anyio
@@ -392,7 +532,7 @@ async def test_explain_rejects_more_than_eight_attachments(configured):
 
 
 @pytest.mark.anyio
-async def test_explain_rejects_extraction_failure(configured, attachment_api, monkeypatch):
+async def test_explain_rejects_extraction_failure(configured, attachment_api, image_file, monkeypatch):
     paths = []
     extract_text = retrieval.extract_text
 
@@ -403,7 +543,7 @@ async def test_explain_rejects_extraction_failure(configured, attachment_api, mo
     monkeypatch.setattr(retrieval, "extract_text", record_path)
     async with attachment_api():
         identifier = await upload(configured.app, "broken.pdf", b"%PDF-1.7\ncorrupt", "application/pdf")
-        image = await upload(configured.app, "image.png", b"\x89PNG\r\n\x1a\n", "image/png")
+        image = await upload(configured.app, "image.png", *(await image_file("image.png")))
         response = await post(configured.app, attachment_ids=[identifier, image])
     assert response.status_code == 422
     assert response.json() == {"detail": f"Attachment {identifier}: Unable to extract text from PDF"}

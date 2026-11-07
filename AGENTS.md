@@ -16,7 +16,8 @@ Two concerns live in this service:
    and delete document chunks and jobs. Phases 2a through 2e are implemented;
    one concurrency test is intentionally skipped pending investigation.
 2. **Retrieval**: synchronous `/explain` retrieves course material by offering
-   and JSONB weeks membership and answers student questions. Phase 3 only.
+  and JSONB weeks membership and answers student questions using course material
+  and optional attachments.
 
 The source of truth for the ingestion contract is the FSE's document at
 `docs/elearning/systems/ai-ingestion-contract.md` in the Next.js repo. This
@@ -60,8 +61,8 @@ lecture documents. Callbacks are landing on the FSE's side (HTTP 200).
 (similarity floor 0.4) and K=8. It embeds the question through
 `services.embedding.embed_chunks` so ingestion and retrieval embeddings stay
 configuration-identical. LLM answers are grounded-only and use
-`EXPLAIN_PROMPT_TEMPLATE` with the Stewart persona. Phase 3.5b adds text
-attachments as described below. Rate limiting is caller-owned.
+`EXPLAIN_PROMPT_TEMPLATE` with the Stewart persona. Phase 3.5 adds text and
+image attachments as described below. Rate limiting is caller-owned.
 
 - `/explain` uses `require_shared_secret_auth` and the inbound API key only.
 - Database initialization checks DATABASE_URL, probes up to three times with
@@ -76,10 +77,12 @@ attachments as described below. Rate limiting is caller-owned.
   sqlalchemy text directly to support isolated test schemas.
 - Retrieve by offering and weeks containment, cosine distance at most 0.6,
   similarity threshold 0.4, and top eight chunks. Return counts and source previews
-  capped at 200 characters. Empty or unrelated material avoids the LLM call.
-- Generation uses the first discovered model at temperature 0.3 and returns a
-  safe fallback for provider failures, missing candidates, or empty text.
-- Screenshots, conversation history, and practice mode remain deferred.
+  capped at 200 characters. Empty or unrelated material avoids the LLM call
+  when the request has no images.
+- Generation uses the first discovered model at temperature 0.3. See the image
+  attachments section for vision rejections. Other provider failures, missing
+  candidates, and empty text use the safe fallback.
+- Conversation history and practice mode remain deferred.
 
 ### Phase 3 verification (5 November 2026)
 
@@ -676,7 +679,8 @@ does. Container deployments require `0.0.0.0` because the platform's proxy
 cannot reach `127.0.0.1` inside the container.
 
 - **Framework:** pytest + `httpx.AsyncClient` via `httpx.ASGITransport`
-- **Command:** `uv run pytest tests/ -q --tb=short --timeout=30`
+- **Command:** `uv run pytest tests/ -q --tb=short --timeout=120`
+  Database-backed tests can run 20-45 seconds each due to Supabase connection latency. Do not lower the timeout below 120 seconds; the value is a hang-detection safety net, not a performance target.
 - **Async provider tests:** AnyIO with the asyncio backend; database acceptance uses `asyncio.run()`.
 - **Provider mocks:** synchronous SDK discovery, client constructors, async generation, and grounding provider routing. The database acceptance test is real; legacy LangChain wrapper tests were removed with their implementation.
 - **Grounding auth coverage:** missing/wrong auth returns 401 with ingestion ready or disabled; valid shared-secret auth proceeds to mocked Gemini generation without database/callback settings, including disabled ingestion states. Missing shared-secret configuration returns 503. Provider startup tests mock ingestion configuration to keep database/worker lifecycle coverage in dedicated tests.
@@ -763,7 +767,7 @@ Before starting any work session:
 1. Read this file top to bottom. The current phase and the sub-phase scope
    sections tell you what NOT to build
 2. Run `git log --oneline -5` to see which sub-phase was last merged
-3. Run `uv run pytest tests/ -q --tb=short --timeout=30` to confirm the baseline is green
+3. Run `uv run pytest tests/ -q --tb=short --timeout=120` to confirm the baseline is green
 4. State what you are about to do in one sentence, then ask for confirmation
    if the task is ambiguous
 
@@ -870,7 +874,7 @@ The route-surface test includes the two new attachment paths. No deployment
 or commit was performed as part of this implementation.
 
 Phase 3.5b accepts up to eight PDF, DOCX, PPTX, TXT, or MD attachment IDs per
-`/explain` request. Image attachments return 422. Attachment chunks are extracted,
+`/explain` request. Text attachment chunks are extracted,
 chunked, embedded, and scored in request memory and are never persisted to
 `concept_explainer.chunks`. The same question embedding ranks up to eight course
 chunks and eight attachment chunks at similarity 0.4 or higher. The attachment
@@ -884,6 +888,25 @@ When the 100-chunk total cap is active, each attachment contributes only its fir
 The 100-chunk cap's decrement step (used when floor-1 minimum allocations push the total above 100) reduces the eligible attachment with the smallest `alloc - share` value, preserving the floor-1 rule and concentrating reductions on the largest allocations. On ties it prefers the later-attached file, which continues to bear the reduction while eligible. This is a deliberate trade-off: decrementing a one-chunk allocation would violate the floor-1 rule. Overshoot requires a mix of larger and tiny files, so equal-sized attachments alone do not trigger it.
 
 Latency budget for /explain: requests without attachments typically complete in 10-20 seconds (course material retrieval + LLM generation). Requests with attachments add the embedding cost of the attached chunks: a small attachment (10-20 chunks) adds ~10-15 seconds; a request hitting the 100-chunk cap adds ~80 seconds of inter-batch sleeps plus embedding compute, for a worst case of roughly 2 minutes end-to-end. Frontend clients must set a request timeout of at least 150 seconds to accommodate the worst case. Callers needing faster responses for large attachments should use smaller attachments, or wait for the asynchronous /explain variant planned for Phase 4.
+
+### Image attachments (Phase 3.5c)
+
+`/explain` accepts PNG, JPEG, and WebP images alongside text attachments. The
+upload limit is 4 MiB per image. All attachments share the eight-ID limit, with
+no aggregate image byte cap. Metadata validation runs in request order before
+byte fetches. Each partition preserves its relative request order.
+
+Image bytes go directly into `types.Part.from_bytes(data=content, mime_type=mime_type)`
+without extraction or embedding. Generation receives `contents=[prompt_text, *image_parts]`
+when images are present and `contents=prompt_text` otherwise. Images allow generation
+even when no text chunks qualify. `attachment_images_count` counts the images sent to
+Gemini and defaults to zero. Attachment chunk counts cover text only. Image sources
+follow text attachment sources in request order with `chunk_preview="[image: {filename}]"`.
+
+Vision rejections return 422 with `Image processing failed. Attachment {attachment_id} could not be read by the vision model.`
+The warning records only the attachment ID and error type. Vision failures have no
+retry or fallback. The SDK does not always identify the failed image, so use the first
+image in request order when it supplies no usable attachment ID.
 
 ### Attachment trust boundary
 

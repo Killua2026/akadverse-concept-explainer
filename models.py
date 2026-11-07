@@ -76,6 +76,7 @@ class RetrievalInfo(BaseModel):
     similarity_threshold: float
     attachment_chunks_available: int = 0
     attachment_chunks_above_threshold: int = 0
+    attachment_images_count: int = 0
 
 
 class ExplainResponse(BaseModel):
