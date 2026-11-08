@@ -371,6 +371,14 @@ Response:
 `POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
 and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
 Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.
+An optional nonempty `session_id` enables conversation context and persistence.
+Stewart sees up to 10 prior messages for the session, and the service saves
+the current question and answer, including canned retrieval responses. The
+service sweeps chat messages older than 105 days at startup and hourly.
+Apply migration 004 before starting this version. An omitted or empty
+`session_id` skips history. The FSE backend must scope session IDs to the
+authorized student.
+
 Optionally include `attachment_ids`, an array of up to eight IDs from
 `POST /attachments`. PDF, DOCX, PPTX, TXT, and MD attachments are supported.
 A missing or expired ID or an extraction failure returns 422 for the entire request.
@@ -393,8 +401,17 @@ With attachment IDs, sources also include `source_type` (`course_material` or
 before the cap) and `attachment_chunks_above_threshold` (capped chunks meeting
 the threshold before the top-eight cutoff). These counters cover text attachments.
 `attachment_images_count` reports how many images were sent to Gemini and is zero
-for requests with only text attachments. An omitted or empty `attachment_ids` array
-preserves the course-only JSON shape.
+for requests with only text attachments. Course sources keep their existing
+shape when `attachment_ids` is omitted or empty.
+
+Stewart starts directly with the answer and only greets in response to a
+greeting with no academic content. When Gemini is called and the student
+requests a worked example, Stewart uses a suitable source example if available.
+Otherwise it can generate one with `[AI-GENERATED EXAMPLE]` on its own line.
+The marker stays in the answer, and the response adds one source with
+`source_type="ai_generated"` and `material_type="AI_GENERATED"`. Its preview
+includes the first marker followed by up to 200 characters of the following
+text with whitespace normalized.
 
 The question uses the ingestion embedding pipeline: gemini-embedding-2, global,
 768 dimensions, no retries. Retrieval filters offering ID and JSONB weeks membership,

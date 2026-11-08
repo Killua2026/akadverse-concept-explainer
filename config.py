@@ -41,6 +41,8 @@ WORKER_COUNT_DEFAULT = 1
 STUCK_JOB_MINUTES = 5
 ATTACHMENT_TTL_HOURS = 6
 ATTACHMENT_MAX_SIZE_BYTES = 4 * 1024 * 1024
+CHAT_HISTORY_TTL_DAYS = 105
+CHAT_HISTORY_FETCH_LIMIT = 10
 ATTACHMENT_ALLOWED_MIME_TYPES = frozenset({
     "application/pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

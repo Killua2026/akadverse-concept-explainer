@@ -58,6 +58,15 @@ class ExplainRequest(BaseModel):
     course_offering_id: str = Field(..., min_length=1)
     week: int = Field(..., ge=1)
     attachment_ids: list[str] = Field(default_factory=list)
+    session_id: str = ""
+
+
+class ChatMessage(BaseModel):
+    session_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    sources_json: list | None = None
+    created_at: datetime
 
 
 class ExplainSource(BaseModel):
@@ -65,7 +74,7 @@ class ExplainSource(BaseModel):
     title: str
     material_type: str
     chunk_preview: str
-    source_type: Literal["course_material", "attachment"] = "course_material"
+    source_type: Literal["course_material", "attachment", "ai_generated"] = "course_material"
     attachment_id: str | None = None
     filename: str | None = None
 

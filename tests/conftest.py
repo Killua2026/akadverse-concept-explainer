@@ -42,7 +42,10 @@ def storage_session():
         schema = f"concept_explainer_test_{uuid4().hex}"
         migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
         migrations = []
-        for name in ("001_pgvector_storage.sql", "002_jobs_table.sql", "003_attachments_table.sql"):
+        for name in (
+            "001_pgvector_storage.sql", "002_jobs_table.sql", "003_attachments_table.sql",
+            "004_chat_messages_table.sql",
+        ):
             migrations.append(await asyncio.to_thread(
                 (migrations_dir / name).read_text, encoding="utf-8"
             ))
@@ -86,10 +89,12 @@ def worker_database(storage_session, monkeypatch):
         from types import SimpleNamespace
         from sqlalchemy import text
         from sqlalchemy.ext.asyncio import async_sessionmaker
+        from services import chat_history
         from workers import ingestion
 
         async with storage_session() as (session, schema):
             monkeypatch.setattr(ingestion, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
+            monkeypatch.setattr(chat_history, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
             yield SimpleNamespace(sessions=async_sessionmaker(
                 session.bind, expire_on_commit=False,
                 join_transaction_mode="create_savepoint",

@@ -44,8 +44,8 @@ Status:
 - [x] Phase 3: POST /explain retrieval endpoint (verified on Railway with PDF and PPTX)
 - [x] Phase 3.5a: Attachment subsystem (upload/get/delete, Postgres BYTEA storage, 6-hour expiry, ownership by API key)
 - [x] Phase 3.5b: /explain accepts text attachments (PDF, DOCX, PPTX, TXT, MD) and merges retrieval with course material
-- [ ] Phase 3.5c: /explain handles image attachments (PNG, JPG, WebP) via Gemini vision
-- [ ] Phase 4a: Conversation history storage for Stewart (multi-turn context)
+- [x] Phase 3.5c: /explain handles image attachments (PNG, JPG, WebP) via Gemini vision
+- [x] Phase 4a: Conversation history, direct answers, and labeled worked examples
 - [ ] Phase 4b: Streaming responses for /explain
 - [ ] Phase 4c: Durable callback outbox (deferred until an observed delivery problem)
 - [ ] Phase 4d: Investigation and restoration of skipped test_multiple_workers_no_collision
@@ -82,7 +82,6 @@ image attachments as described below. Rate limiting is caller-owned.
 - Generation uses the first discovered model at temperature 0.3. See the image
   attachments section for vision rejections. Other provider failures, missing
   candidates, and empty text use the safe fallback.
-- Conversation history and practice mode remain deferred.
 
 ### Phase 3 verification (5 November 2026)
 
@@ -95,6 +94,28 @@ The real-database callback-configuration independence acceptance test passed.
 Route inspection confirmed six application paths including `/explain`, and
 retrieval imports passed. Phase 3 is now committed and deployed; see Deployment
 status for the subsequent Railway smoke-test verification.
+
+## Current implementation: Phase 4a
+
+### Conversation history and worked examples
+
+- An optional `session_id` on `POST /explain` enables conversation context.
+  Retrieval reads up to 10 prior messages for the session in chronological
+  order and includes at most 2000 characters per message in the prompt.
+  An empty ID skips history and emits a warning. The FSE backend owns student
+  authorization and must supply only session IDs belonging to that student.
+- The route saves the question and answer together after building the final
+  response, including when retrieval returns a canned answer. The assistant's
+  sources are stored as a JSONB array. Apply migration 004 before deploying.
+  Startup and hourly sweeps delete individual messages older than 105 days.
+- Stewart begins with the answer. A greeting-only message can receive a
+  brief greeting.
+- When generation runs and a requested worked example has no suitable source
+  example, Stewart can create one and marks it with `[AI-GENERATED EXAMPLE]`
+  on its own line. The marker remains in the answer. Multiple markers yield
+  one `source_type="ai_generated"` entry per request, using the first marker.
+- `GET /sessions/{id}/history` is deferred. If the FSE needs to restore chat
+  history after a page reload, that endpoint can be added in a follow-up.
 
 `GET /documents/{document_id}/status` provides read-only reconciliation for
 missed callbacks. It uses the same auth as `/ingest` and DELETE
@@ -790,7 +811,7 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Phase 3.5a is the next sub-phase: attachment subsystem. The FSE has requested Stewart's document and screenshot attachments and the frontend is already built. Chat history (4a) follows and will reuse the attachment IDs from 3.5a. Streaming, outbox, and the skipped-test investigation are deferred until a driver appears.
+Streaming, outbox, and the skipped-test investigation are deferred until a driver appears.
 
 ## Deployment status
 

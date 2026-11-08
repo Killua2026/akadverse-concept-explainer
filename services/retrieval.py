@@ -15,6 +15,7 @@ from config import GeminiSettings
 from db import Database
 from models import ExplainResponse, ExplainSource, RetrievalInfo
 from services.attachments import get_attachment_bytes, get_attachment_metadata
+from services.chat_history import fetch_recent_messages
 from services.chunking import chunk_text
 from services.embedding import embed_chunks
 from services.extractors import ExtractionError, extract_text
@@ -39,8 +40,37 @@ Rules:
 4. When multiple excerpts support the answer, synthesise them.
 5. If the excerpts are only partially relevant, answer what you can and explicitly say what is not covered.
 6. Aim for 100-400 words unless the question demands more.
+
+Do not introduce yourself or greet the student. Begin directly
+with the answer to their question. Only greet if the student's
+message is itself a greeting with no academic content (e.g.
+"hi", "hello", "good morning"). In that case, respond with a
+brief greeting only.
+
+Worked problems and examples:
+
+The following is an exception to the excerpts-only rules for worked
+examples. If the student asks for an explanation with a worked example,
+a practice problem, or a demonstration:
+1. First check the course material excerpts and attached files
+   for a suitable example.
+2. If a suitable source example exists, use it and cite the
+   source.
+3. If no suitable example exists in the material, you MAY
+   generate one.
+4. Any example or problem you generate MUST begin with the
+   literal marker [AI-GENERATED EXAMPLE] on its own line,
+   followed by the example content.
+5. Do not attribute a generated example to the lecturer's
+   material. Never claim a generated example came from the
+   course notes.
+6. If the student explicitly asked for an example and the
+   material contains none, do not refuse - generate one with
+   the marker.
 """
-MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE = EXPLAIN_PROMPT_TEMPLATE.replace("{context}", "{context}{image_block}", 1)
+MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE = EXPLAIN_PROMPT_TEMPLATE.replace(
+    "{context}", "{context}{image_block}", 1,
+).replace("Student's question:", "{history_section}Student's question:", 1)
 IMAGE_BLOCK_TEMPLATE = """\n\nAttached images ({count}): {filenames}
 
 The attached images are provided as multimodal input. The excerpts-only rules
@@ -222,7 +252,7 @@ async def _generate_answer(
     question: str, chunks: list, settings: GeminiSettings,
     attachment_chunks: list[tuple[str, str, str]] | None = None,
     images: list[tuple[str, str, bytes, str]] | None = None,
-    *, retrieval_info: RetrievalInfo | None = None,
+    *, retrieval_info: RetrievalInfo | None = None, history_block: str = "",
 ) -> str:
     context = "\n\n".join(
         f"--- Source: {chunk['metadata']['title']} ---\n{chunk['content']}" for chunk in chunks
@@ -242,8 +272,9 @@ async def _generate_answer(
         image_block = IMAGE_BLOCK_TEMPLATE.format(
             count=len(images), filenames=", ".join(filename for _, filename, _, _ in images),
         )
+    history_section = f"Conversation so far:\n{history_block}" if history_block else ""
     prompt_text = MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE.format(
-        context=context, image_block=image_block, question=question,
+        context=context, image_block=image_block, question=question, history_section=history_section,
     )
     try:
         client = create_client(settings)
@@ -281,7 +312,17 @@ async def _generate_answer(
 
 async def explain(*, question: str, course_offering_id: str, week: int,
                   settings: GeminiSettings, database: Database,
-                  attachment_ids: list[str] = []) -> ExplainResponse:
+                  attachment_ids: list[str] = [], session_id: str = "") -> ExplainResponse:
+    history_block = ""
+    if session_id:
+        messages = await fetch_recent_messages(database, session_id)
+        history_block = "".join(
+            f"{message.role.capitalize()}: {message.content[:2000]}"
+            + ("\n" if message.role == "user" else "\n\n")
+            for message in messages
+        )
+    else:
+        logger.warning("chat_history.skipped reason=missing_session_id")
     text_attachments, images = await _load_attachments(database, attachment_ids) if attachment_ids else ([], [])
     vector = await _embed_question(question, settings)
     available, above_threshold, chunks = await _query_chunks(database, vector, course_offering_id, week)
@@ -312,7 +353,10 @@ async def explain(*, question: str, course_offering_id: str, week: int,
             for attachment_id, filename, _, _ in images
         )
     if above_threshold or attachment_chunks or images:
-        answer = await _generate_answer(question, chunks, settings, attachment_chunks, images, retrieval_info=info)
+        answer = await _generate_answer(
+            question, chunks, settings, attachment_chunks, images,
+            retrieval_info=info, history_block=history_block,
+        )
     elif not attachment_ids and available == 0:
         answer = f"No course material has been ingested for Week {week} of this offering yet."
     else:
