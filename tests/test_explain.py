@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from config import GeminiSettings
 from routes.attachments import make_attachments_router
 from routes.explain import make_explain_router
-from services import attachments, retrieval
+from services import attachments, chat_history, retrieval
 
 
 @pytest.fixture
@@ -54,6 +55,7 @@ def seeded(storage_session, monkeypatch, configured):
     async def seed(rows=None):
         async with storage_session() as (session, schema):
             monkeypatch.setattr(retrieval, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
+            monkeypatch.setattr(chat_history, "text", lambda sql: text(sql.replace("concept_explainer", schema)))
 
             @asynccontextmanager
             async def connection():
@@ -86,10 +88,12 @@ def seeded(storage_session, monkeypatch, configured):
 
 
 async def post(app, *, question="Explain the topic", week=1, offering="offering", token="test-secret",
-               attachment_ids=None):
+               attachment_ids=None, session_id=None):
     body = {"question": question, "week": week, "course_offering_id": offering}
     if attachment_ids is not None:
         body["attachment_ids"] = attachment_ids
+    if session_id is not None:
+        body["session_id"] = session_id
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         return await client.post("/explain", json=body,
                                  headers={"Authorization": f"Bearer {token}"} if token else {})
@@ -296,6 +300,229 @@ def attachment_api(configured, worker_database, monkeypatch):
             configured.embed.side_effect = lambda chunks, settings: [[1.0] + [0.0] * 767 for _ in chunks]
             yield database, schema
     return setup
+
+
+@pytest.mark.anyio
+async def test_explain_persists_user_and_assistant_messages(configured, attachment_api):
+    marker = "[AI-GENERATED EXAMPLE]"
+    configured.generate.return_value.text = f"{marker}\nWork through this example."
+    async with attachment_api([1.0]) as (database, schema):
+        response = await post(configured.app, session_id="test-session-1")
+        assert response.status_code == 200
+        async with database.sessions() as session:
+            rows = (await session.execute(text(f"""
+                SELECT role, content, sources_json, jsonb_typeof(sources_json) AS sources_type
+                FROM {schema}.chat_messages
+                WHERE session_id = 'test-session-1'
+                ORDER BY created_at, id
+            """))).mappings().all()
+        messages = await chat_history.fetch_recent_messages(database, "test-session-1")
+    assert len(rows) == 2
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert [row["content"] for row in rows] == ["Explain the topic", response.json()["answer"]]
+    assert rows[0]["sources_json"] is None
+    assert rows[0]["sources_type"] is None
+    assert rows[1]["sources_type"] == "array"
+    assert rows[1]["sources_json"] == [
+        {"source_type": "course_material", "attachment_id": None, "filename": None,
+         **response.json()["sources"][0]},
+        response.json()["sources"][1],
+    ]
+    assert messages[1].sources_json == rows[1]["sources_json"]
+    assert messages[0].created_at < messages[1].created_at
+
+
+@pytest.mark.anyio
+async def test_explain_fetches_history_for_followup(configured, attachment_api):
+    async with attachment_api([1.0]) as (database, _):
+        for role, content in [
+            ("user", "What is recursion?"), ("assistant", "A function calls itself."),
+            ("user", "What stops it?"), ("assistant", "A base case."),
+        ]:
+            await chat_history.persist_message(database, "followup", role, content)
+        await chat_history.persist_message(database, "other", "user", "Unrelated session")
+        response = await post(configured.app, question="Why does it matter?", session_id="followup")
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert (
+        "Conversation so far:\nUser: What is recursion?\nAssistant: A function calls itself.\n\n"
+        "User: What stops it?\nAssistant: A base case.\n\n"
+    ) in prompt
+    assert "Student's question: Why does it matter?" in prompt
+    assert prompt.index("Conversation so far:") < prompt.index("Student's question:")
+    assert "User: Why does it matter?" not in prompt
+    assert "Unrelated session" not in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_empty_session_id_skips_history(configured, attachment_api, caplog):
+    async with attachment_api([1.0]) as (database, schema):
+        response = await post(configured.app, session_id="")
+        async with database.sessions() as session:
+            assert await session.scalar(text(f"SELECT count(*) FROM {schema}.chat_messages")) == 0
+    assert response.status_code == 200
+    assert "Conversation so far:" not in configured.generate.await_args.kwargs["contents"]
+    assert any(
+        record.levelname == "WARNING"
+        and record.getMessage() == "chat_history.skipped reason=missing_session_id"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.anyio
+async def test_explain_history_fetches_last_10_only(configured, attachment_api):
+    async with attachment_api([1.0]) as (database, _):
+        async with database.sessions.begin() as session:
+            for index in range(15):
+                await chat_history.persist_message(
+                    database, "long", "user", f"Prior turn [{index}]", session=session,
+                )
+        response = await post(configured.app, session_id="long")
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert all(f"Prior turn [{index}]" not in prompt for index in range(5))
+    expected = "".join(f"User: Prior turn [{index}]\n" for index in range(5, 15))
+    assert f"Conversation so far:\n{expected}" in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_history_format(configured, attachment_api):
+    long_message = "x" * 2000
+    async with attachment_api([1.0]) as (database, _):
+        await chat_history.persist_message(database, "format", "user", long_message + "Truncated")
+        await chat_history.persist_message(database, "format", "assistant", "Two lines\nwith braces {here}.")
+        response = await post(configured.app, session_id="format")
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert f"User: {long_message}\nAssistant: Two lines\nwith braces {{here}}.\n\n" in prompt
+    assert "Truncated" not in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_short_circuit_persists_messages(configured, attachment_api):
+    async with attachment_api([0.0, 1.0]) as (database, _):
+        for week, session_id, answer in [
+            (2, "empty", "No course material has been ingested for Week 2 of this offering yet."),
+            (1, "irrelevant", "The course material for Week 1 does not cover this question."),
+        ]:
+            response = await post(configured.app, week=week, session_id=session_id)
+            assert response.status_code == 200
+            assert response.json()["answer"] == answer
+            messages = await chat_history.fetch_recent_messages(database, session_id)
+            assert [(message.role, message.content, message.sources_json) for message in messages] == [
+                ("user", "Explain the topic", None), ("assistant", answer, []),
+            ]
+    configured.generate.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_explain_no_greeting_in_prompt(configured, attachment_api):
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert "Do not introduce yourself or greet the student." in prompt
+    assert "greeting with no academic content" in prompt
+    assert "Hello! I am Stewart" not in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_prompt_includes_ai_generated_instruction(configured, attachment_api):
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    prompt = configured.generate.await_args.kwargs["contents"]
+    assert "Worked problems and examples:" in prompt
+    assert "for a suitable example" in prompt
+    assert "literal marker [AI-GENERATED EXAMPLE] on its own line" in prompt
+    assert "do not refuse - generate one with" in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_detects_ai_generated_example(configured, attachment_api):
+    marker = "[AI-GENERATED EXAMPLE]"
+    configured.generate.return_value.text = f"{marker}\n  Add   two\n numbers. {'x' * 200}"
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    assert response.json()["sources"][-1] == {
+        "source_type": "ai_generated", "document_id": None, "title": "AI-generated example",
+        "material_type": "AI_GENERATED", "chunk_preview": f"{marker} Add two numbers. {'x' * 183}",
+        "attachment_id": None, "filename": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_explain_no_ai_generated_source_when_marker_absent(configured, attachment_api):
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    assert len(response.json()["sources"]) == 1
+    assert all(source.get("source_type") != "ai_generated" for source in response.json()["sources"])
+
+
+@pytest.mark.anyio
+async def test_explain_does_not_strip_marker_from_answer(configured, attachment_api):
+    answer = "Here is a worked example.\n\n[AI-GENERATED EXAMPLE]\nAdd two numbers."
+    configured.generate.return_value.text = answer
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    assert response.json()["answer"] == answer
+
+
+@pytest.mark.anyio
+async def test_explain_multiple_markers_only_one_source(configured, attachment_api):
+    marker = "[AI-GENERATED EXAMPLE]"
+    configured.generate.return_value.text = f"{marker}\nFirst example.\n{marker}\nSecond example."
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    sources = [source for source in response.json()["sources"] if source.get("source_type") == "ai_generated"]
+    assert len(sources) == 1
+    assert sources[0]["chunk_preview"].startswith(f"{marker} First example.")
+
+
+async def insert_chat_message_with_age(database, schema, session_id, days):
+    async with database.sessions.begin() as session:
+        await session.execute(text(f"""
+            INSERT INTO {schema}.chat_messages (session_id, role, content, created_at)
+            VALUES (:session_id, 'user', 'Question', now() - :age)
+        """), {"session_id": session_id, "age": timedelta(days=days)})
+
+
+@pytest.mark.anyio
+async def test_sweep_expired_chat_messages(worker_database):
+    async with worker_database() as (database, schema):
+        await insert_chat_message_with_age(database, schema, "expired", 106)
+        await insert_chat_message_with_age(database, schema, "fresh", 30)
+        assert await chat_history.sweep_expired_chat_messages(database) == 1
+        assert await chat_history.fetch_recent_messages(database, "expired") == []
+        assert len(await chat_history.fetch_recent_messages(database, "fresh")) == 1
+
+
+@pytest.mark.anyio
+async def test_startup_sweep_includes_chat_messages(configured, attachment_api, monkeypatch, caplog):
+    import main
+
+    async with attachment_api() as (database, schema):
+        await insert_chat_message_with_age(database, schema, "expired", 106)
+        database.dispose = AsyncMock()
+
+        async def configure(application):
+            application.state.ingest_database = database
+            application.state.ingest_status = "disabled (missing AI_SERVICE_CALLBACK_SECRET)"
+
+        monkeypatch.setattr(main, "gemini_settings", configured.settings)
+        monkeypatch.setattr(main, "configure_ingestion", configure)
+        caplog.set_level("INFO", logger=main.cleanup_logger.name)
+        async with main.lifespan(configured.app):
+            assert await chat_history.fetch_recent_messages(database, "expired") == []
+            task = configured.app.state.cleanup_sweep_task
+            assert not task.done()
+        assert task.cancelled()
+    assert "attachments.swept count=0" in caplog.text
+    assert "chat_messages.swept count=1" in caplog.text
 
 
 async def upload(app, filename, content, mime_type):

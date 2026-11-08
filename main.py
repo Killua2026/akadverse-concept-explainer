@@ -22,6 +22,7 @@ from routes.ingest import router as ingest_router
 from routes.documents import router as documents_router
 from services.callback import CallbackSettings
 from services.attachments import sweep_expired_attachments
+from services.chat_history import sweep_expired_chat_messages
 from routes.attachments import make_attachments_router
 
 logging.basicConfig(
@@ -32,6 +33,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+cleanup_logger = logger.getChild("cleanup")
 
 _WORKER_TEMP_FILE_PATTERN = re.compile(r"^[0-9a-f]{32}_")
 
@@ -119,13 +121,27 @@ from routes.explain import make_explain_router
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
 
-async def _periodic_attachment_sweep(database):
+async def _run_cleanup_sweeps(database: Database) -> None:
+    for resource, sweep in (
+        ("attachments", sweep_expired_attachments),
+        ("chat_messages", sweep_expired_chat_messages),
+    ):
+        try:
+            count = await sweep(database)
+        except Exception as exc:
+            cleanup_logger.warning("%s.sweep_failed error_type=%s", resource, type(exc).__name__)
+        else:
+            cleanup_logger.info("%s.swept count=%s", resource, count)
+
+
+async def _periodic_cleanup_sweep(database: Database) -> None:
     while True:
         await asyncio.sleep(3600)
-        try:
-            await sweep_expired_attachments(database)
-        except Exception as exc:
-            logger.warning("attachments.sweep_failed error_type=%s", type(exc).__name__)
+        await _run_cleanup_sweeps(database)
+
+
+# Preserve the pre-Phase 4a lifecycle hooks for existing callers.
+_periodic_attachment_sweep = _periodic_cleanup_sweep
 
 
 @asynccontextmanager
@@ -139,6 +155,7 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
     worker_count = get_worker_count()
     application.state.worker_count = worker_count
     application.state.worker_tasks = []
+    application.state.cleanup_sweep_task = None
     callback_client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
     application.state.callback_client = callback_client
     callback_settings = CallbackSettings.from_env()
@@ -162,10 +179,9 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         await configure_ingestion(application)
         database = get_ingestion_database(application)
         if database is not None:
-            swept = await sweep_expired_attachments(database)
-            if swept:
-                logger.info("attachments.swept count=%s", swept)
-            application.state.attachment_sweep_task = asyncio.create_task(_periodic_attachment_sweep(database))
+            await _run_cleanup_sweeps(database)
+            application.state.cleanup_sweep_task = asyncio.create_task(_periodic_cleanup_sweep(database))
+            application.state.attachment_sweep_task = application.state.cleanup_sweep_task
         application.state.worker_status = (
             "disabled (ingest not configured)" if application.state.ingest_status.startswith("disabled (missing ")
             else "stopped (db unavailable)"
@@ -199,10 +215,10 @@ async def lifespan(application: "FastAPI") -> AsyncIterator[None]:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        attachment_sweep_task = getattr(application.state, "attachment_sweep_task", None)
-        if attachment_sweep_task is not None:
-            attachment_sweep_task.cancel()
-            await asyncio.gather(attachment_sweep_task, return_exceptions=True)
+        cleanup_sweep_task = application.state.cleanup_sweep_task
+        if cleanup_sweep_task is not None:
+            cleanup_sweep_task.cancel()
+            await asyncio.gather(cleanup_sweep_task, return_exceptions=True)
         await callback_client.aclose()
         if worker_logging_enabled:
             worker_logger.removeFilter(worker_log_context)

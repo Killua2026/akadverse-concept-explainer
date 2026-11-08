@@ -7,7 +7,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from auth import UNAVAILABLE, require_shared_secret_auth
 from config import GeminiSettings
-from models import ExplainRequest, ExplainResponse
+from models import ExplainRequest, ExplainResponse, ExplainSource
+from services.chat_history import persist_message
 from services.retrieval import AttachmentError, AttachmentStorageError, ImageProcessingError, explain
 
 logger = logging.getLogger(__name__)
@@ -26,10 +27,28 @@ def make_explain_router(settings: GeminiSettings) -> APIRouter:
         if not settings.use_enterprise or database is None:
             raise HTTPException(status_code=503, detail="Course material retrieval is unavailable.")
         try:
-            return await explain(
+            response = await explain(
                 question=body.question, course_offering_id=body.course_offering_id,
                 week=body.week, settings=settings, database=database, attachment_ids=body.attachment_ids,
+                session_id=body.session_id,
             )
+            marker = "[AI-GENERATED EXAMPLE]"
+            _, found, following = response.answer.partition(marker)
+            if found:
+                preview = " ".join(following.split())[:200].rstrip()
+                response.sources.append(ExplainSource(
+                    source_type="ai_generated", document_id=None, title="AI-generated example",
+                    material_type="AI_GENERATED", chunk_preview=f"{marker} {preview}".rstrip(),
+                    attachment_id=None, filename=None,
+                ))
+            if body.session_id:
+                async with database.sessions.begin() as session:
+                    await persist_message(database, body.session_id, "user", body.question, session=session)
+                    await persist_message(
+                        database, body.session_id, "assistant", response.answer,
+                        [source.model_dump() for source in response.sources], session=session,
+                    )
+            return response
         except AttachmentError as error:
             raise HTTPException(422, str(error)) from None
         except ImageProcessingError as error:
