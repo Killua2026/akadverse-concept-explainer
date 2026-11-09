@@ -32,7 +32,9 @@ The intended caller is the Next.js backend, not a browser client.
 | Legacy endpoint retirement and grounding auth | Implemented and committed in Phase 2e |
 | Concurrent job-claim collision test | Retained but skipped; dedicated investigation pending for intermittent teardown hang |
 | Retrieval over ingested pgvector chunks | Implemented: authenticated synchronous `POST /explain` |
-| Stewart chat history | Phase 4; not implemented |
+| Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
+| File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
+| AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
 | ZIP ingestion | Rejected; deferred to a later phase |
 
 `/ingest` writes pgvector chunks. `/explain` retrieves from these chunks.
@@ -48,6 +50,7 @@ not change the committed job status or roll back chunks.
 - [Configuration](#configuration)
 - [Database setup](#database-setup)
 - [API endpoints](#api-endpoints)
+  - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
 - [Extraction and processing](#extraction-and-processing)
 - [Jobs and workers](#jobs-and-workers)
@@ -377,11 +380,22 @@ the current question and answer, including canned retrieval responses. The
 service sweeps chat messages older than 105 days at startup and hourly.
 Apply migration 004 before starting this version. An omitted or empty
 `session_id` skips history. The FSE backend must scope session IDs to the
-authorized student.
+authorized student. The request field defaults to `session_id: str = ""`.
+
+The microservice does not create sessions. There is no `POST /sessions` endpoint.
+The FSE backend generates a UUID (or any stable string) per authorized
+conversation, stores it alongside the conversation record, and sends it on every
+`/explain` call for that conversation. To continue a conversation, send the same
+`session_id`. To start a fresh conversation, send a new one. Stewart loads the
+stored history, so send the current question and the session ID along with the
+usual request fields.
+
+For a student opening Week 3 of CSC424 in the Study Zone, generate one `session_id` per (student, course_offering, week) tuple and reuse it across all questions in that study session.
 
 Optionally include `attachment_ids`, an array of up to eight IDs from
 `POST /attachments`. PDF, DOCX, PPTX, TXT, and MD attachments are supported.
 A missing or expired ID or an extraction failure returns 422 for the entire request.
+See [Attachments](#attachments) for the upload workflow and expiry handling.
 
 Image attachments support `image/png`, `image/jpeg`, and `image/webp` and can be mixed
 with text files. The cap is 4 MiB per image and eight total attachments, with no
@@ -395,8 +409,14 @@ Per-model inline limits can be lower than the API-wide limit. Smoke-test a real 
 The response has `answer`, `sources` (`document_id`, `title`, `material_type`,
 `chunk_preview`, the first 200 content characters), and `retrieval_info`
 (`chunks_available`, `chunks_above_threshold`, `similarity_threshold`).
-With attachment IDs, sources also include `source_type` (`course_material` or
-`attachment`), `attachment_id`, and `filename`. Attachment sources have a null
+
+| `source_type` | When it appears | UI suggestion |
+| --- | --- | --- |
+| `course_material` | Retrieved from a lecturer-ingested document for the requested offering and week | Cite the `title` and `document_id`. Link to the source document if your UI supports it. |
+| `attachment` | Retrieved from a text or image file the student uploaded via `POST /attachments` | Show the `filename`. For images, `chunk_preview` is `"[image: {filename}]"`. Render a thumbnail if you have one. |
+| `ai_generated` | A worked example Stewart generated because the source material contained none | Render with a distinct style (icon, tint, or badge) and the marker `[AI-GENERATED EXAMPLE]`. Never present as lecturer content. |
+
+With attachment IDs, sources also include `source_type`, `attachment_id`, and `filename`. Attachment sources have a null
 `document_id`. The retrieval info adds `attachment_chunks_available` (all chunks
 before the cap) and `attachment_chunks_above_threshold` (capped chunks meeting
 the threshold before the top-eight cutoff). These counters cover text attachments.
@@ -452,6 +472,105 @@ When the 100-chunk total cap is active, each attachment contributes only its fir
 Latency budget for /explain: requests without attachments typically complete in 10-20 seconds (course material retrieval + LLM generation). Requests with attachments add the embedding cost of the attached chunks: a small attachment (10-20 chunks) adds ~10-15 seconds; a request hitting the 100-chunk cap adds ~80 seconds of inter-batch sleeps plus embedding compute, for a worst case of roughly 2 minutes end-to-end. Frontend clients must set a request timeout of at least 150 seconds to accommodate the worst case. Callers needing faster responses for large attachments should use smaller attachments, or wait for the asynchronous /explain variant planned for Phase 4.
 
 Attachment ownership is enforced by the FSE backend before calling this service. The microservice stores and serves any attachment by ID to any caller presenting a valid `AI_SERVICE_API_KEY`. The FSE backend must verify that a student is authorized to view a course/material before including its `attachment_ids` in an `/explain` request, and must verify student identity before calling `/attachments` or `/explain` at all.
+
+### Attachments
+
+1. **Upload a file.** `POST /attachments` uploads a file and returns an `attachment_id`.
+2. **Reference the upload.** `POST /explain` references one or more `attachment_id` values in `attachment_ids`.
+
+Attachments expire 6 hours after upload. `/explain` returns 422 for an expired or unknown ID.
+
+#### POST /attachments
+
+Use the same Bearer token as `/explain`. Send `multipart/form-data` with a single
+`file` field. The per-file limit is 4 MiB for all file types, including text and images.
+
+Accepted MIME types
+
+- `application/pdf`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+- `application/vnd.openxmlformats-officedocument.presentationml.presentation`
+- `text/plain`
+- `text/markdown`
+- `image/png`
+- `image/jpeg`
+- `image/webp`
+
+A successful upload returns `200` with
+`{attachment_id, filename, mime_type, size_bytes, created_at, expires_at}`.
+An oversized file returns `413`. An unsupported MIME type or empty file returns `422`.
+
+#### GET /attachments/{attachment_id}
+
+Returns the same metadata as `POST /attachments`, with `404` after expiry or deletion.
+
+#### DELETE /attachments/{attachment_id}
+
+Returns `204` on deletion or `404` if the attachment is missing or already expired.
+
+#### End-to-end example
+
+1. Upload a local `recursion.txt` file from your backend environment.
+
+   ```bash
+   curl -X POST 'https://<RAILWAY_URL>/attachments' \
+     -H 'Authorization: Bearer <AI_SERVICE_API_KEY>' \
+     -F 'file=@recursion.txt;type=text/plain'
+   ```
+
+   Example `200` response
+
+   ```json
+   {
+     "attachment_id": "8ce28683-406d-4f61-aa75-957c032be16c",
+     "filename": "recursion.txt",
+     "mime_type": "text/plain",
+     "size_bytes": 128,
+     "created_at": "2026-11-09T10:00:00Z",
+     "expires_at": "2026-11-09T16:00:00Z"
+   }
+   ```
+
+2. Ask a question and reference the returned ID in `attachment_ids`.
+
+   ```bash
+   curl -X POST 'https://<RAILWAY_URL>/explain' \
+     -H 'Authorization: Bearer <AI_SERVICE_API_KEY>' \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "question": "What does the base case do in recursion?",
+       "course_offering_id": "offering-id",
+       "week": 3,
+       "attachment_ids": ["8ce28683-406d-4f61-aa75-957c032be16c"]
+     }'
+   ```
+
+3. Read the answer and its attachment source. This fragment shows the `answer` and `sources` fields.
+
+   ```json
+   {
+     "answer": "The base case stops a recursive function from calling itself once a stopping condition is met.",
+     "sources": [
+       {
+         "document_id": null,
+         "title": "recursion.txt",
+         "material_type": "ATTACHMENT",
+         "source_type": "attachment",
+         "attachment_id": "8ce28683-406d-4f61-aa75-957c032be16c",
+         "filename": "recursion.txt",
+         "chunk_preview": "A base case is a stopping condition for a recursive function."
+       }
+     ]
+   }
+   ```
+
+#### Handling expiry
+
+The `expires_at` field in the upload response is an ISO 8601 timestamp. If a user
+drafts a question and returns more than 6 hours later, `/explain` returns
+`422 Attachment {id} not found or expired`. The FSE UI should detect this error,
+prompt the student to re-attach the file, and call `POST /attachments` again to
+obtain a fresh `attachment_id`. Do not cache `attachment_id` past its `expires_at`.
 
 ### GET /health
 
@@ -931,7 +1050,12 @@ grounded answers, correct citations, and correct not-covered responses.
 Callbacks to `https://akadverse.vercel.app/api/webhooks/ai-ingest` returned 200 OK.
 Exchange secrets privately. Production deployment remains a separate decision.
 
-Wait for FSE direction on attachments, history, streaming, or outbox. Investigate
-and restore the skipped concurrency test separately. Durable callback outbox
-remains deferred until the FSE reports an actual delivery problem. Plan a Railway
+Attachments, chat history, and AI-generated worked examples are complete
+(Phases 3.5a-3.5c and 4a). The remaining deferred items are the skipped concurrency
+test investigation, the durable callback outbox (only when an actual delivery
+problem is observed), streaming `/explain` responses, and the full Stewart
+teaching roadmap (lesson plans, micro-tasks, evaluation, learner model, assistance
+ladder) pending Phase 0 alignment with the FSE and founder.
+
+Plan a Railway
 upgrade or migration before the trial expires early December 2026.
