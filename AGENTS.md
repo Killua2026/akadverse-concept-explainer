@@ -26,35 +26,29 @@ and you should surface the conflict to the developer before proceeding.
 
 ## Current phase
 
-**Phase 3: Course material retrieval.** Legacy endpoints are retired in Phase 2e.
+**Phase 4a: Conversation history and labeled worked examples.** Legacy endpoints were retired in Phase 2e.
 Grounding uses the existing shared-secret authentication dependency.
 
 Status:
 
-- [x] Phase 1: Google API key moved from form field to `GOOGLE_API_KEY` env var
-- [x] Phase 2a: pgvector storage
-- [x] Phase 2b1: Extract main.py, routes/grounding.py. Old endpoints unchanged
-- [x] Phase 2b0: Dual-provider support implemented and validated
-- [x] Phase 2b2: auth.py, models.py, migrations/002_jobs_table.sql, routes/ingest.py (202 only)
-- [x] Phase 2b3: services/embedding.py, workers/ingestion.py, end-to-end PDF ingestion
-- [x] Phase 2c: PDF / DOCX / PPTX extractors
-- [x] Phase 2d implementation: `/documents/{id}` delete + callback client (`9fbbf20`)
-- [x] Phase 2e: retire old endpoints and authenticate grounding (known test skip)
-- [x] Deployment: Railway staging (smoke test verified 202 / chunks / job done)
-- [x] Phase 3: POST /explain retrieval endpoint (verified on Railway with PDF and PPTX)
-- [x] Phase 3.5a: Attachment subsystem (upload/get/delete, Postgres BYTEA storage, 6-hour expiry, ownership by API key)
-- [x] Phase 3.5b: /explain accepts text attachments (PDF, DOCX, PPTX, TXT, MD) and merges retrieval with course material
-- [x] Phase 3.5c: /explain handles image attachments (PNG, JPG, WebP) via Gemini vision
-- [x] Phase 4a: Conversation history, direct answers, and labeled worked examples
-- [ ] Phase 4b: Streaming responses for /explain
-- [ ] Phase 4c: Durable callback outbox (deferred until an observed delivery problem)
-- [ ] Phase 4d: Investigation and restoration of skipped test_multiple_workers_no_collision
+- [x] Phase 1: Google API key env var migration
+- [x] Phase 2a-2e: Ingestion pipeline, dual-provider, extractors, delete/callback, legacy retirement
+- [x] Deployment: Railway staging (Hobby plan, always-on)
+- [x] Phase 3: POST /explain retrieval endpoint
+- [x] Phase 3.5a: Attachment subsystem (Postgres BYTEA, 6-hour TTL, API-key-only ownership)
+- [x] Phase 3.5b: /explain text attachments (PDF/DOCX/PPTX/TXT/MD, 100-chunk cap, merged retrieval)
+- [x] Phase 3.5c: /explain image attachments (PNG/JPG/WebP via Gemini vision)
+- [x] Phase 4a: Conversation history, no-greeting, labeled AI-generated worked examples
+- [ ] Phase 4b: Streaming responses for /explain (deferred)
+- [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
+- [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
+- [ ] Phase 5: Stewart teaching roadmap (lesson plans, concept decomposition, guided micro-tasks, evaluation, learner model, assistance ladder L0-L6, FSRS integration). BLOCKED on Phase 0 alignment with FSE and founder before any implementation. The two roadmap documents are `stewart_ai_engineer_implementation_plan.md` and `AI_ENGINEER_STUDY_VIRTUAL_ASSISTANT.md`. Do not start any Phase 5 sub-item without explicit scope agreement.
 
 Phase 2e is merged and deployed on Railway, as confirmed by the developer.
 Phase 3 is committed and verified end-to-end on Railway with real PDF and PPTX
 lecture documents. Callbacks are landing on the FSE's side (HTTP 200).
 
-## Current implementation: Phase 3
+## Phase 3 implementation (retrieval)
 
 `POST /explain` retrieves from `concept_explainer.chunks` filtered by
 `course_offering_id` and `weeks` membership, with cosine distance ceiling 0.6
@@ -85,7 +79,8 @@ image attachments as described below. Rate limiting is caller-owned.
 
 ### Phase 3 verification (5 November 2026)
 
-After removing the shell DATABASE_URL override so dotenv can load the configured
+Historical (superseded by Phase 3.5 and 4a verification blocks): After removing
+the shell DATABASE_URL override so dotenv can load the configured
 database, the full suite passed: 217 passed, 1 skipped, 1 existing deprecation
 warning in 366.05 seconds. The third-attempt startup probe and health-status
 tests passed unchanged. Ingestion/worker configuration tests received only
@@ -149,7 +144,7 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   shared-secret authentication independently of ingestion readiness.
 - `run.py` already provides the Windows selector-loop setup on port 8010.
 
-## Phase 2e verification (27 October 2026)
+## Historical: Phase 2e verification (27 October 2026)
 
 - Phase 2e is committed locally as `54a6ecb`. The suite contains 163 cases:
   164 baseline cases minus one obsolete API-key case and two legacy-wrapper
@@ -280,6 +275,42 @@ Uses `Depends(require_shared_secret_auth)` independently of ingestion readiness.
 Missing/wrong token returns 401 when `AI_SERVICE_API_KEY` is configured; an unset
 or blank shared secret returns 503. Database and callback configuration are not
 required. Prompt, response, and citations are preserved.
+
+### `GET /documents/{document_id}/status` (implemented)
+
+Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`. Uses the same `require_ingest_auth` dependency as `/ingest` and `DELETE`.
+
+Returns `{document_id, status, chunk_count, attempts, last_error, created_at, updated_at}`. This read-only endpoint triggers no work. It returns 404 if no job exists for that `document_id` and 503 if the database is unavailable. The FSE's 5-minute cron uses it to reconcile missed callbacks.
+
+### `POST /attachments` (implemented)
+
+Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`. Multipart/form-data with a single `file` field.
+
+Accepted MIME types are `application/pdf`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/vnd.openxmlformats-officedocument.presentationml.presentation`, `text/plain`, `text/markdown`, `image/png`, `image/jpeg`, and `image/webp`. The per-file limit is 4 MiB. Each `/explain` request accepts up to 8 attachments, counting text and images together.
+
+Returns 200 with `{attachment_id, filename, mime_type, size_bytes, created_at, expires_at}`. Returns 413 for an oversized file, 422 for an unsupported MIME type or empty file, and 503 when the database is unavailable or the service runs in developer mode.
+
+### `GET /attachments/{attachment_id}` (implemented)
+
+Uses the same auth as `POST /attachments` and returns the same metadata shape. Returns 404 after expiry or deletion. The endpoint returns metadata only. `/explain` reads bytes through an internal service function.
+
+### `DELETE /attachments/{attachment_id}` (implemented)
+
+Uses the same auth as `POST /attachments`. Returns 204 on delete and 404 if the attachment is missing or already expired.
+
+### `POST /explain` (implemented)
+
+Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`. Synchronous JSON.
+
+Request: `{question: str (1-4000 chars), course_offering_id: str (non-empty), week: int (>=1), attachment_ids: list[str] = [], session_id: str = ""}`.
+
+Response: `{answer, sources[], retrieval_info{chunks_available, chunks_above_threshold, similarity_threshold, attachment_chunks_available, attachment_chunks_above_threshold, attachment_images_count}}`.
+
+`source_type` is `Literal["course_material", "attachment", "ai_generated"]`. AI-generated worked examples are labeled with `[AI-GENERATED EXAMPLE]` on its own line in the answer. The marker stays in the text.
+
+Retrieval filters by `course_offering_id` and JSONB `weeks` membership, with cosine distance <= 0.6 (similarity >= 0.4) and K=8 course chunks. The request accepts up to 8 attachment IDs. Text attachment chunks share a 100-chunk embedding budget, and images pass to Gemini as multimodal Parts. A non-empty `session_id` fetches the last 10 chat messages, truncated to 2000 characters per message.
+
+Rate limiting is caller-owned. Latency is 10-20 seconds without attachments and up to about 2 minutes at the 100-chunk attachment cap.
 
 ## Outbound callback (implemented)
 
@@ -420,6 +451,44 @@ CREATE TABLE concept_explainer.jobs (
 
 CREATE INDEX ON concept_explainer.jobs (status, created_at);
 ```
+
+#### Phase 3.5a additions (attachments)
+
+Migration 003 creates the attachments table:
+
+```sql
+CREATE TABLE concept_explainer.attachments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INT NOT NULL,
+  content BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX attachments_expires_at_idx ON concept_explainer.attachments (expires_at);
+```
+
+The application sets `expires_at` using `ATTACHMENT_TTL_HOURS`. The column has no default.
+
+#### Phase 4a additions (chat messages)
+
+Migration 004 creates the chat messages table:
+
+```sql
+CREATE TABLE concept_explainer.chat_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+  content TEXT NOT NULL,
+  sources_json JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX chat_messages_session_created_idx ON concept_explainer.chat_messages (session_id, created_at);
+CREATE INDEX chat_messages_created_at_idx ON concept_explainer.chat_messages (created_at);
+```
+
+`created_at` uses `clock_timestamp()` so user and assistant messages inserted in the same transaction preserve chronological order. Chat messages have no `expires_at` column. The sweep applies the `CHAT_HISTORY_TTL_DAYS` retention period of 105 days.
 
 Legacy local vector storage was retired in Phase 2e.
 
@@ -565,9 +634,8 @@ credential fields remain empty.
 
 ## Target file structure (build incrementally, per sub-phase)
 
-Phases through 2e are implemented in this checkout. The files below are current,
-including the documents router, callback client, and their tests. Add future
-files only within the authorized sub-phase so each diff stays reviewable.
+The tree below reflects the Phase 4a implementation. Add future files only
+within the authorized sub-phase so each diff stays reviewable.
 
 ```
 akadverse-concept-explainer/
@@ -580,7 +648,9 @@ akadverse-concept-explainer/
 |-- models.py                     # Pydantic request/response schemas (2b)
 |-- routes/
 |   |-- ingest.py                 # POST /ingest (2b)
-|   |-- documents.py              # DELETE /documents/{id} (2d)
+|   |-- documents.py              # DELETE + GET /documents/{id}/status (Phase 2d, extended Phase 2f)
+|   |-- explain.py                # POST /explain (Phase 3)
+|   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
 |   `-- ingestion.py              # Job loop, re-queue on startup (2b)
@@ -595,7 +665,15 @@ akadverse-concept-explainer/
 |   |   `-- pptx.py               # (2c)
 |   |-- chunking.py               # (2c)
 |   |-- embedding.py              # Enterprise batch embedding, no retries (2b3)
+|   |-- retrieval.py              # Course-scoped RAG and attachment merging (Phase 3, 3.5)
+|   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
+|   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
+|-- migrations/
+|   |-- 001_pgvector_storage.sql
+|   |-- 002_jobs_table.sql
+|   |-- 003_attachments_table.sql
+|   `-- 004_chat_messages_table.sql
 |-- tests/
 |   |-- conftest.py               # Isolated DB and generated Office fixtures
 |   |-- test_api_key_env.py       # Provider startup checks
@@ -611,6 +689,9 @@ akadverse-concept-explainer/
 |   |-- test_embedding.py         # Embedding batches and validation
 |   |-- fixtures/sample.pdf       # Committed PDF fixture
 |   |-- test_delete.py            # (2d)
+|   |-- test_explain.py           # Retrieval and attachment tests (Phase 3, 3.5)
+|   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
+|   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
 |-- conftest.py                   # Empty, already present
 `-- requirements.txt
@@ -689,7 +770,7 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-The full suite baseline after deployment changes: 183 passed, 1 skipped. Do not regress below this.
+Current full-suite baseline after Phase 4a: 286 passed, 1 skipped. Do not regress below this. Historical baselines: Phase 2e 162, Phase 3 217, Phase 3.5a 250, Phase 3.5b 262, Phase 3.5c 272, Phase 4a 286. The `--timeout=120` command is authoritative; database-backed tests run 20-45 seconds each due to Supabase latency.
 
 `run.py` selects the bind address automatically. When `$PORT` is unset (local
 development on the developer's Windows PC), it binds `127.0.0.1:8010`. When
@@ -744,7 +825,7 @@ Before declaring a sub-phase complete, run all of these and confirm they
 pass. Do NOT mark a phase done in the checklist until every line below is
 green:
 
-1. `uv run pytest tests/ -q --tb=short --timeout=30` passes with the expected count of new tests
+1. `uv run pytest tests/ -q --tb=short --timeout=120` passes with the expected count of new tests
 2. `uv run python -c "from main import app"` imports cleanly
 3. No `print()` statements in new code (grep the diff)
 4. No `time.sleep()` (grep the diff)
@@ -811,7 +892,11 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Streaming, outbox, and the skipped-test investigation are deferred until a driver appears.
+Three tracks remain, none urgent:
+
+1. **Roadmap alignment (blocking future feature work).** Two documents describe the full Stewart teaching roadmap (lesson plans, micro-tasks, evaluation engine, learner model, assistance ladder, FSRS). Both explicitly require Phase 0 alignment with the FSE and founder before implementation. Do not start any roadmap sub-phase speculatively.
+2. **Deferred engineering (unblocked, low priority).** Phase 4b streaming, Phase 4c durable callback outbox (wait for actual delivery problem), Phase 4d skipped-test investigation.
+3. **Optional follow-ups (only if FSE asks).** GET /sessions/{id}/history if the FSE needs to reload history after a page refresh.
 
 ## Deployment status
 
