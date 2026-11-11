@@ -35,7 +35,7 @@ Student's question: {question}
 
 Rules:
 1. Answer only from the excerpts. If they do not cover the question, say so clearly - do not invent information.
-2. For conceptual questions (explain, what is, how does), naturally include a plain-language explanation, a relatable analogy, a concrete example, and if applicable a step-by-step worked problem. Do NOT use section labels; weave these into natural prose.
+2. For conceptual questions (explain, what is, how does), include a plain-language explanation, a relatable analogy, a concrete example, and if applicable a step-by-step worked problem. Organize this content using the formatting rules below — headings, lists, and paragraphs where they aid comprehension.
 3. For non-conceptual questions (summarise, list, define), answer directly in the most useful form.
 4. When multiple excerpts support the answer, synthesise them.
 5. If the excerpts are only partially relevant, answer what you can and explicitly say what is not covered.
@@ -67,6 +67,21 @@ a practice problem, or a demonstration:
 6. If the student explicitly asked for an example and the
    material contains none, do not refuse - generate one with
    the marker.
+
+Formatting rules:
+
+Structure the answer as a well-organized educational article, not plain conversational prose. Keep the same teaching content and reasoning — only the presentation changes.
+
+1. Use Markdown headings (`##` for main sections, `###` for subsections) where the answer is long enough to warrant them. Short answers to simple questions may have no headings at all. Do not pad the answer with sections the content does not warrant.
+2. Use bulleted or numbered lists where they make content easier to scan. Space paragraphs clearly. Do not present a long answer as one continuous paragraph.
+3. Use Markdown tables for structured comparisons (e.g. comparing two concepts, listing metric definitions) where a table is genuinely clearer than prose.
+4. Use **bold** sparingly — only for key terms or short conclusions. Do not over-bold.
+5. When the answer naturally has a takeaway, add a short section titled "Key takeaway" with one or two sentences. Omit it when there is no clear takeaway. Never invent one.
+6. Mathematical expressions: use LaTeX for all mathematical content, including simple arithmetic. Inline math as `$...$` (for example `$E = mc^2$` or `$50 \\div 240 \\approx 0.208$`). Display math for multi-line derivations as `$$...$$` on its own line. Never use Unicode math symbols like the division sign, multiplication sign, approximately-equal sign, or square-root sign. Write them as LaTeX macros (`\\div`, `\\times`, `\\approx`, `\\sqrt`).
+7. Worked examples: place each example within the section it illustrates, not collected at the end. Do not repeat the exact same example twice in one response. Different examples illustrating different aspects are welcome.
+8. If you generate a worked example (no suitable source example exists), place `[AI-GENERATED EXAMPLE]` on its own line immediately before the example content. Emit the marker exactly as written — do not add bold, headings, or any other Markdown styling around it. The frontend detects this literal string and applies its own visual treatment.
+9. Do not append a "References", "Sources", or "Citations" section at the end of the answer. The API response's `sources` array already provides structured source metadata, and the frontend renders it separately. Inline citations like "(Lecture 1)" are fine where they help the reader.
+10. Do not repeat the full question back to the student, and do not add meta-commentary about what you are about to do. Begin the answer directly.
 """
 MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE = EXPLAIN_PROMPT_TEMPLATE.replace(
     "{context}", "{context}{image_block}", 1,

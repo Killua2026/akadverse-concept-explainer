@@ -444,6 +444,26 @@ async def test_explain_prompt_includes_ai_generated_instruction(configured, atta
 
 
 @pytest.mark.anyio
+async def test_explain_prompt_contains_formatting_instructions(configured, attachment_api):
+    async with attachment_api([1.0]):
+        response = await post(configured.app)
+    assert response.status_code == 200
+    configured.client.assert_called_once_with(configured.settings)
+    configured.generate.assert_awaited_once()
+    prompt = configured.generate.await_args.kwargs["contents"]
+    phase_4a_rules, heading, formatting_rules = prompt.partition("Formatting rules:")
+    assert heading == "Formatting rules:"
+    for instruction in ("##", "Key takeaway", "LaTeX", "$", "[AI-GENERATED EXAMPLE]",
+                        "Do not append", "Do not repeat"):
+        assert instruction in formatting_rules
+    assert "Do not introduce yourself or greet the student." in phase_4a_rules
+    assert "greeting with no academic content" in phase_4a_rules
+    assert "Worked problems and examples:" in phase_4a_rules
+    assert "literal marker [AI-GENERATED EXAMPLE] on its own line" in phase_4a_rules
+    assert "do not refuse - generate one with" in phase_4a_rules
+
+
+@pytest.mark.anyio
 async def test_explain_detects_ai_generated_example(configured, attachment_api):
     marker = "[AI-GENERATED EXAMPLE]"
     configured.generate.return_value.text = f"{marker}\n  Add   two\n numbers. {'x' * 200}"
