@@ -18,7 +18,6 @@ def make_explain_router(settings: GeminiSettings) -> APIRouter:
     router = APIRouter()
 
     @router.post("/explain", response_model=ExplainResponse, tags=["Q&A"],
-                 response_model_exclude_unset=True,
                  dependencies=[Depends(require_shared_secret_auth)])
     async def explain_endpoint(body: ExplainRequest, request: Request) -> ExplainResponse:
         if len(body.attachment_ids) > 8:

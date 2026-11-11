@@ -108,9 +108,11 @@ async def test_explain_valid_answer_with_sources(configured, seeded):
     assert body["answer"] == "A grounded answer."
     assert [s["document_id"] for s in body["sources"]] == ["exact", "diagonal", "half"]
     assert body["sources"][0] == {"document_id": "exact", "title": "exact", "material_type": "NOTES",
-                                  "chunk_preview": ("exact" + " course material " * 30)[:200]}
+                                  "chunk_preview": ("exact" + " course material " * 30)[:200],
+                                  "source_type": "course_material", "attachment_id": None, "filename": None}
     assert body["retrieval_info"] == {"chunks_available": 4, "chunks_above_threshold": 3,
-                                      "similarity_threshold": 0.4}
+                                      "similarity_threshold": 0.4, "attachment_chunks_available": 0,
+                                      "attachment_chunks_above_threshold": 0, "attachment_images_count": 0}
     configured.embed.assert_awaited_once_with(["Explain the topic"], configured.settings)
     configured.client.assert_called_once_with(configured.settings)
     kwargs = configured.generate.await_args.kwargs
@@ -127,7 +129,8 @@ async def test_explain_empty_week(configured, seeded):
         body = (await post(configured.app, week=9)).json()
     assert body == {"answer": "No course material has been ingested for Week 9 of this offering yet.",
                     "sources": [], "retrieval_info": {"chunks_available": 0, "chunks_above_threshold": 0,
-                                                      "similarity_threshold": 0.4}}
+                                                      "similarity_threshold": 0.4, "attachment_chunks_available": 0,
+                                                      "attachment_chunks_above_threshold": 0, "attachment_images_count": 0}}
     configured.generate.assert_not_awaited()
 
 
@@ -137,7 +140,9 @@ async def test_explain_below_threshold(configured, seeded):
         body = (await post(configured.app)).json()
     assert body["answer"] == "The course material for Week 1 does not cover this question."
     assert body["sources"] == []
-    assert body["retrieval_info"] == {"chunks_available": 1, "chunks_above_threshold": 0, "similarity_threshold": 0.4}
+    assert body["retrieval_info"] == {"chunks_available": 1, "chunks_above_threshold": 0,
+                                      "similarity_threshold": 0.4, "attachment_chunks_available": 0,
+                                      "attachment_chunks_above_threshold": 0, "attachment_images_count": 0}
     configured.generate.assert_not_awaited()
 
 
