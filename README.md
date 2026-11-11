@@ -371,6 +371,8 @@ Response:
 
 ### POST /explain
 
+Answers are Markdown-formatted. Mathematical expressions use LaTeX (`$...$` inline, `$$...$$` for display). AI-generated worked examples are marked with `[AI-GENERATED EXAMPLE]` on its own line as plain text. The frontend detects this literal string and applies its own visual styling. The response's `sources` array is separate from the answer text; render them independently.
+
 `POST /explain` is synchronous JSON. Send `Authorization: Bearer <AI_SERVICE_API_KEY>`
 and a body such as `{"question":"Explain recursion","course_offering_id":"offering-id","week":3}`.
 Question length is 1-4000 characters, offering ID is non-empty, and week is at least 1.

@@ -112,6 +112,8 @@ status for the subsequent Railway smoke-test verification.
 - `GET /sessions/{id}/history` is deferred. If the FSE needs to restore chat
   history after a page reload, that endpoint can be added in a follow-up.
 
+The `/explain` prompt requires well-structured Markdown output: headings, lists, tables where warranted, LaTeX for math, `[AI-GENERATED EXAMPLE]` markers on AI-generated examples, emitted as plain text on their own line (no Markdown styling), and no trailing source lists (structured sources are in the response's `sources` array). The frontend renders Markdown and KaTeX; the microservice only produces the text.
+
 `GET /documents/{document_id}/status` provides read-only reconciliation for
 missed callbacks. It uses the same auth as `/ingest` and DELETE
 `/documents/{document_id}`. It does not trigger any work. Startup runs a
