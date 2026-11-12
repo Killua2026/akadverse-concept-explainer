@@ -58,6 +58,9 @@ a practice problem, or a demonstration:
    source.
 3. If no suitable example exists in the material, you MAY
    generate one.
+
+   If the source material contains an example with different numbers and the student asks for a calculation with their own numbers, treat the adapted calculation as generated content: prefix it with `[AI-GENERATED EXAMPLE]` and do not append a source citation to the adapted numbers. You may cite the source method in prose ("using the formula from Lecture 1") without implying the specific calculation came from the lecture.
+
 4. Any example or problem you generate MUST begin with the
    literal marker [AI-GENERATED EXAMPLE] on its own line,
    followed by the example content.
