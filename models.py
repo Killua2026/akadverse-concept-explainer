@@ -92,3 +92,38 @@ class ExplainResponse(BaseModel):
     answer: str
     sources: list[ExplainSource]
     retrieval_info: RetrievalInfo
+
+
+class AnalyseMaterialRequest(BaseModel):
+    document_id: str = Field(..., min_length=1)
+    max_concepts: int = Field(default=12, ge=3, le=20)
+
+
+class LessonPlanConcept(BaseModel):
+    concept_id: str
+    title: str
+    description: str
+    learning_objective: str
+    difficulty: Literal["introductory", "intermediate", "advanced"]
+    prerequisite_concept_ids: list[str] = Field(default_factory=list)
+    source_chunk_ids: list[str] = Field(default_factory=list)
+
+
+class LessonPlanSection(BaseModel):
+    section_id: str
+    title: str
+    concept_ids: list[str]
+
+
+class LessonPlan(BaseModel):
+    document_id: str
+    sections: list[LessonPlanSection]
+    concepts: list[LessonPlanConcept]
+    missing_prerequisites: list[str] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class AnalyseMaterialResponse(BaseModel):
+    document_id: str
+    lesson_plan: LessonPlan
+    chunks_analysed: int
