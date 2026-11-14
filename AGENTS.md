@@ -41,6 +41,7 @@ Status:
 - [x] Phase 4a: Conversation history, no-greeting, labeled AI-generated worked examples
 - [x] Lesson planning: POST /analyse-material (structured plan generation from ingested chunks, 80k character cap, fallback on LLM failure)
 - [x] Concept-scoped /explain: optional `concept_id` and `concept_description` fields (prompt-level scoping)
+- [x] Example tasks: POST /generate-example-tasks (worked example + interactive micro-tasks, 30k char cap, single-task fallback)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -169,6 +170,34 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
 - Railway logs `lesson_plan.repaired document_id=<id>` when repair changes a
   plan and `lesson_plan.fallback document_id=<id> error_type=<type> reason=<reason> parsed=<bool> finish_reason=<reason> raw_length=<n>`
   when fallback fires. The logs omit raw model output.
+
+### Example tasks (current)
+
+- `POST /generate-example-tasks` reads chunks for `document_id` in ID order.
+  With empty `example_text`, Gemini first produces a worked example and then
+  decomposes it into tasks. Supplied text skips generation. Each stage uses
+  its own `response_schema`, following lesson planning's schema-enforced JSON
+  pattern and plain generation retry.
+- `example.source` is `LECTURE_NOTE` when Gemini selects a verbatim example
+  found in a source chunk. For supplied `example_text`, attribution uses a
+  case-insensitive substring match on the first 100 characters after
+  collapsing whitespace and trimming both texts. Otherwise the source is
+  `AI_GENERATED`.
+- `_repair_tasks` in `services/example_tasks.py` drops invalid tasks,
+  deduplicates `task_id`, renumbers `sequence`, and caps at `max_tasks`.
+  Fewer than three valid tasks or generation failure returns HTTP 200 with a
+  single-task fallback, `source=AI_GENERATED`, empty `source_chunk_ids`, and
+  the prompt `"Read the worked example and explain the first step."`.
+- `DocumentNotFound` is imported from `services.lesson_planning`. JSON
+  extraction and task repair are local to `services/example_tasks.py`.
+- Logs include `example_tasks.repaired`, `example_tasks.fallback`, and
+  `example_tasks.empty_example_text` in the lesson planning format. Logs omit
+  raw model output.
+- The FSE receives `expected_answer` and `evaluation_criteria` for feedback
+  and evaluation. Keep `expected_answer` hidden until the student submits.
+- The source prompt has a 30,000-character cap and a 5,000-character cap per
+  chunk. Truncation can omit a source example and yield an AI-generated one.
+- `concept_description` drives task quality. Pass the concept's `description` from `/analyse-material` verbatim in the FSE integration. Vague descriptions produce vague tasks, while specific descriptions produce concrete, checkable tasks. Both pass validation.
 
 ### Concept-scoped /explain
 
@@ -690,6 +719,7 @@ akadverse-concept-explainer/
 |   |-- documents.py              # DELETE + GET /documents/{id}/status (Phase 2d, extended Phase 2f)
 |   |-- explain.py                # POST /explain (Phase 3)
 |   |-- lesson_planning.py        # POST /analyse-material
+|   |-- example_tasks.py          # POST /generate-example-tasks
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -707,6 +737,7 @@ akadverse-concept-explainer/
 |   |-- embedding.py              # Enterprise batch embedding, no retries (2b3)
 |   |-- retrieval.py              # Course-scoped RAG and attachment merging (Phase 3, 3.5)
 |   |-- lesson_planning.py        # Generate structured plans from ingested chunks
+|   |-- example_tasks.py          # Worked examples and interactive tasks
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -732,6 +763,7 @@ akadverse-concept-explainer/
 |   |-- test_delete.py            # (2d)
 |   |-- test_explain.py           # Retrieval and attachment tests (Phase 3, 3.5)
 |   |-- test_analyse_material.py  # Lesson planning endpoint tests
+|   |-- test_example_tasks.py     # Worked-example task endpoint tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -812,14 +844,10 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-Current expected full-suite baseline after lesson planning and concept-scoped
-`/explain` is 294 passed, 1 skipped (287 at last full run + 5
-`/analyse-material` tests + 2 concept-scoped `/explain` tests). This estimate
-uses the original five endpoint tests. `test_analyse_material.py` also contains
-three parsing and repair tests. Focused suites were green as of the latest
-implementation commit. Full-suite verification is pending. The documentation
-session's run timed out in Windows event-loop initialization before reporting a
-test count. Record the actual count after a completed run.
+The planning estimate after `/generate-example-tasks` is 300 passed, 1 skipped.
+The previous baseline of 294 and the 6 new example-task tests account for 300.
+The route-set update changes an existing test. Focused suites passed. Full-suite
+verification is pending. Record the actual count after a completed run.
 
 Historical baselines were 162 for Phase 2e, 217 for Phase 3, 250 for Phase
 3.5a, 262 for Phase 3.5b, 272 for Phase 3.5c, and 286 for Phase 4a. The
@@ -946,14 +974,15 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Two demo-critical endpoints shipped, `/analyse-material` and concept-scoped
-`/explain`. Both were verified in production via Swagger on
-`csc424-lecture-1-2027`. Await FSE demo feedback before scoping the next
-feature. Likely candidates in priority order, all requiring Phase 0
-alignment, are micro-task generation, answer and reasoning evaluation,
-assistance ladder L0-L6, and streaming `/explain`. The durable callback
-outbox is deferred until an observed delivery failure. The skipped-test
-investigation is also deferred. FSRS is explicitly the last feature per FSE.
+Three roadmap endpoints shipped and were verified on `csc424-lecture-1-2027`:
+`/analyse-material`, concept-scoped `/explain`, and
+`/generate-example-tasks`. Await FSE feedback on the interactive-tasks demo
+before scoping the next feature. The likely next endpoint is
+`/evaluate-practice` for answer and reasoning evaluation with misconception
+diagnosis in PRACTICE mode. The assistance ladder L0-L6 and streaming
+`/explain` follow. The durable callback outbox remains deferred until an
+observed delivery failure. The skipped-test investigation is deferred. FSRS
+is last per FSE.
 
 ## Deployment status
 
