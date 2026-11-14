@@ -107,9 +107,8 @@ def _repair_plan(plan_data: dict, max_concepts: int) -> dict:
 
 
 def _parse_plan(
-    response_text: str, document_id: str, max_concepts: int, source_ids: set[str],
+    data: dict, document_id: str, max_concepts: int, source_ids: set[str],
 ) -> LessonPlan:
-    data = _extract_json_object(response_text)
     repaired = _repair_plan(data, max_concepts)
     plan = LessonPlan.model_validate({**repaired, "document_id": document_id})
     if not 3 <= len(plan.concepts) <= max_concepts or not 1 <= len(plan.sections) <= 4:
@@ -169,13 +168,38 @@ async def analyse_material(
         if client is None:
             raise RuntimeError("Gemini client is unavailable")
         async with client.aio as api:
-            response = await api.models.generate_content(
-                model=settings.model_names[0],
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json"),
-            )
+            selected_model = settings.model_names[0]
+            try:
+                response = await api.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type="application/json",
+                        response_schema=LessonPlan,
+                    ),
+                )
+            except Exception as schema_error:
+                logger.warning(
+                    "lesson_plan.schema_attempt_failed document_id=%s error_type=%s",
+                    document_id, type(schema_error).__name__,
+                )
+                response = await api.models.generate_content(
+                    model=selected_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.2),
+                )
             raw_text = response.text or ""
-        plan = _parse_plan(raw_text, document_id, max_concepts, source_ids)
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, LessonPlan):
+            data = parsed.model_dump()
+        elif isinstance(parsed, dict):
+            data = parsed
+        elif parsed is None:
+            data = _extract_json_object(raw_text)
+        else:
+            raise ValueError("Unexpected parsed lesson plan type")
+        plan = _parse_plan(data, document_id, max_concepts, source_ids)
     except Exception as error:
         logger.warning(
             "lesson_plan.fallback document_id=%s error_type=%s raw_length=%s",
