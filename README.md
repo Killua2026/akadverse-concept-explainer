@@ -32,6 +32,8 @@ The intended caller is the Next.js backend, not a browser client.
 | Legacy endpoint retirement and grounding auth | Implemented and committed in Phase 2e |
 | Concurrent job-claim collision test | Retained but skipped; dedicated investigation pending for intermittent teardown hang |
 | Retrieval over ingested pgvector chunks | Implemented: authenticated synchronous `POST /explain` |
+| `POST /analyse-material` | Implemented: decomposes ingested material into a structured lesson plan with sections, concepts, prerequisites, difficulty, and source chunk citations |
+| Concept-scoped `/explain` | Implemented: optional `concept_id` and `concept_description` fields scope Stewart's answer to a single concept |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -50,6 +52,8 @@ not change the committed job status or roll back chunks.
 - [Configuration](#configuration)
 - [Database setup](#database-setup)
 - [API endpoints](#api-endpoints)
+  - [Analyse material](#post-analyse-material)
+  - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
 - [Extraction and processing](#extraction-and-processing)
@@ -399,6 +403,14 @@ Optionally include `attachment_ids`, an array of up to eight IDs from
 A missing or expired ID or an extraction failure returns 422 for the entire request.
 See [Attachments](#attachments) for the upload workflow and expiry handling.
 
+Two optional fields, `concept_id` and `concept_description`, scope the answer to a
+single concept from a lesson plan, typically from `/analyse-material`. When both
+are non-empty, the prompt instructs Stewart to answer for that concept and its
+immediate prerequisites only. When either field is empty, the prompt is
+byte-identical to the unscoped prompt. Retrieval still uses the requested course
+offering and week, so Gemini may occasionally mention adjacent concepts. See
+[Demo flow](#demo-flow-lesson-planning--teaching) below.
+
 Image attachments support `image/png`, `image/jpeg`, and `image/webp` and can be mixed
 with text files. The cap is 4 MiB per image and eight total attachments, with no
 aggregate image byte cap. Each image appears after the text attachment sources, in
@@ -474,6 +486,59 @@ When the 100-chunk total cap is active, each attachment contributes only its fir
 Latency budget for /explain: requests without attachments typically complete in 10-20 seconds (course material retrieval + LLM generation). Requests with attachments add the embedding cost of the attached chunks: a small attachment (10-20 chunks) adds ~10-15 seconds; a request hitting the 100-chunk cap adds ~80 seconds of inter-batch sleeps plus embedding compute, for a worst case of roughly 2 minutes end-to-end. Frontend clients must set a request timeout of at least 150 seconds to accommodate the worst case. Callers needing faster responses for large attachments should use smaller attachments, or wait for the asynchronous /explain variant planned for Phase 4.
 
 Attachment ownership is enforced by the FSE backend before calling this service. The microservice stores and serves any attachment by ID to any caller presenting a valid `AI_SERVICE_API_KEY`. The FSE backend must verify that a student is authorized to view a course/material before including its `attachment_ids` in an `/explain` request, and must verify student identity before calling `/attachments` or `/explain` at all.
+
+### POST /analyse-material
+
+Builds a structured lesson plan from an ingested document. The plan provides the
+foundation for lesson state and concept-scoped explanations.
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as `/explain`.
+
+```json
+{"document_id": "csc424-lecture-1-2027", "max_concepts": 8}
+```
+
+`max_concepts` is optional, defaults to 12, and accepts values from 3 to 20.
+
+The response contains `document_id`, `lesson_plan`, and `chunks_analysed`.
+`chunks_analysed` counts chunks whose content was included in the prompt.
+
+| `lesson_plan` field | Shape |
+| --- | --- |
+| `document_id` | String |
+| `sections` | Array of objects with `section_id`, `title`, and `concept_ids` |
+| `concepts` | Array of objects with `concept_id`, `title`, `description`, `learning_objective`, `difficulty`, `prerequisite_concept_ids`, and `source_chunk_ids` |
+| `missing_prerequisites` | Array of strings |
+| `notes` | String or null |
+
+The service reads all chunks for the document and calls Gemini with
+`response_schema` for structured JSON output. It repairs minor reference defects
+before validation and returns a single-concept plan if generation and recovery
+fail.
+
+- `200` returns the generated plan or a fallback plan.
+- `401` indicates a missing or invalid Bearer token.
+- `404` indicates that the document has no ingested chunks.
+- `503` indicates unavailable database access, developer mode, or missing auth configuration.
+- `422` indicates an invalid request body.
+
+The prompt includes up to 80,000 characters of concatenated chunk content and
+markers, so long documents may lose later topics. Plan quality depends on
+Gemini's structured output, and pathological inputs may trigger the fallback.
+
+Smoke-test concept `concept-4`, **Modes of Data Transmission**, was intermediate,
+required `concept-1`, and cited chunks `98` through `100`.
+
+### Demo flow: lesson planning → teaching
+
+1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
+2. After ingestion completes, the FSE backend calls `/analyse-material` with the
+   `document_id` and receives ordered concepts with prerequisite links.
+3. The FSE frontend renders the plan as a course structure with per-concept entry points.
+4. The student opens a concept. The backend calls `/explain` with the plan's
+   `concept_id` and concept description as `concept_description`.
+5. Stewart answers for the selected concept with Markdown structure and LaTeX
+   where relevant. The response's `sources` array carries citation metadata.
 
 ### Attachments
 
@@ -994,12 +1059,14 @@ akadverse-concept-explainer/
   db.py                        Async Postgres engine and session factory
   routes/
     explain.py                 Authenticated synchronous POST /explain
+    lesson_planning.py         Authenticated POST /analyse-material
     ingest.py                  POST /ingest
     documents.py               Transactional DELETE /documents/{document_id}
     grounding.py               Retained Google Search Grounding route
   workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
   services/
     retrieval.py               Course-scoped retrieval and grounded answers
+    lesson_planning.py         Structured plans from ingested chunks
     embedding.py               Enterprise batch embeddings
     callback.py                CallbackSettings and bounded authorized delivery
     chunking.py                Shared text splitting
@@ -1016,6 +1083,7 @@ akadverse-concept-explainer/
     002_jobs_table.sql
   tests/
     conftest.py                Isolated database and generated Office fixtures
+    test_analyse_material.py
     test_api_key_env.py
     test_auth.py
     test_callback.py
