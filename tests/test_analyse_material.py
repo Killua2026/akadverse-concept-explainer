@@ -98,7 +98,7 @@ async def test_analyse_returns_structured_plan(configured, lesson_database):
             "missing_prerequisites": [],
             "notes": None,
         }
-        configured.generate.return_value = SimpleNamespace(text=json.dumps(plan))
+        configured.generate.return_value = SimpleNamespace(text=json.dumps(plan), parsed=plan)
         response = await post(configured.app, document_id, max_concepts=3)
 
     assert response.status_code == 200
@@ -122,6 +122,10 @@ async def test_analyse_returns_structured_plan(configured, lesson_database):
     assert kwargs["model"] == "test-model"
     assert kwargs["config"].temperature == 0.2
     assert kwargs["config"].response_mime_type == "application/json"
+    schema = kwargs["config"].response_schema
+    assert "document_id" not in schema["properties"]
+    assert "document_id" not in schema["required"]
+    assert lesson_planning.TEXT_FALLBACK_SCHEMA not in kwargs["contents"]
     chunks = "\n\n".join(f"--- chunk {chunk_id} ---\n{topic}" for chunk_id, topic in zip(chunk_ids, topics))
     assert chunks in kwargs["contents"]
 
@@ -140,7 +144,10 @@ async def test_analyse_malformed_llm_returns_fallback_plan(configured, lesson_da
     document_id = uuid4().hex
     async with lesson_database() as (database, schema):
         await seed_chunks(database, schema, document_id, ["Ohm's law"])
-        for invalid_response in ("garbage", '{"concepts": []}'):
+        for invalid_response, reason in (
+            ("garbage", "no_json_object"),
+            ('{"concepts": []}', "invalid_concept_or_section_lists"),
+        ):
             caplog.clear()
             configured.generate.return_value = SimpleNamespace(text=invalid_response)
             response = await post(configured.app, document_id)
@@ -157,6 +164,7 @@ async def test_analyse_malformed_llm_returns_fallback_plan(configured, lesson_da
             assert any(
                 record.levelno == logging.WARNING
                 and record.getMessage().startswith(f"lesson_plan.fallback document_id={document_id} error_type=")
+                and f" reason={reason} parsed=False finish_reason=None " in record.getMessage()
                 and record.getMessage().endswith(f" raw_length={len(invalid_response)}")
                 for record in caplog.records
             )
