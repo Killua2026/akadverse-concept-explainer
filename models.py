@@ -129,3 +129,34 @@ class AnalyseMaterialResponse(BaseModel):
     document_id: str
     lesson_plan: LessonPlan
     chunks_analysed: int
+
+
+class GenerateExampleTasksRequest(BaseModel):
+    concept_id: str = Field(..., min_length=1)
+    concept_description: str = Field(..., min_length=1)
+    document_id: str = Field(..., min_length=1)
+    max_tasks: int = Field(default=6, ge=3, le=10)
+    example_text: str = ""
+
+
+class ExampleTask(BaseModel):
+    task_id: str
+    sequence: int
+    prompt: str
+    response_type: Literal["text", "number", "multiple_choice", "step"]
+    expected_answer: str
+    evaluation_criteria: list[str] = Field(default_factory=list)
+    hint_strategy: str | None = None
+    required: bool = True
+
+
+class WorkedExample(BaseModel):
+    source: Literal["LECTURE_NOTE", "AI_GENERATED"]
+    text: str
+    source_chunk_ids: list[str] = Field(default_factory=list)
+
+
+class GenerateExampleTasksResponse(BaseModel):
+    concept_id: str
+    example: WorkedExample
+    tasks: list[ExampleTask]

@@ -12,8 +12,9 @@ def test_main_app_has_all_expected_routes():
     assert "/attachments" in paths
     assert "/attachments/{attachment_id}" in paths
     assert "/analyse-material" in paths
+    assert "/generate-example-tasks" in paths
     assert set(main.app.openapi()["paths"]) == {
         "/ingest", "/documents/{document_id}", "/documents/{document_id}/status",
         "/explain-with-grounding", "/explain", "/health",
-        "/attachments", "/attachments/{attachment_id}", "/analyse-material"
+        "/attachments", "/attachments/{attachment_id}", "/analyse-material", "/generate-example-tasks",
     }
