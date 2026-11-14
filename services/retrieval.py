@@ -31,7 +31,7 @@ EXPLAIN_PROMPT_TEMPLATE = """You are Stewart, AkadVerse's study assistant. Answe
 
 {context}
 
-Student's question: {question}
+{concept_scope_block}Student's question: {question}
 
 Rules:
 1. Answer only from the excerpts. If they do not cover the question, say so clearly - do not invent information.
@@ -88,7 +88,14 @@ Structure the answer as a well-organized educational article, not plain conversa
 """
 MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE = EXPLAIN_PROMPT_TEMPLATE.replace(
     "{context}", "{context}{image_block}", 1,
-).replace("Student's question:", "{history_section}Student's question:", 1)
+).replace("{concept_scope_block}", "{history_section}{concept_scope_block}", 1)
+CONCEPT_SCOPE_TEMPLATE = """The student is currently learning a specific concept from this material:
+{concept_description}
+
+Scope your answer to this concept and its immediate prerequisites. Do not
+teach later concepts or jump ahead in the plan.
+
+"""
 IMAGE_BLOCK_TEMPLATE = """\n\nAttached images ({count}): {filenames}
 
 The attached images are provided as multimodal input. The excerpts-only rules
@@ -271,6 +278,7 @@ async def _generate_answer(
     attachment_chunks: list[tuple[str, str, str]] | None = None,
     images: list[tuple[str, str, bytes, str]] | None = None,
     *, retrieval_info: RetrievalInfo | None = None, history_block: str = "",
+    concept_scope_block: str = "",
 ) -> str:
     context = "\n\n".join(
         f"--- Source: {chunk['metadata']['title']} ---\n{chunk['content']}" for chunk in chunks
@@ -293,6 +301,7 @@ async def _generate_answer(
     history_section = f"Conversation so far:\n{history_block}" if history_block else ""
     prompt_text = MULTIMODAL_EXPLAIN_PROMPT_TEMPLATE.format(
         context=context, image_block=image_block, question=question, history_section=history_section,
+        concept_scope_block=concept_scope_block,
     )
     try:
         client = create_client(settings)
@@ -330,7 +339,8 @@ async def _generate_answer(
 
 async def explain(*, question: str, course_offering_id: str, week: int,
                   settings: GeminiSettings, database: Database,
-                  attachment_ids: list[str] = [], session_id: str = "") -> ExplainResponse:
+                  attachment_ids: list[str] = [], session_id: str = "",
+                  concept_id: str = "", concept_description: str = "") -> ExplainResponse:
     history_block = ""
     if session_id:
         messages = await fetch_recent_messages(database, session_id)
@@ -371,9 +381,14 @@ async def explain(*, question: str, course_offering_id: str, week: int,
             for attachment_id, filename, _, _ in images
         )
     if above_threshold or attachment_chunks or images:
+        concept_scope_block = (
+            CONCEPT_SCOPE_TEMPLATE.format(concept_description=concept_description)
+            if concept_id and concept_description else ""
+        )
         answer = await _generate_answer(
             question, chunks, settings, attachment_chunks, images,
             retrieval_info=info, history_block=history_block,
+            concept_scope_block=concept_scope_block,
         )
     elif not attachment_ids and available == 0:
         answer = f"No course material has been ingested for Week {week} of this offering yet."
