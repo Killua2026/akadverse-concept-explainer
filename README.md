@@ -34,6 +34,7 @@ The intended caller is the Next.js backend, not a browser client.
 | Retrieval over ingested pgvector chunks | Implemented: authenticated synchronous `POST /explain` |
 | `POST /analyse-material` | Implemented: decomposes ingested material into a structured lesson plan with sections, concepts, prerequisites, difficulty, and source chunk citations |
 | Concept-scoped `/explain` | Implemented: optional `concept_id` and `concept_description` fields scope Stewart's answer to a single concept |
+| `POST /generate-example-tasks` | Implemented: decomposes a worked example into ordered interactive student tasks (multiple-choice, text, number, step responses) with expected answers and evaluation criteria |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -53,6 +54,7 @@ not change the committed job status or roll back chunks.
 - [Database setup](#database-setup)
 - [API endpoints](#api-endpoints)
   - [Analyse material](#post-analyse-material)
+  - [Generate example tasks](#post-generate-example-tasks)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
@@ -529,6 +531,62 @@ Gemini's structured output, and pathological inputs may trigger the fallback.
 Smoke-test concept `concept-4`, **Modes of Data Transmission**, was intermediate,
 required `concept-1`, and cited chunks `98` through `100`.
 
+### POST /generate-example-tasks
+
+Takes a concept from a lesson plan and returns a worked example with 3 to 10
+ordered interactive micro-tasks. Use the same Bearer token as `/explain`.
+
+```json
+{
+  "concept_id": "concept-4",
+  "concept_description": "The classification of data flow directions between devices, categorized as simplex, half-duplex, and full-duplex.",
+  "document_id": "csc424-lecture-1-2027",
+  "max_tasks": 5,
+  "example_text": ""
+}
+```
+
+`concept_id`, `concept_description`, and `document_id` are required.
+`max_tasks` defaults to 6 and accepts 3 to 10. `example_text` is optional.
+
+Response fields
+
+- `concept_id` (string)
+- `example` (object) with `source` (`LECTURE_NOTE` or `AI_GENERATED`),
+  `text` (string), and `source_chunk_ids` (list of strings)
+- `tasks` (list) with `task_id` (string), `sequence` (integer), `prompt`
+  (string), `response_type` (`text`, `number`, `multiple_choice`, or `step`),
+  `expected_answer` (string), `evaluation_criteria` (list of strings),
+  `hint_strategy` (string or null), and `required` (boolean)
+
+- An empty `example_text` triggers two Gemini calls, one to produce a worked
+  example and one to decompose it. A supplied example goes straight to
+  decomposition. Both stages use `response_schema` for structured JSON.
+  The service validates tasks, drops duplicates, renumbers them, and caps
+  the result at `max_tasks`.
+- `LECTURE_NOTE` identifies an example found in the ingested material.
+  The FSE should label `AI_GENERATED` examples in the UI, consistent with
+  `source_type="ai_generated"` in `/explain` sources.
+- Keep `expected_answer` and `evaluation_criteria` server-side until the
+  student submits. They support immediate feedback and the future
+  `/evaluate-practice` evaluation flow.
+- Status codes include 200 for success and fallback, 401 for auth failure,
+  404 for an unknown document or one with no chunks, and 503 when the
+  database is unavailable or the service is in developer mode.
+- The 30,000-character source cap can omit a lecture example and lead to an
+  AI-generated one. Task quality depends on Gemini's structured output.
+  Generation failure or fewer than three valid tasks yields a single-task plan.
+- **`concept_description` has the biggest influence on task quality.**
+  A vague description such as "transmission modes" produces vague tasks.
+  A specific description such as "classification of data flow directions
+  between devices, categorized as simplex, half-duplex, and full-duplex"
+  produces concrete, checkable tasks. The FSE should pass the concept's
+  `description` from `/analyse-material` verbatim as `concept_description`.
+  Both descriptions pass validation. The difference is in the tasks Gemini returns.
+
+This is the third teaching stage after lesson planning and concept-scoped
+explanation. See [Demo flow](#demo-flow-lesson-planning--teaching).
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -539,6 +597,14 @@ required `concept-1`, and cited chunks `98` through `100`.
    `concept_id` and concept description as `concept_description`.
 5. Stewart answers for the selected concept with Markdown structure and LaTeX
    where relevant. The response's `sources` array carries citation metadata.
+6. From the concept entry, the FSE calls `/generate-example-tasks` with the
+   concept's `concept_id`, its `description` as `concept_description`, and
+   the `document_id`. The response includes a worked example and ordered tasks.
+7. The FSE renders the example and presents the tasks one at a time.
+   `expected_answer` and `evaluation_criteria` stay server-side until the
+   student submits, then drive immediate feedback.
+8. The student completes the tasks. Once `/evaluate-practice` ships, the FSE
+   can optionally submit answers for separate answer and reasoning grading.
 
 ### Attachments
 
@@ -1060,6 +1126,7 @@ akadverse-concept-explainer/
   routes/
     explain.py                 Authenticated synchronous POST /explain
     lesson_planning.py         Authenticated POST /analyse-material
+    example_tasks.py            Authenticated POST /generate-example-tasks
     ingest.py                  POST /ingest
     documents.py               Transactional DELETE /documents/{document_id}
     grounding.py               Retained Google Search Grounding route
@@ -1067,6 +1134,7 @@ akadverse-concept-explainer/
   services/
     retrieval.py               Course-scoped retrieval and grounded answers
     lesson_planning.py         Structured plans from ingested chunks
+    example_tasks.py            Worked examples and interactive tasks
     embedding.py               Enterprise batch embeddings
     callback.py                CallbackSettings and bounded authorized delivery
     chunking.py                Shared text splitting
@@ -1084,6 +1152,7 @@ akadverse-concept-explainer/
   tests/
     conftest.py                Isolated database and generated Office fixtures
     test_analyse_material.py
+    test_example_tasks.py
     test_api_key_env.py
     test_auth.py
     test_callback.py
