@@ -155,7 +155,9 @@ async def test_analyse_malformed_llm_returns_fallback_plan(configured, lesson_da
             assert concept["title"] == "Overview of Circuit Analysis"
             assert concept["description"] == "The material could not be decomposed into a structured plan"
             assert any(
-                record.levelno == logging.WARNING and "lesson_planning.fallback" in record.getMessage()
+                record.levelno == logging.WARNING
+                and record.getMessage().startswith(f"lesson_plan.fallback document_id={document_id} error_type=")
+                and record.getMessage().endswith(f" raw_length={len(invalid_response)}")
                 for record in caplog.records
             )
 
@@ -174,3 +176,63 @@ async def test_analyse_503_when_db_unavailable(configured):
     response = await post(configured.app, "lecture")
     assert response.status_code == 503
     configured.generate.assert_not_awaited()
+
+
+@pytest.fixture
+async def generated_plan(configured, lesson_database):
+    document_id = uuid4().hex
+    topics = ["Ohm's law", "Series circuits", "Voltage division"]
+    concept_ids = ["concept-1", "concept-2", "concept-3"]
+    async with lesson_database() as (database, schema):
+        chunk_ids = await seed_chunks(database, schema, document_id, topics)
+        plan = {
+            "sections": [{"section_id": "section-1", "title": "Circuit foundations", "concept_ids": concept_ids}],
+            "concepts": [
+                {
+                    "concept_id": concept_id,
+                    "title": topic,
+                    "description": f"Introduce {topic}.",
+                    "learning_objective": f"Apply {topic} in a circuit.",
+                    "difficulty": "introductory",
+                    "prerequisite_concept_ids": concept_ids[:index],
+                    "source_chunk_ids": [chunk_id],
+                }
+                for index, (concept_id, topic, chunk_id) in enumerate(zip(concept_ids, topics, chunk_ids))
+            ],
+        }
+        yield document_id, plan
+
+
+@pytest.mark.anyio
+async def test_analyse_handles_fenced_json(configured, generated_plan):
+    document_id, plan = generated_plan
+    configured.generate.return_value = SimpleNamespace(text=f"```json\n{json.dumps(plan)}\n```")
+    response = await post(configured.app, document_id)
+    assert response.status_code == 200
+    assert response.json()["lesson_plan"]["concepts"] == plan["concepts"]
+
+
+@pytest.mark.anyio
+async def test_analyse_handles_preamble_json(configured, generated_plan):
+    document_id, plan = generated_plan
+    configured.generate.return_value = SimpleNamespace(text=f"Here is the plan:\n{json.dumps(plan)}")
+    response = await post(configured.app, document_id)
+    assert response.status_code == 200
+    assert response.json()["lesson_plan"]["concepts"] == plan["concepts"]
+
+
+@pytest.mark.anyio
+async def test_analyse_repairs_invalid_prerequisites(configured, generated_plan, caplog):
+    document_id, plan = generated_plan
+    plan["concepts"][1]["prerequisite_concept_ids"].extend(["unknown", "concept-2", "concept-3"])
+    plan["sections"][0]["concept_ids"].append("unknown")
+    plan["sections"].append({"section_id": "section-2", "title": "Empty", "concept_ids": ["unknown"]})
+    configured.generate.return_value = SimpleNamespace(text=json.dumps(plan))
+    response = await post(configured.app, document_id)
+    assert response.status_code == 200
+    repaired_plan = response.json()["lesson_plan"]
+    assert len(repaired_plan["concepts"]) == 3
+    assert repaired_plan["concepts"][1]["prerequisite_concept_ids"] == ["concept-1"]
+    assert len(repaired_plan["sections"]) == 1
+    assert repaired_plan["sections"][0]["concept_ids"] == ["concept-1", "concept-2", "concept-3"]
+    assert f"lesson_plan.repaired document_id={document_id}" in caplog.messages
