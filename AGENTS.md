@@ -39,10 +39,12 @@ Status:
 - [x] Phase 3.5b: /explain text attachments (PDF/DOCX/PPTX/TXT/MD, 100-chunk cap, merged retrieval)
 - [x] Phase 3.5c: /explain image attachments (PNG/JPG/WebP via Gemini vision)
 - [x] Phase 4a: Conversation history, no-greeting, labeled AI-generated worked examples
+- [x] Lesson planning: POST /analyse-material (structured plan generation from ingested chunks, 80k character cap, fallback on LLM failure)
+- [x] Concept-scoped /explain: optional `concept_id` and `concept_description` fields (prompt-level scoping)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
-- [ ] Phase 5: Stewart teaching roadmap (lesson plans, concept decomposition, guided micro-tasks, evaluation, learner model, assistance ladder L0-L6, FSRS integration). BLOCKED on Phase 0 alignment with FSE and founder before any implementation. The two roadmap documents are `stewart_ai_engineer_implementation_plan.md` and `AI_ENGINEER_STUDY_VIRTUAL_ASSISTANT.md`. Do not start any Phase 5 sub-item without explicit scope agreement.
+- [ ] Phase 5: Remaining Stewart teaching roadmap (guided micro-tasks, evaluation, learner model, assistance ladder L0-L6, FSRS integration). BLOCKED on Phase 0 alignment with FSE and founder before any further implementation. The two roadmap documents are `stewart_ai_engineer_implementation_plan.md` and `AI_ENGINEER_STUDY_VIRTUAL_ASSISTANT.md`. Do not start any remaining Phase 5 sub-item without explicit scope agreement.
 
 Phase 2e is merged and deployed on Railway, as confirmed by the developer.
 Phase 3 is committed and verified end-to-end on Railway with real PDF and PPTX
@@ -145,6 +147,41 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
 - Legacy endpoints and local FAISS state are removed. Grounding uses
   shared-secret authentication independently of ingestion readiness.
 - `run.py` already provides the Windows selector-loop setup on port 8010.
+
+### Lesson planning (current)
+
+- `POST /analyse-material` reads all chunks for `document_id` in chunk ID order
+  and concatenates them with chunk ID markers. The first Gemini call uses
+  `response_mime_type="application/json"` and a `response_schema` derived from
+  `LessonPlan`. The API enforces the schema for this call. If it raises, the
+  service retries with the schema written into the prompt.
+- The service fills `document_id` on `LessonPlan` and the outer response.
+  The Gemini schema contains only model-generated fields.
+- When `response.parsed` is absent, `_extract_json_object` tolerates fences
+  and preamble in the text. `_repair_plan` drops dangling references and caps
+  the concept count before validation on both the parsed and text paths.
+- A generation or plan-processing failure returns HTTP 200 with a
+  single-concept overview and a description of the failure. Auth and
+  availability errors can return 401 or 503. Missing chunks return 404.
+- The concatenated prompt material has an 80,000-character cap, including
+  chunk markers. Typical lecture PDFs are under the cap. Textbook-length
+  material may lose later topics.
+- Railway logs `lesson_plan.repaired document_id=<id>` when repair changes a
+  plan and `lesson_plan.fallback document_id=<id> error_type=<type> reason=<reason> parsed=<bool> finish_reason=<reason> raw_length=<n>`
+  when fallback fires. The logs omit raw model output.
+
+### Concept-scoped /explain
+
+- `ExplainRequest` has two optional fields, `concept_id: str = ""` and
+  `concept_description: str = ""`.
+- `EXPLAIN_PROMPT_TEMPLATE` places `{concept_scope_block}` after history and
+  before the question. Both fields must be non-empty to populate the block.
+  Otherwise the empty block preserves the pre-change prompt byte for byte.
+  A dedicated test asserts this compatibility.
+- The prompt asks the model to stay within the chosen concept and its immediate
+  prerequisites. Retrieval still uses `course_offering_id` and week, preserving
+  access to prerequisite analogies from earlier concepts. The model determines
+  how closely it follows the scope.
 
 ## Historical: Phase 2e verification (27 October 2026)
 
@@ -304,7 +341,7 @@ Uses the same auth as `POST /attachments`. Returns 204 on delete and 404 if the 
 
 Header: `Authorization: Bearer <AI_SERVICE_API_KEY>`. Synchronous JSON.
 
-Request: `{question: str (1-4000 chars), course_offering_id: str (non-empty), week: int (>=1), attachment_ids: list[str] = [], session_id: str = ""}`.
+Request: `{question: str (1-4000 chars), course_offering_id: str (non-empty), week: int (>=1), attachment_ids: list[str] = [], session_id: str = "", concept_id: str = "", concept_description: str = ""}`.
 
 Response: `{answer, sources[], retrieval_info{chunks_available, chunks_above_threshold, similarity_threshold, attachment_chunks_available, attachment_chunks_above_threshold, attachment_images_count}}`.
 
@@ -636,7 +673,7 @@ credential fields remain empty.
 
 ## Target file structure (build incrementally, per sub-phase)
 
-The tree below reflects the Phase 4a implementation. Add future files only
+The tree below includes Phase 4a and lesson planning. Add future files only
 within the authorized sub-phase so each diff stays reviewable.
 
 ```
@@ -652,6 +689,7 @@ akadverse-concept-explainer/
 |   |-- ingest.py                 # POST /ingest (2b)
 |   |-- documents.py              # DELETE + GET /documents/{id}/status (Phase 2d, extended Phase 2f)
 |   |-- explain.py                # POST /explain (Phase 3)
+|   |-- lesson_planning.py        # POST /analyse-material
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -668,6 +706,7 @@ akadverse-concept-explainer/
 |   |-- chunking.py               # (2c)
 |   |-- embedding.py              # Enterprise batch embedding, no retries (2b3)
 |   |-- retrieval.py              # Course-scoped RAG and attachment merging (Phase 3, 3.5)
+|   |-- lesson_planning.py        # Generate structured plans from ingested chunks
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -692,6 +731,7 @@ akadverse-concept-explainer/
 |   |-- fixtures/sample.pdf       # Committed PDF fixture
 |   |-- test_delete.py            # (2d)
 |   |-- test_explain.py           # Retrieval and attachment tests (Phase 3, 3.5)
+|   |-- test_analyse_material.py  # Lesson planning endpoint tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -772,7 +812,19 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-Current full-suite baseline after Phase 4a: 286 passed, 1 skipped. Do not regress below this. Historical baselines: Phase 2e 162, Phase 3 217, Phase 3.5a 250, Phase 3.5b 262, Phase 3.5c 272, Phase 4a 286. The `--timeout=120` command is authoritative; database-backed tests run 20-45 seconds each due to Supabase latency.
+Current expected full-suite baseline after lesson planning and concept-scoped
+`/explain` is 294 passed, 1 skipped (287 at last full run + 5
+`/analyse-material` tests + 2 concept-scoped `/explain` tests). This estimate
+uses the original five endpoint tests. `test_analyse_material.py` also contains
+three parsing and repair tests. Focused suites were green as of the latest
+implementation commit. Full-suite verification is pending. The documentation
+session's run timed out in Windows event-loop initialization before reporting a
+test count. Record the actual count after a completed run.
+
+Historical baselines were 162 for Phase 2e, 217 for Phase 3, 250 for Phase
+3.5a, 262 for Phase 3.5b, 272 for Phase 3.5c, and 286 for Phase 4a. The
+`--timeout=120` command is authoritative. Database-backed tests run 20-45
+seconds each due to Supabase latency.
 
 `run.py` selects the bind address automatically. When `$PORT` is unset (local
 development on the developer's Windows PC), it binds `127.0.0.1:8010`. When
@@ -894,11 +946,14 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Three tracks remain, none urgent:
-
-1. **Roadmap alignment (blocking future feature work).** Two documents describe the full Stewart teaching roadmap (lesson plans, micro-tasks, evaluation engine, learner model, assistance ladder, FSRS). Both explicitly require Phase 0 alignment with the FSE and founder before implementation. Do not start any roadmap sub-phase speculatively.
-2. **Deferred engineering (unblocked, low priority).** Phase 4b streaming, Phase 4c durable callback outbox (wait for actual delivery problem), Phase 4d skipped-test investigation.
-3. **Optional follow-ups (only if FSE asks).** GET /sessions/{id}/history if the FSE needs to reload history after a page refresh.
+Two demo-critical endpoints shipped, `/analyse-material` and concept-scoped
+`/explain`. Both were verified in production via Swagger on
+`csc424-lecture-1-2027`. Await FSE demo feedback before scoping the next
+feature. Likely candidates in priority order, all requiring Phase 0
+alignment, are micro-task generation, answer and reasoning evaluation,
+assistance ladder L0-L6, and streaming `/explain`. The durable callback
+outbox is deferred until an observed delivery failure. The skipped-test
+investigation is also deferred. FSRS is explicitly the last feature per FSE.
 
 ## Deployment status
 
