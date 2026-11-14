@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 from google.genai import types
 from sqlalchemy import text
@@ -52,13 +53,65 @@ class DocumentNotFound(Exception):
     """The requested document has no ingested chunks."""
 
 
+def _extract_json_object(raw_text: str) -> dict:
+    """Extract an object from raw JSON, Markdown fences, or surrounding prose."""
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL | re.IGNORECASE):
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+    decoder = json.JSONDecoder()
+    stripped = raw_text.lstrip()
+    if stripped.startswith("["):
+        raise ValueError("Expected a lesson plan object")
+    for match in re.finditer(r"\{", stripped):
+        try:
+            data, _ = decoder.raw_decode(stripped, match.start())
+        except json.JSONDecodeError:
+            continue
+        return data
+    raise ValueError("No JSON object found in LLM response")
+
+
+def _repair_plan(plan_data: dict, max_concepts: int) -> dict:
+    """Repair common reference and optional-field defects before validation."""
+    concepts = plan_data["concepts"]
+    sections = plan_data["sections"]
+    if not isinstance(concepts, list) or not isinstance(sections, list):
+        raise ValueError("Expected concept and section lists")
+    concepts = [concept.copy() for concept in concepts[:max_concepts]]
+    valid_ids = {concept["concept_id"] for concept in concepts}
+
+    earlier_ids: set[str] = set()
+    for concept in concepts:
+        prerequisites = concept.get("prerequisite_concept_ids")
+        if isinstance(prerequisites, list) or prerequisites is None:
+            concept["prerequisite_concept_ids"] = [
+                item for item in prerequisites or [] if isinstance(item, str) and item in earlier_ids
+            ]
+        earlier_ids.add(concept["concept_id"])
+        concept.setdefault("source_chunk_ids", [])
+
+    kept_sections = []
+    for original_section in sections:
+        section = original_section.copy()
+        ids = section.get("concept_ids")
+        if isinstance(ids, list) or ids is None:
+            section["concept_ids"] = [item for item in ids or [] if isinstance(item, str) and item in valid_ids]
+            if not section["concept_ids"]:
+                continue
+        kept_sections.append(section)
+
+    return {"missing_prerequisites": [], "notes": None, **plan_data, "concepts": concepts, "sections": kept_sections}
+
+
 def _parse_plan(
     response_text: str, document_id: str, max_concepts: int, source_ids: set[str],
 ) -> LessonPlan:
-    data = json.loads(response_text)
-    if not isinstance(data, dict):
-        raise ValueError("Expected a lesson plan object")
-    plan = LessonPlan.model_validate({**data, "document_id": document_id})
+    data = _extract_json_object(response_text)
+    repaired = _repair_plan(data, max_concepts)
+    plan = LessonPlan.model_validate({**repaired, "document_id": document_id})
     if not 3 <= len(plan.concepts) <= max_concepts or not 1 <= len(plan.sections) <= 4:
         raise ValueError("Lesson plan is outside the requested concept or section limits")
 
@@ -74,6 +127,8 @@ def _parse_plan(
         if not source_ids.issuperset(concept.source_chunk_ids):
             raise ValueError("Concept cites a chunk outside the supplied material")
         earlier_ids.add(concept.concept_id)
+    if repaired["concepts"] != data["concepts"] or repaired["sections"] != data["sections"]:
+        logger.warning("lesson_plan.repaired document_id=%s", document_id)
     return plan
 
 
@@ -108,6 +163,7 @@ async def analyse_material(
             break
 
     prompt = ANALYSE_MATERIAL_PROMPT_TEMPLATE.format(chunks="".join(parts), max_concepts=max_concepts)
+    raw_text = ""
     try:
         client = create_client(settings)
         if client is None:
@@ -118,9 +174,13 @@ async def analyse_material(
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json"),
             )
-        plan = _parse_plan(response.text or "", document_id, max_concepts, source_ids)
+            raw_text = response.text or ""
+        plan = _parse_plan(raw_text, document_id, max_concepts, source_ids)
     except Exception as error:
-        logger.warning("lesson_planning.fallback error_type=%s", type(error).__name__)
+        logger.warning(
+            "lesson_plan.fallback document_id=%s error_type=%s raw_length=%s",
+            document_id, type(error).__name__, len(raw_text),
+        )
         title = chunks[0]["metadata"].get("title") or document_id
         plan = LessonPlan(
             document_id=document_id,
