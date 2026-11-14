@@ -29,7 +29,8 @@ def make_explain_router(settings: GeminiSettings) -> APIRouter:
             response = await explain(
                 question=body.question, course_offering_id=body.course_offering_id,
                 week=body.week, settings=settings, database=database, attachment_ids=body.attachment_ids,
-                session_id=body.session_id,
+                session_id=body.session_id, concept_id=body.concept_id,
+                concept_description=body.concept_description,
             )
             marker = "[AI-GENERATED EXAMPLE]"
             _, found, following = response.answer.partition(marker)

@@ -59,6 +59,8 @@ class ExplainRequest(BaseModel):
     week: int = Field(..., ge=1)
     attachment_ids: list[str] = Field(default_factory=list)
     session_id: str = ""
+    concept_id: str = ""
+    concept_description: str = ""
 
 
 class ChatMessage(BaseModel):

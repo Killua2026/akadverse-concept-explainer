@@ -88,8 +88,8 @@ def seeded(storage_session, monkeypatch, configured):
 
 
 async def post(app, *, question="Explain the topic", week=1, offering="offering", token="test-secret",
-               attachment_ids=None, session_id=None):
-    body = {"question": question, "week": week, "course_offering_id": offering}
+               attachment_ids=None, session_id=None, **concept_fields):
+    body = {"question": question, "week": week, "course_offering_id": offering, **concept_fields}
     if attachment_ids is not None:
         body["attachment_ids"] = attachment_ids
     if session_id is not None:
@@ -120,7 +120,39 @@ async def test_explain_valid_answer_with_sources(configured, seeded):
     assert kwargs["config"].temperature == 0.3
     context = "\n\n".join(f"--- Source: {name} ---\n{name}" + " course material " * 30
                             for name in ["exact", "diagonal", "half"])
-    assert kwargs["contents"] == retrieval.EXPLAIN_PROMPT_TEMPLATE.format(context=context, question="Explain the topic")
+    assert kwargs["contents"] == retrieval.EXPLAIN_PROMPT_TEMPLATE.format(
+        context=context, question="Explain the topic", concept_scope_block="",
+    )
+
+
+@pytest.fixture
+def concept_prompt_app(configured, monkeypatch):
+    configured.app.state.ingest_database = object()
+    monkeypatch.setattr(retrieval, "_query_chunks", AsyncMock(return_value=(1, 1, [{
+        "document_id": "lecture", "content": "Two resistors in series.",
+        "metadata": {"title": "Lecture", "material_type": "NOTES"},
+    }])))
+    return configured
+
+
+@pytest.mark.anyio
+async def test_explain_concept_scoped_prompt(concept_prompt_app):
+    response = await post(concept_prompt_app.app, concept_id="concept-3", concept_description="Voltage division")
+
+    assert response.status_code == 200
+    prompt = concept_prompt_app.generate.await_args.kwargs["contents"]
+    assert "currently learning a specific concept" in prompt
+    assert "Voltage division" in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_no_concept_scope_preserves_prompt(concept_prompt_app):
+    response = await post(concept_prompt_app.app)
+
+    assert response.status_code == 200
+    prompt = concept_prompt_app.generate.await_args.kwargs["contents"]
+    assert "currently learning a specific concept" not in prompt
+    assert "Two resistors in series.\n\nStudent's question: Explain the topic" in prompt
 
 
 @pytest.mark.anyio
