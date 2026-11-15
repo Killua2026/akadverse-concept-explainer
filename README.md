@@ -37,6 +37,7 @@ The intended caller is the Next.js backend, not a browser client.
 | `POST /generate-example-tasks` | Implemented: decomposes a worked example into ordered interactive student tasks (multiple-choice, text, number, step responses) with expected answers and evaluation criteria |
 | `POST /evaluate-practice` | Implemented: LLM-graded answer and reasoning evaluation with misconception diagnosis; DB-free, returns 200 with `needs_review=true` on degraded fallback |
 | `POST /generate-practice` | Implemented: independent-practice question generation, source-grounded, solution hidden from student until submission; distinct from guided `/generate-example-tasks` |
+| `POST /generate-revision-questions` | Implemented: generates revision questions from a taught concept and submits them to FSE's `/webhooks/tutor/questions` via HMAC-SHA256; requires `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the deployed service |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -59,6 +60,7 @@ not change the committed job status or roll back chunks.
   - [Generate example tasks](#post-generate-example-tasks)
   - [Evaluate practice](#post-evaluate-practice)
   - [Generate practice](#post-generate-practice)
+  - [Generate revision questions](#post-generate-revision-questions)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
@@ -758,6 +760,64 @@ when the ingest database is unavailable or the service runs in developer mode.
 
 Expected latency is 8-25 seconds.
 
+### POST /generate-revision-questions
+
+Generates revision questions from a taught concept and submits them to FSE's `/webhooks/tutor/questions` webhook with HMAC-SHA256 auth. This endpoint completes the revision-question-bank loop: FSE detects a passed teaching stage, calls us, we generate, we submit, FSE persists and returns IDs, we return the combined result to FSE's original call.
+
+Stateless and DB-free. FSE owns persistence, semantic dedup, embeddings, FSRS scheduling, student cards, and review logs. We own generation, wire-format transformation, and HMAC submission.
+
+Flow:
+
+```
+FSE stage tracker (student passed) -> POST /generate-revision-questions
+ -> Gemini generates 1-5 questions
+ -> HMAC-signed POST to FSE_WEBHOOK_URL
+ -> FSE persists, dedups, creates FSRS cards, returns results[]
+ -> Service returns GenerateRevisionQuestionsResponse to FSE's original call
+```
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as other authenticated endpoints.
+
+Request from FSE:
+
+```json
+{
+  "teaching_event_id": "teach_9f31...",
+  "student_id": "stu_123",
+  "concept_id": "con_concept-4",
+  "concept_description": "The classification of data flow directions...",
+  "taught_summary": "Half-duplex allows bidirectional communication but only one side transmits at a time.",
+  "subject": "Data Communication",
+  "curriculum": "WAEC",
+  "level": "SS2",
+  "topic": "Modes of Data Transmission",
+  "language": "en",
+  "max_questions": 3,
+  "question_types": ["short_answer", "mcq", "true_false"]
+}
+```
+
+Required: `teaching_event_id`, `student_id`, `concept_id`, `concept_description`, `taught_summary`, `subject`. `taught_summary` is capped at 2,000 characters. `curriculum`, `level`, `topic` default to empty. `language` defaults to `"en"`. `max_questions` defaults to 3, accepts 1-5. `question_types` defaults to `["short_answer"]`; allowed values are `mcq`, `short_answer`, `true_false`.
+
+Response to FSE:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `teaching_event_id` | string | Echo of the request's ID |
+| `generated_count` | int | Number of questions we generated and attempted to submit |
+| `webhook_attempted` | bool | `true` if we called FSE's webhook, `false` on generation failure or missing config |
+| `webhook_status` | enum | `processed` \| `accepted_async` \| `failed_permanent` \| `failed_transient` \| `not_attempted` |
+| `webhook_results` | array | FSE's `results[]` array echoed verbatim when `webhook_status` is `processed` or `accepted_async`; empty list otherwise |
+| `needs_review` | bool | `true` on any degraded state; `false` only when `webhook_status="processed"` AND all questions returned a non-rejected outcome AND at least one result present |
+| `error_detail` | string \| null | Short sanitized reason on degraded states; never includes URL, secret, signature, or response body |
+
+`needs_review` semantics for FSE:
+
+- `false`: safe to treat results as canonical. Use `webhook_results` to attach FSRS cards.
+- `true` with `webhook_status="processed"` and results present but one or more `rejected_invalid`: FSE processed the batch but rejected some questions. Use only the non-rejected results; do not retry the batch.
+- `true` with `webhook_status in {"failed_permanent", "failed_transient"}`: our submission to your webhook failed. Question IDs not available. Consider re-firing the endpoint after investigating (same `teaching_event_id` gets a new `Idempotency-Key` value only if you generate a new teaching event; same event reuses the same key).
+- `true` with `webhook_status="not_attempted"`: generation failed before submission. No questions exist. Retry after a minute or investigate our logs.
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -787,6 +847,8 @@ Expected latency is 8-25 seconds.
    `reasoning_feedback`, and any diagnosed misconceptions. When
    `needs_review` is `true`, flag the attempt for review and pause automatic
    routing. Otherwise, use `recommended_next_step` to select the next step.
+
+Note: `/generate-revision-questions` is built and tested against stubs but is not part of the current demo walkthrough. Its end-to-end flow requires FSE's `/webhooks/tutor/questions` handler to be live. The demo uses `/generate-practice` and `/evaluate-practice` for the teaching loop.
 
 ### Attachments
 
@@ -1063,6 +1125,123 @@ Run these from your backend environment.
    `chunks_available > 0`, the material does not cover the question: route to
    `/explain-with-grounding` as a fallback and show the student the source-type
    difference (course material versus Google Search grounding).
+
+### Revision question bank integration
+
+The `/generate-revision-questions` endpoint requires two environment variables on our deployed service before it will function:
+
+| Variable | Value | Provider |
+| --- | --- | --- |
+| `FSE_WEBHOOK_URL` | Full URL to your `/webhooks/tutor/questions` endpoint | FSE, out of band |
+| `FSE_WEBHOOK_SECRET` | Shared HMAC-SHA256 signing secret | FSE, out of band |
+
+Until both are set on the Railway service, every call returns `503 {"detail": "Revision submission is not configured."}`. This is intentional: the endpoint is inert until configured. Confirm with the AI team when both are provisioned.
+
+#### What we POST to your webhook
+
+We sign and submit to `FSE_WEBHOOK_URL` with HMAC-SHA256. This is a different auth mechanism than our existing ingestion callbacks, which use `Authorization: Bearer <AI_SERVICE_CALLBACK_SECRET>`. Do not reuse the Bearer pattern for this webhook.
+
+Headers:
+
+```
+Content-Type: application/json
+X-Akadverse-Signature: <hex HMAC-SHA256 of body bytes with FSE_WEBHOOK_SECRET>
+X-Akadverse-Timestamp: <UTC ISO-8601, e.g. 2026-11-15T10:42:00.123456+00:00>
+Idempotency-Key: teach_<teaching_event_id>
+```
+
+Signature verification on your side:
+
+1. Read the raw request body bytes.
+2. Compute `hmac.new(FSE_WEBHOOK_SECRET.encode("utf-8"), raw_body_bytes, hashlib.sha256).hexdigest()`.
+3. Compare with `X-Akadverse-Signature` using constant-time comparison.
+4. Reject if `X-Akadverse-Timestamp` is older than 5 minutes.
+
+Body (matches your spec §6.3):
+
+```json
+{
+  "event_id": "<fresh UUID we generate per submission>",
+  "teaching_event_id": "<echoed from your request>",
+  "student_id": "<echoed>",
+  "occurred_at": "<our generation time, UTC ISO-8601>",
+  "context": {
+    "subject": "<echoed>",
+    "curriculum": "<echoed>",
+    "level": "<echoed>",
+    "topic": "<echoed>",
+    "concept_id": "<echoed>",
+    "concept_title": "<echoed from concept_description>",
+    "language": "<echoed>"
+  },
+  "taught_summary": "<echoed>",
+  "questions": [
+    {
+      "client_ref": "q1",
+      "type": "mcq",
+      "stem": "...",
+      "options": [{"key": "A", "text": "..."}, ...],
+      "correct_answer": "A",
+      "explanation": "...",
+      "difficulty_estimate": 0.5,
+      "bloom_level": "understand",
+      "tags": []
+    }
+  ]
+}
+```
+
+Specific alignment notes:
+
+- `event_id` is our UUID4, fresh per submission. Use it for our-side traceability.
+- `occurred_at` is our generation time, not your request time.
+- `concept_title` is our internal name; we populate it from your `concept_description` field. Your spec calls the field `concept_title` on the wire, we carry `concept_description` inbound. Same value, two names.
+- `client_ref` is `q1`, `q2`, etc., sequential per submission, stable within the retry window.
+- `correct_answer` for `true_false` is a Boolean (`true`/`false`), not a string. For `mcq`, it is the option key letter. For `short_answer`, it is the exact correct string.
+- For `short_answer` questions, we include `accepted_answers` (list, possibly empty) at the top level of the question object as a sibling to `correct_answer`.
+
+Retries: we attempt the webhook up to 3 times with delays of 0s, 1s, 4s. The body, signature, timestamp, and `Idempotency-Key` are byte-identical across retries. Our retry window is ~5 seconds total, well within your 5-minute freshness check. If your webhook returns the same `Idempotency-Key` twice with the same body, return the original response unchanged per your spec §6.6.
+
+We do not retry on 400, 401, 409, or any other 4xx. We retry on 429, 5xx, timeouts, request errors, and malformed 200/202 bodies.
+
+Response we expect back (your §6.5):
+
+```json
+{
+  "status": "processed",
+  "event_id": "...",
+  "results": [
+    {
+      "client_ref": "q1",
+      "question_id": "qst_8a21...",
+      "outcome": "created",
+      "similarity": null,
+      "student_card_id": "card_77c..."
+    }
+  ]
+}
+```
+
+We treat these as success:
+- HTTP 200 with body `status="processed"` (must be exact string match)
+- HTTP 202 with any valid JSON object body
+
+We treat everything else as failure per the retry rules above.
+
+Latency and timeout budget for FSE:
+
+- Our full round-trip: 8-18 seconds typical (Gemini generation 5-15s + your webhook 3s target).
+- Worst case: ~30 seconds if Gemini is slow and your webhook retries internally.
+- Set the timeout on your call to `/generate-revision-questions` to at least 30 seconds.
+- Do not set 3 seconds — that is your webhook target, not the full loop.
+
+End-to-end integration checklist for FSE:
+
+1. Deploy `/webhooks/tutor/questions` with HMAC-SHA256 signature verification and timestamp freshness check.
+2. Provision `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the AI service (Railway env vars).
+3. Confirm `question_types` v1 = `mcq`, `short_answer`, `true_false` (drop `fill_blank`, `numeric`, `step` from v1 scope).
+4. Set your timeout on calls to `/generate-revision-questions` to 30s minimum.
+5. Trigger a manual call with a synthetic `teaching_event_id`. Verify signature passes, timestamp is fresh, body shape matches §6.3, and your response returns `status="processed"` with `results[]` populated.
 
 ### Do not
 
@@ -1383,8 +1562,8 @@ Callbacks to `https://akadverse.vercel.app/api/webhooks/ai-ingest` returned 200 
 Exchange secrets privately. Production deployment remains a separate decision.
 
 Attachments, chat history, AI-generated worked examples, lesson planning,
-concept-scoped explanations, interactive micro-tasks, practice evaluation, and independent practice
-generation are complete. The remaining deferred items are the skipped concurrency test
+concept-scoped explanations, interactive micro-tasks, practice evaluation, independent practice
+generation, and revision question generation (pending FSE webhook deployment) are complete. The remaining deferred items are the skipped concurrency test
 investigation, the durable callback outbox (only when an actual delivery
 problem is observed), streaming `/explain` responses, and the full Stewart
 teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration)
