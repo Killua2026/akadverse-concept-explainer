@@ -246,3 +246,30 @@ class GenerateRevisionQuestionsResponse(BaseModel):
     webhook_results: list[dict] = Field(default_factory=list)
     needs_review: bool
     error_detail: str | None = Field(default=None, max_length=200)
+
+
+class GenerateHintRequest(BaseModel):
+    concept_id: str = Field(..., min_length=1)
+    concept_description: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+    expected_answer: str = Field(..., min_length=1)
+    evaluation_criteria: list[str] = Field(default_factory=list)
+    student_attempt: str = Field(..., min_length=1)
+    target_level: int = Field(..., ge=1, le=6)
+    previous_hints: list[str] = Field(default_factory=list)
+
+
+class GenerateHintResponse(BaseModel):
+    level_given: int
+    hint_type: Literal[
+        "L1_METACOGNITIVE",
+        "L2_DIRECTIONAL",
+        "L3_CONCEPT_REMINDER",
+        "L4_ANALOGOUS_EXAMPLE",
+        "L5_PARTIAL_SOLUTION",
+        "L6_FULL_SOLUTION",
+        "NO_HINT",
+    ]
+    hint_content: str
+    rationale: str
+    needs_review: bool
