@@ -119,6 +119,7 @@ from routes.grounding import make_grounding_router
 from routes.explain import make_explain_router
 from routes.lesson_planning import make_lesson_planning_router
 from routes.example_tasks import make_example_tasks_router
+from routes.practice_evaluation import make_practice_evaluation_router
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
@@ -249,6 +250,7 @@ app.include_router(documents_router)
 app.include_router(make_attachments_router())
 app.include_router(make_lesson_planning_router(gemini_settings))
 app.include_router(make_example_tasks_router(gemini_settings))
+app.include_router(make_practice_evaluation_router(gemini_settings))
 
 
 @app.middleware("http")
