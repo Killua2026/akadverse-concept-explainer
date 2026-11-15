@@ -26,8 +26,13 @@ and you should surface the conflict to the developer before proceeding.
 
 ## Current phase
 
-**Phase 4a: Conversation history and labeled worked examples.** Legacy endpoints were retired in Phase 2e.
-Grounding uses the existing shared-secret authentication dependency.
+**Phase 4a plus demo-focused teaching slice.** Conversation history and labeled worked
+examples remain the last formally named phase, extended with a demo-focused
+teaching slice: `/analyse-material`, concept-scoped `/explain`,
+`/generate-example-tasks`, and `/evaluate-practice`. Legacy endpoints were
+retired in Phase 2e. Grounding uses the existing shared-secret authentication
+dependency. Phase 0 alignment with FSE and founder is still required before
+the remaining Phase 5 items (assistance ladder, learner model, FSRS) can start.
 
 Status:
 
@@ -42,6 +47,7 @@ Status:
 - [x] Lesson planning: POST /analyse-material (structured plan generation from ingested chunks, 80k character cap, fallback on LLM failure)
 - [x] Concept-scoped /explain: optional `concept_id` and `concept_description` fields (prompt-level scoping)
 - [x] Example tasks: POST /generate-example-tasks (worked example + interactive micro-tasks, 30k char cap, single-task fallback)
+- [x] Practice evaluation: POST /evaluate-practice (LLM-graded answer and reasoning with misconception diagnosis, DB-free, guarded degraded fallback with needs_review=true)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -198,6 +204,64 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
 - The source prompt has a 30,000-character cap and a 5,000-character cap per
   chunk. Truncation can omit a source example and yield an AI-generated one.
 - `concept_description` drives task quality. Pass the concept's `description` from `/analyse-material` verbatim in the FSE integration. Vague descriptions produce vague tasks, while specific descriptions produce concrete, checkable tasks. Both pass validation.
+
+### Practice evaluation (current)
+
+- `POST /evaluate-practice` grades a student's answer and reasoning against
+  the `expected_answer` and `evaluation_criteria` produced by
+  `/generate-example-tasks`. The service module is
+  `services/practice_evaluation.py`; the route is
+  `routes/practice_evaluation.py`; models are
+  `EvaluatePracticeRequest`, `EvaluatePracticeResponse`, and `Misconception`
+  in `models.py`.
+- The service signature is
+  `evaluate_practice(settings, *, concept_id, concept_description, question,
+  expected_answer, evaluation_criteria, student_answer, student_reasoning,
+  response_type) -> EvaluatePracticeResponse`. There is no `database`
+  parameter. The endpoint is DB-free by design and does not read from
+  `concept_explainer.chunks`.
+- Generation uses `settings.model_names[0]` at `temperature=0.1` with
+  `response_mime_type="application/json"` and a `response_schema` derived
+  from a private `_EvaluationResult` model. The schema attempt is followed
+  by a plain generation retry (schema written into the prompt) on failure,
+  matching the pattern in `services/example_tasks.py`. `_extract_json_object`
+  is a local copy in `services/practice_evaluation.py` per the project's
+  one-copy-per-service convention.
+- The route's only 503 guard is `not settings.use_enterprise and not
+  settings.google_api_key`. There is no `database is None` check, no
+  database access, and no migration. Enterprise mode is guaranteed valid at
+  request time because `gemini_settings.validate()` runs in lifespan.
+- Any LLM, schema, validation, or parse failure returns HTTP 200 with a
+  degraded payload: `answer_correct=false`, `reasoning_quality="absent"`,
+  `evidence_strength="insufficient"`, `needs_review=true`,
+  `recommended_next_step="reinforce"`, empty `misconceptions`, and explanatory
+  fallback strings in `answer_feedback` and `reasoning_feedback`. The
+  concept_id is echoed from the request. The degraded path never returns 5xx.
+- `needs_review: bool` on `EvaluatePracticeResponse` is a required field
+  with no default. This intentionally diverges from
+  `ExampleTask.required: bool = True` in the sibling endpoint: defaulting
+  `needs_review` to false would silently mark degraded output as review-free,
+  which is unsafe for a grading UI. Pydantic raises ValidationError when
+  the LLM omits it, which triggers the degraded fallback path with
+  `needs_review=true`.
+- The fallback handler protects the `response.parsed` and
+  `response.candidates[0].finish_reason` reads with a try/except that logs
+  `evaluate_practice.response_read_failed` and defaults `parsed_present` and
+  `finish_reason` to safe values. Without this guard, a failure while reading
+  response metadata inside the `except Exception` block would escape and
+  produce a 500. When fixing the equivalent pattern in
+  `services/example_tasks.py:236-249` post-demo, mirror this guard.
+- The prompt instructs the LLM to treat the student's answer and reasoning as
+  data, not instructions, matching the injection-defense line used in
+  `services/example_tasks.py` and `services/lesson_planning.py`. Schema
+  validation constrains the response shape but cannot verify the judgment;
+  prompt injection risk is accepted for the demo and is a post-demo
+  hardening item.
+- `recommended_next_step="progress"` with `reasoning_quality="absent"` is
+  valid: a correct answer with no submitted reasoning still passes
+  `needs_review=false` and routes to `"progress"`. The FSE should check
+  `reasoning_quality` separately when gating reasoning-driven advancement.
+  This behavior is intentional and documented in the prompt.
 
 ### Concept-scoped /explain
 
@@ -720,6 +784,7 @@ akadverse-concept-explainer/
 |   |-- explain.py                # POST /explain (Phase 3)
 |   |-- lesson_planning.py        # POST /analyse-material
 |   |-- example_tasks.py          # POST /generate-example-tasks
+|   |-- practice_evaluation.py    # POST /evaluate-practice
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -738,6 +803,7 @@ akadverse-concept-explainer/
 |   |-- retrieval.py              # Course-scoped RAG and attachment merging (Phase 3, 3.5)
 |   |-- lesson_planning.py        # Generate structured plans from ingested chunks
 |   |-- example_tasks.py          # Worked examples and interactive tasks
+|   |-- practice_evaluation.py    # Answer and reasoning evaluation with misconception diagnosis
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -764,6 +830,7 @@ akadverse-concept-explainer/
 |   |-- test_explain.py           # Retrieval and attachment tests (Phase 3, 3.5)
 |   |-- test_analyse_material.py  # Lesson planning endpoint tests
 |   |-- test_example_tasks.py     # Worked-example task endpoint tests
+|   |-- test_practice_evaluation.py  # Practice evaluation endpoint tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -844,8 +911,11 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-The planning estimate after `/generate-example-tasks` is 300 passed, 1 skipped.
-The previous baseline of 294 and the 6 new example-task tests account for 300.
+Focused run after `/evaluate-practice`: 9 passed (7 new practice-evaluation
+test cases plus the existing `test_refactor.py::test_main_app_has_all_expected_routes`).
+Full-suite projection: 312 collected / 311 passed + 1 skipped. Pending
+developer verification at end of session; record the actual count after
+a completed run.
 The route-set update changes an existing test. Focused suites passed. Full-suite
 verification is pending. Record the actual count after a completed run.
 
@@ -885,6 +955,28 @@ cannot reach `127.0.0.1` inside the container.
   malformed-input test
 - **DB tests:** use a separate test schema and roll it back in a fixture.
   Never run tests against the production `concept_explainer` schema
+
+### Deferred post-demo cleanup
+
+The following are out of scope for the `/evaluate-practice` commit and will
+be addressed in a single post-demo cleanup pass:
+
+- Apply the guarded metadata-read pattern from
+  `services/practice_evaluation.py` to the fallback handler in
+  `services/example_tasks.py:236-249`. The same latent unguarded-`parsed`-read
+  exists there and is reachable on schema-retry failure.
+- Parametrize `test_evaluate_practice_parsed_read_failure_returns_degraded`
+  over `ValueError` in addition to `AttributeError`. The Google SDK's
+  `response.parsed` property raises ValueError (or `json.JSONDecodeError`,
+  which subclasses it) on unparseable text, not AttributeError. The test
+  as written still verifies the guard but does not exercise the SDK's real
+  failure mode.
+- Remove the unused `MODEL_PRIORITY_ORDER` import in
+  `services/gemini_provider.py:9`. The module-level priority list actually
+  used is `ENTERPRISE_MODEL_PRIORITY`, defined inline at lines 13-18.
+- Replace pre-rule `print()` calls in `services/model_discovery.py` (three)
+  and `main.py` (two) with `logging` calls, per the AGENTS.md "no `print()`"
+  rule.
 
 ## Code Quality and Maintainability
 
@@ -974,15 +1066,15 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Three roadmap endpoints shipped and were verified on `csc424-lecture-1-2027`:
-`/analyse-material`, concept-scoped `/explain`, and
-`/generate-example-tasks`. Await FSE feedback on the interactive-tasks demo
-before scoping the next feature. The likely next endpoint is
-`/evaluate-practice` for answer and reasoning evaluation with misconception
-diagnosis in PRACTICE mode. The assistance ladder L0-L6 and streaming
-`/explain` follow. The durable callback outbox remains deferred until an
-observed delivery failure. The skipped-test investigation is deferred. FSRS
-is last per FSE.
+Four teaching-stage endpoints shipped and were verified on
+`csc424-lecture-1-2027`: `/analyse-material`, concept-scoped `/explain`,
+`/generate-example-tasks`, and `/evaluate-practice`. Await FSE feedback on
+the full teaching loop (plan, explain, practice, evaluate) before scoping the
+next feature. The likely next items are the assistance ladder L0-L6 and the
+learner model, but neither starts until FSE demo reaction lands. The durable
+callback outbox remains deferred until an observed delivery failure. The
+skipped-test investigation is deferred. Streaming `/explain` remains deferred.
+FSRS is last per FSE.
 
 ## Deployment status
 
