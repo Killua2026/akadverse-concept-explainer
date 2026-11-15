@@ -49,6 +49,7 @@ Status:
 - [x] Example tasks: POST /generate-example-tasks (worked example + interactive micro-tasks, 30k char cap, single-task fallback)
 - [x] Practice evaluation: POST /evaluate-practice (LLM-graded answer and reasoning with misconception diagnosis, DB-free, guarded degraded fallback with needs_review=true)
 - [x] Practice generation: POST /generate-practice (independent-practice question generation, distinct from guided /generate-example-tasks, DB-backed, solution hidden from student until submission)
+- [x] Revision questions: POST /generate-revision-questions (generates revision questions from taught_summary and submits to FSE's /webhooks/tutor/questions via HMAC-SHA256; DB-free, requires FSE_WEBHOOK_URL and FSE_WEBHOOK_SECRET env vars; end-to-end blocked on FSE webhook deployment)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -315,6 +316,105 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   `question_text` (and `options` for MC) before submission. `question_text`
   reads as an exam question, not a stepwise solution. This is the primary
   quality signal to verify when the prompt is ever changed.
+
+### Revision questions (current)
+
+- `POST /generate-revision-questions` produces 1-5 revision questions from a
+  taught concept and submits them to FSE's `/webhooks/tutor/questions` with
+  HMAC-SHA256 auth. Completes the loop topology: FSE detects a passed teaching
+  stage, calls us, we generate, we sign and submit, FSE persists, dedups,
+  creates FSRS cards, returns question_ids, we return the combined result to
+  FSE's original call.
+- Service modules: `services/revision_questions.py` (generation + wire-format
+  transform), `services/revision_submission.py` (HMAC signing + retry + POST).
+  Route: `routes/revision_questions.py`. Models: `GenerateRevisionQuestionsRequest`,
+  `GenerateRevisionQuestionsResponse` in `models.py`.
+- DB-free. No `database` parameter. No migration. No worker. No persistence.
+  FSE owns question_bank, question_embeddings, student_cards, review_logs.
+  Our role is a stateless producer.
+- Request carries: `teaching_event_id`, `student_id` (echoed only; we do not
+  act on it), `concept_id`, `concept_description`, `taught_summary` (max 2,000
+  chars), `subject`, `curriculum`, `level`, `topic`, `language`,
+  `max_questions` (1-5), `question_types` (list of `mcq`, `short_answer`,
+  `true_false`).
+- Generation uses `settings.model_names[0]` at `temperature=0.3` with
+  `response_mime_type="application/json"` and a `response_schema` derived from
+  a private `_RevisionBundleLLM` model. Schema-attempt failure triggers a
+  plain-generation retry with schema in prompt, matching siblings.
+  `_extract_json_object` is a local copy per the one-copy-per-service convention.
+- `_repair_questions` drops candidates where: stem < 10 or > 500 chars,
+  explanation empty, type not in allowed set, stem contains "passage",
+  "as I said earlier", or "above" (case-insensitive, per FSE's self-contained
+  rule), or type-specific answer missing. For mcq: requires 3-5 nonempty
+  options and valid 0-indexed correct_option_index. For true_false: requires
+  correct_bool. For short_answer: requires correct_text. Survivors get
+  sequential `client_ref` as `q1`, `q2`, etc.
+- Wire format transformation to FSE's §6.3 shape: mcq options become
+  `[{"key": "A"/"B"/..., "text": ...}]` with correct_answer as the letter;
+  true_false correct_answer is Boolean; short_answer correct_answer is the
+  string, with accepted_answers as a sibling list.
+- `concept_description` inbound maps to `context.concept_title` outbound.
+  Same value, two names. Do not surface this as a bug; it is intentional per
+  FSE's wire-format naming.
+- HMAC signing: `hmac.new(webhook_secret.encode("utf-8"), body_bytes,
+  hashlib.sha256).hexdigest()` where `body_bytes` is
+  `json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")`.
+  Deterministic serialization is load-bearing: same payload must produce same
+  bytes on retry. Sign ONCE, reuse signature + timestamp + body + Idempotency-Key
+  across all 3 retry attempts. Retry window is ~5s, well within FSE's 5-minute
+  freshness check.
+- Outbound POST MUST use `content=body_bytes`, NOT `json=payload`. httpx's
+  `json=` re-serializes internally, changing bytes and breaking the signature.
+  This is the single most important implementation detail in
+  `services/revision_submission.py`.
+- Retry policy: 3 attempts, delays 0s/1s/4s. Retry on 429, 5xx, timeouts,
+  httpx.RequestError, and malformed 200/202 bodies. Do NOT retry on 400, 401,
+  409, or other 4xx. HTTP 200 requires valid JSON dict with `status="processed"`
+  exact string; HTTP 202 requires valid JSON dict; malformed bodies retry as
+  transient; HTTP 200 with unexpected `status` returns `failed_permanent`
+  without retry.
+- New outbound auth pattern. Existing callbacks (`services/callback.py`) use
+  `Authorization: Bearer`. Revision webhook uses HMAC-SHA256 over the body.
+  Different mechanism, different threat model. DO NOT share code with
+  `services/callback.py`.
+- `needs_review: bool` has NO default. Service sets it explicitly on every
+  return path. `False` requires ALL of: `webhook_status="processed"` AND
+  `len(webhook_results) >= 1` AND no result has `outcome="rejected_invalid"`.
+  All other cases return `True`. Any relaxation must be deliberate, not a
+  quiet default.
+- Degraded states:
+  - Generation failure or repair rejection: `webhook_attempted=false`,
+    `webhook_status="not_attempted"`, `generated_count=0`,
+    `needs_review=true`, `error_detail="generation failed"`.
+  - Webhook 4xx (permanent): `webhook_attempted=true`,
+    `webhook_status="failed_permanent"`, `generated_count=N`,
+    `needs_review=true`, `error_detail="webhook rejected payload"`.
+  - Webhook exhaustion after 3 retries: `webhook_status="failed_transient"`,
+    `needs_review=true`, `error_detail="webhook failed after 3 attempts"`.
+  - Fallback NEVER returns 5xx. Only 401 (auth) and 503 (missing config or
+    no LLM provider) can occur outside 200.
+- `error_detail` capped at 200 chars, sanitized. Never includes webhook URL,
+  secret, signature, or response body.
+- New environment variables required at request time (not startup):
+  - `FSE_WEBHOOK_URL`: full URL to FSE's `/webhooks/tutor/questions`.
+  - `FSE_WEBHOOK_SECRET`: shared HMAC-SHA256 signing secret.
+  If either is blank or absent, the route returns `503 {"detail": "Revision
+  submission is not configured."}`. This is correct behavior; the endpoint is
+  inert until configured. Do not add startup health probes for these.
+- `question_types` v1 scope: `mcq`, `short_answer`, `true_false` only.
+  `fill_blank`, `numeric`, and `step` are deferred. If a broader set is
+  requested later, update the schema Literal and the wire-format transform.
+- Integration status: end-to-end blocked on FSE deploying their
+  `/webhooks/tutor/questions` handler. All 17 new test executions use
+  `httpx.MockTransport` for the outbound; they verify our side is correct,
+  but production integration requires FSE's handler to be live. Once FSE
+  confirms deployment and provides `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET`,
+  run one manual call with a synthetic `teaching_event_id` to verify signature
+  acceptance and response parsing. That is the true integration smoke test.
+- FSE has agreed to HMAC (not Bearer) for this webhook. FSE has NOT yet
+  confirmed: webhook endpoint live, URL value, secret value, latency budget
+  acceptance (30s on their call, not 3s), or question_types v1 scope. These
+  are the outstanding FSE confirmations before integration testing.
 
 ### Concept-scoped /explain
 
@@ -803,6 +903,8 @@ synchronous discovery once; `lifespan()` validates the selected provider.
 | `AI_SERVICE_CALLBACK_SECRET` | Bearer secret for outbound callbacks, loaded into CallbackSettings | Required for ingestion |
 | `AI_SERVICE_CALLBACK_ALLOWED_HOSTS` | Comma-separated exact callback hostnames; explicitly list local development exceptions; no wildcards | Required for ingestion |
 | `WORKER_COUNT` | Ingestion worker tasks, default `1`; restart required after change | Optional |
+| `FSE_WEBHOOK_URL` | FSE revision webhook endpoint; required for /generate-revision-questions; blank or absent returns 503 | Required for revision |
+| `FSE_WEBHOOK_SECRET` | HMAC-SHA256 signing secret for revision webhook; required for /generate-revision-questions; blank or absent returns 503 | Required for revision |
 
 In Enterprise mode `main.configure_ingestion` checks `DATABASE_URL`,
 `AI_SERVICE_API_KEY`, `AI_SERVICE_CALLBACK_SECRET`, then
@@ -811,6 +913,9 @@ In Enterprise mode `main.configure_ingestion` checks `DATABASE_URL`,
 workers do not start. The allowlist must contain a non-empty entry, not only
 commas/whitespace. Database probing/recovery failures disable ingestion as
 unreachable. Grounding uses shared-secret authentication without ingestion readiness gates.
+`FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` are checked at request time on
+`/generate-revision-questions`, not at startup; missing values return 503
+without affecting any other endpoint.
 
 Do not read or log secret values or inspect the user's `.env`. Do not commit
 `.env` or credential files. Rotate the previously shared callback secret
@@ -839,6 +944,7 @@ akadverse-concept-explainer/
 |   |-- example_tasks.py          # POST /generate-example-tasks
 |   |-- practice_evaluation.py    # POST /evaluate-practice
 |   |-- practice_generation.py    # POST /generate-practice
+|   |-- revision_questions.py     # POST /generate-revision-questions
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -859,6 +965,8 @@ akadverse-concept-explainer/
 |   |-- example_tasks.py          # Worked examples and interactive tasks
 |   |-- practice_evaluation.py    # Answer and reasoning evaluation with misconception diagnosis
 |   |-- practice_generation.py    # Independent practice question generation
+|   |-- revision_questions.py     # Revision question generation and FSE webhook submission
+|   |-- revision_submission.py    # HMAC-SHA256 signing and POST to FSE webhook
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -887,6 +995,8 @@ akadverse-concept-explainer/
 |   |-- test_example_tasks.py     # Worked-example task endpoint tests
 |   |-- test_practice_evaluation.py  # Practice evaluation endpoint tests
 |   |-- test_practice_generation.py  # Practice generation endpoint tests
+|   |-- test_revision_questions.py   # Revision generation endpoint tests
+|   |-- test_revision_submission.py  # HMAC client and retry tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -967,8 +1077,15 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-Verified full-suite baseline after `/evaluate-practice`: 311 passed, 1 skipped,
-1 warning in 31:36 (312 collected). This confirms the prior projection.
+Verified full-suite baselines:
+- After `/evaluate-practice`: 311 passed, 1 skipped, 1 warning in 31:36
+  (312 collected).
+- After `/generate-practice`: 320 passed, 1 skipped, 1 warning (321 collected).
+
+Focused run after `/generate-revision-questions`: 18 passed (7 submission
++ 10 generation + 1 refactor). Full-suite projection after this commit:
+337 passed + 1 skipped / 338 collected. Pending developer verification at
+end of session.
 
 Focused run after `/generate-practice`: 10 passed (9 new practice-generation
 test executions plus the existing
@@ -1123,12 +1240,30 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Five teaching-stage endpoints shipped and were verified on
+Six teaching-stage endpoints shipped and were verified on
 `csc424-lecture-1-2027`: `/analyse-material`, concept-scoped `/explain`,
-`/generate-example-tasks` (guided), `/generate-practice` (independent), and
-`/evaluate-practice` (grading). The full learning progression is now
-demonstrable end-to-end: analyse → explain → guided example → independent
-practice → evaluate → adaptive next action.
+`/generate-example-tasks` (guided), `/generate-practice` (independent),
+`/evaluate-practice` (grading), and `/generate-revision-questions` (FSE
+webhook producer). The full learning loop is demonstrable end-to-end.
+
+Outstanding FSE dependencies:
+- `POST /webhooks/tutor/questions` must be deployed on FSE's side with
+  HMAC-SHA256 verification per their revision bank spec §6.2.
+- FSE must provision `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the
+  Railway service.
+- FSE must confirm question_types v1 scope (recommend mcq, short_answer,
+  true_false only).
+- FSE must confirm the 30s timeout budget on their call to us (their 3s
+  target is their webhook, not the full loop).
+
+Pre-Phase-0 items still open: `/generate-hint` (assistance ladder L1-L6)
+is not yet built; the Phase 0 audit (vocabulary reconciliation, request
+envelope, stable concept IDs, student context snapshot) remains blocked
+on FSE availability after demo.
+
+Deferred items unchanged: durable callback outbox (until observed delivery
+problem), skipped-test investigation, streaming `/explain`, and FSRS
+integration (last per FSE).
 
 Remaining pre-Phase-0 items: the assistance ladder (`/generate-hint`, L1-L6)
 is designed but not yet built, punted in favor of `/generate-practice` on FSE
