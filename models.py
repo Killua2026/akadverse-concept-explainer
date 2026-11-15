@@ -160,3 +160,31 @@ class GenerateExampleTasksResponse(BaseModel):
     concept_id: str
     example: WorkedExample
     tasks: list[ExampleTask]
+
+
+class Misconception(BaseModel):
+    label: str
+    evidence: str
+
+
+class EvaluatePracticeRequest(BaseModel):
+    concept_id: str = Field(..., min_length=1)
+    concept_description: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1)
+    expected_answer: str = Field(..., min_length=1)
+    evaluation_criteria: list[str] = Field(default_factory=list)
+    student_answer: str = Field(..., min_length=1)
+    student_reasoning: str = ""
+    response_type: Literal["text", "number", "multiple_choice", "step"] = "text"
+
+
+class EvaluatePracticeResponse(BaseModel):
+    concept_id: str
+    answer_correct: bool
+    answer_feedback: str
+    reasoning_quality: Literal["strong", "adequate", "weak", "absent"]
+    reasoning_feedback: str
+    misconceptions: list[Misconception] = Field(default_factory=list)
+    evidence_strength: Literal["independent", "assisted", "insufficient"]
+    needs_review: bool
+    recommended_next_step: Literal["progress", "reinforce", "teach_prerequisite"]
