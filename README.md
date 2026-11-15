@@ -639,12 +639,11 @@ committing to `recommended_next_step` blindly.
 
 Response notes for FSE:
 
-- `"progress"` with `reasoning_quality="absent"` is valid. A correct answer
-  with no submitted reasoning still passes `needs_review=false` and routes to
-  `"progress"` because the answer itself was correct. Do not treat
-  `"progress"` as proof that reasoning was assessed and was good; check
-  `reasoning_quality` separately when you want to gate reasoning-driven
-  advancement.
+- The grading prompt reserves `"progress"` for correct answers with adequate
+  or strong reasoning. For a correct answer without reasoning, it asks the
+  model to set `answer_correct=true`, `reasoning_quality="absent"`, and
+  `needs_review=false`. The response schema allows `"progress"` with
+  `"absent"`, so check `reasoning_quality` when gating advancement on reasoning.
 - `misconceptions` is empty when no specific misconception was diagnosed.
   A wrong answer with no identifiable misconception returns an empty list,
   not a generic entry. The FSE should not assume "wrong" and "misconception"
@@ -657,14 +656,19 @@ parsed, the endpoint returns HTTP 200 with a degraded payload:
 `answer_correct=false`, `reasoning_quality="absent"`,
 `evidence_strength="insufficient"`, `needs_review=true`,
 `recommended_next_step="reinforce"`, and explanatory fallback strings in
-`answer_feedback` and `reasoning_feedback`. The degraded path never returns
-5xx; if `needs_review` is `true` due to degraded fallback, the FSE should
-surface an "evaluation unavailable" state rather than a "wrong answer" state.
+`answer_feedback` and `reasoning_feedback`. The same `needs_review` flag also
+covers completed evaluations that need review. The response has no dedicated
+fallback indicator, so pause automatic routing and show the feedback when
+`needs_review` is `true`.
 
-Status codes: `200` for success or degraded fallback; `401` for a missing or
-incorrect Bearer token; `503` only when no LLM provider is configured. There
-is no `404`, no `422` for missing documents, and no database-unavailable
-`503`; this endpoint does not touch the database.
+| Status | Meaning |
+| --- | --- |
+| `200` | Completed evaluation or degraded fallback |
+| `401` | Missing or incorrect Bearer token when shared-secret authentication is configured |
+| `422` | Invalid request body, such as a missing required field or an unsupported `response_type` |
+| `503` | Shared-secret authentication or the LLM provider is unconfigured |
+
+The endpoint requires no ingested document or database connection.
 
 Expected latency is 3-10 seconds for a single evaluation.
 
@@ -685,13 +689,13 @@ Expected latency is 3-10 seconds for a single evaluation.
    `expected_answer` and `evaluation_criteria` stay server-side until the
    student submits, then drive immediate feedback.
 8. As the student submits each answer, the FSE calls `/evaluate-practice`
-   with the task's `prompt`, `expected_answer`, and `evaluation_criteria`,
-   plus the student's `student_answer` and `student_reasoning`. The FSE
-   displays `answer_feedback`, `reasoning_feedback`, any diagnosed
-   misconceptions, and routes the student to `progress`, `reinforce`, or
-   `teach_prerequisite` based on `recommended_next_step`. When
-   `needs_review` is `true`, the FSE surfaces an "evaluation unavailable"
-   state instead of committing to a routing decision.
+   with the plan's `concept_id` and `concept_description`, the task's
+   `prompt` as `question`, its `expected_answer`, `evaluation_criteria`,
+   and `response_type`, plus the student's `student_answer` and optional
+   `student_reasoning`. The FSE displays `answer_feedback`,
+   `reasoning_feedback`, and any diagnosed misconceptions. When
+   `needs_review` is `true`, flag the attempt for review and pause automatic
+   routing. Otherwise, use `recommended_next_step` to select the next step.
 
 ### Attachments
 
@@ -1206,22 +1210,27 @@ akadverse-concept-explainer/
   .dockerignore                Build exclusions, including .env
   main.py                      FastAPI lifespan, router wiring, health
   run.py                       Windows-compatible launcher, port 8010
-  auth.py                      Ingestion shared-secret authentication
-  models.py                    Ingestion request/response schemas
+  auth.py                      Shared-secret authentication and ingestion readiness
+  models.py                    Request and response schemas
   config.py                    Provider/storage settings and worker constants
   db.py                        Async Postgres engine and session factory
   routes/
     explain.py                 Authenticated synchronous POST /explain
     lesson_planning.py         Authenticated POST /analyse-material
-    example_tasks.py            Authenticated POST /generate-example-tasks
+    example_tasks.py           Authenticated POST /generate-example-tasks
+    practice_evaluation.py    Authenticated POST /evaluate-practice
+    attachments.py            Authenticated attachment upload, metadata, and deletion
     ingest.py                  POST /ingest
-    documents.py               Transactional DELETE /documents/{document_id}
+    documents.py               Document deletion and ingestion status
     grounding.py               Retained Google Search Grounding route
   workers/ingestion.py          Claims, recovery, processing, temp-file cleanup
   services/
     retrieval.py               Course-scoped retrieval and grounded answers
     lesson_planning.py         Structured plans from ingested chunks
-    example_tasks.py            Worked examples and interactive tasks
+    example_tasks.py           Worked examples and interactive tasks
+    practice_evaluation.py    Answer and reasoning evaluation
+    attachments.py            Attachment storage and expiry sweeps
+    chat_history.py           Conversation persistence and retention sweeps
     embedding.py               Enterprise batch embeddings
     callback.py                CallbackSettings and bounded authorized delivery
     chunking.py                Shared text splitting
@@ -1236,10 +1245,16 @@ akadverse-concept-explainer/
   migrations/
     001_pgvector_storage.sql
     002_jobs_table.sql
+    003_attachments_table.sql
+    004_chat_messages_table.sql
   tests/
     conftest.py                Isolated database and generated Office fixtures
     test_analyse_material.py
     test_example_tasks.py
+    test_practice_evaluation.py
+    test_attachments.py
+    test_health.py
+    test_status.py
     test_api_key_env.py
     test_auth.py
     test_callback.py

@@ -51,7 +51,7 @@ Status:
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
-- [ ] Phase 5: Remaining Stewart teaching roadmap (guided micro-tasks, evaluation, learner model, assistance ladder L0-L6, FSRS integration). BLOCKED on Phase 0 alignment with FSE and founder before any further implementation. The two roadmap documents are `stewart_ai_engineer_implementation_plan.md` and `AI_ENGINEER_STUDY_VIRTUAL_ASSISTANT.md`. Do not start any remaining Phase 5 sub-item without explicit scope agreement.
+- [ ] Phase 5: Remaining Stewart teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration). BLOCKED on Phase 0 alignment with FSE and founder before any further implementation. The two roadmap documents are `stewart_ai_engineer_implementation_plan.md` and `AI_ENGINEER_STUDY_VIRTUAL_ASSISTANT.md`. Do not start any remaining Phase 5 sub-item without explicit scope agreement.
 
 Phase 2e is merged and deployed on Railway, as confirmed by the developer.
 Phase 3 is committed and verified end-to-end on Railway with real PDF and PPTX
@@ -227,10 +227,10 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   matching the pattern in `services/example_tasks.py`. `_extract_json_object`
   is a local copy in `services/practice_evaluation.py` per the project's
   one-copy-per-service convention.
-- The route's only 503 guard is `not settings.use_enterprise and not
-  settings.google_api_key`. There is no `database is None` check, no
-  database access, and no migration. Enterprise mode is guaranteed valid at
-  request time because `gemini_settings.validate()` runs in lifespan.
+- The route returns HTTP 503 when `not settings.use_enterprise and not
+  settings.google_api_key`. The shared-secret auth dependency also returns
+  HTTP 503 if `AI_SERVICE_API_KEY` is unset. Enterprise settings are
+  validated during lifespan startup. The route requires no database.
 - Any LLM, schema, validation, or parse failure returns HTTP 200 with a
   degraded payload: `answer_correct=false`, `reasoning_quality="absent"`,
   `evidence_strength="insufficient"`, `needs_review=true`,
@@ -257,11 +257,13 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   validation constrains the response shape but cannot verify the judgment;
   prompt injection risk is accepted for the demo and is a post-demo
   hardening item.
-- `recommended_next_step="progress"` with `reasoning_quality="absent"` is
-  valid: a correct answer with no submitted reasoning still passes
-  `needs_review=false` and routes to `"progress"`. The FSE should check
-  `reasoning_quality` separately when gating reasoning-driven advancement.
-  This behavior is intentional and documented in the prompt.
+- The prompt reserves `recommended_next_step="progress"` for correct answers
+  with adequate or strong reasoning. For a correct answer without reasoning,
+  it asks for `answer_correct=true`, `reasoning_quality="absent"`, and
+  `needs_review=false`. The schema accepts any valid recommendation with
+  `"absent"`, and the service forwards the validated recommendation as
+  returned. The FSE should check `reasoning_quality` when gating advancement
+  on reasoning.
 
 ### Concept-scoped /explain
 
@@ -911,13 +913,12 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-Focused run after `/evaluate-practice`: 9 passed (7 new practice-evaluation
-test cases plus the existing `test_refactor.py::test_main_app_has_all_expected_routes`).
-Full-suite projection: 312 collected / 311 passed + 1 skipped. Pending
-developer verification at end of session; record the actual count after
-a completed run.
-The route-set update changes an existing test. Focused suites passed. Full-suite
-verification is pending. Record the actual count after a completed run.
+Focused run after `/evaluate-practice` recorded 9 passed. The seven
+practice-evaluation test functions produce eight cases because the auth test
+covers a missing token and an incorrect token. The ninth case is
+`test_refactor.py::test_main_app_has_all_expected_routes`.
+Full-suite projection is 312 collected, with 311 expected to pass and 1
+expected to skip. Record the actual count after a completed run.
 
 Historical baselines were 162 for Phase 2e, 217 for Phase 3, 250 for Phase
 3.5a, 262 for Phase 3.5b, 272 for Phase 3.5c, and 286 for Phase 4a. The
