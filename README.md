@@ -35,6 +35,7 @@ The intended caller is the Next.js backend, not a browser client.
 | `POST /analyse-material` | Implemented: decomposes ingested material into a structured lesson plan with sections, concepts, prerequisites, difficulty, and source chunk citations |
 | Concept-scoped `/explain` | Implemented: optional `concept_id` and `concept_description` fields scope Stewart's answer to a single concept |
 | `POST /generate-example-tasks` | Implemented: decomposes a worked example into ordered interactive student tasks (multiple-choice, text, number, step responses) with expected answers and evaluation criteria |
+| `POST /evaluate-practice` | Implemented: LLM-graded answer and reasoning evaluation with misconception diagnosis; DB-free, returns 200 with `needs_review=true` on degraded fallback |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -55,6 +56,7 @@ not change the committed job status or roll back chunks.
 - [API endpoints](#api-endpoints)
   - [Analyse material](#post-analyse-material)
   - [Generate example tasks](#post-generate-example-tasks)
+  - [Evaluate practice](#post-evaluate-practice)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
@@ -587,6 +589,85 @@ Response fields
 This is the third teaching stage after lesson planning and concept-scoped
 explanation. See [Demo flow](#demo-flow-lesson-planning--teaching).
 
+### POST /evaluate-practice
+
+Grades a student's practice answer against the expected answer and criteria
+returned by `/generate-example-tasks`. Returns structured feedback, reasoning
+assessment, misconception diagnosis, and a recommended next step. This
+endpoint is DB-free; it does not read from `concept_explainer.chunks` and
+does not require an ingested document.
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as `/explain`.
+
+```json
+{
+  "concept_id": "concept-4",
+  "concept_description": "The classification of data flow directions between devices, categorized as simplex, half-duplex, and full-duplex.",
+  "question": "<task prompt from /generate-example-tasks>",
+  "expected_answer": "<that task's expected_answer>",
+  "evaluation_criteria": ["<that task's criteria>"],
+  "student_answer": "<student's answer>",
+  "student_reasoning": "<optional; student's reasoning>",
+  "response_type": "text"
+}
+```
+
+`concept_id`, `concept_description`, `question`, `expected_answer`, and
+`student_answer` are required non-empty strings. `evaluation_criteria`
+defaults to `[]`. `student_reasoning` defaults to `""`. `response_type`
+defaults to `"text"` and accepts `text`, `number`, `multiple_choice`, or
+`step`.
+
+The response contains nine fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `concept_id` | string | Echo of the request's `concept_id` |
+| `answer_correct` | boolean | Whether the answer matches the expected answer and criteria |
+| `answer_feedback` | string | Specific feedback on the answer |
+| `reasoning_quality` | `"strong"` \| `"adequate"` \| `"weak"` \| `"absent"` | Assessment of the student's reasoning |
+| `reasoning_feedback` | string | Specific feedback on the reasoning |
+| `misconceptions` | array of `{label, evidence}` | Detected misconceptions with quoted evidence; empty when none |
+| `evidence_strength` | `"independent"` \| `"assisted"` \| `"insufficient"` | Whether the student appears to have solved without hints |
+| `needs_review` | boolean | True when the answer is ambiguous, the reasoning conflicts with the answer, or the LLM is uncertain |
+| `recommended_next_step` | `"progress"` \| `"reinforce"` \| `"teach_prerequisite"` | How the FSE should route the student after this attempt |
+
+`needs_review` is a required boolean, not a defaulted field. The LLM sets
+it per response. When `needs_review` is `true`, the FSE should route the
+attempt to instructor review or flag it for later attention rather than
+committing to `recommended_next_step` blindly.
+
+Response notes for FSE:
+
+- `"progress"` with `reasoning_quality="absent"` is valid. A correct answer
+  with no submitted reasoning still passes `needs_review=false` and routes to
+  `"progress"` because the answer itself was correct. Do not treat
+  `"progress"` as proof that reasoning was assessed and was good; check
+  `reasoning_quality` separately when you want to gate reasoning-driven
+  advancement.
+- `misconceptions` is empty when no specific misconception was diagnosed.
+  A wrong answer with no identifiable misconception returns an empty list,
+  not a generic entry. The FSE should not assume "wrong" and "misconception"
+  are synonymous.
+- `evidence_strength` reflects the absence or presence of hint context in
+  the submission; it is not a judgment of the student's overall ability.
+
+If the LLM call fails, the schema is violated, or the response cannot be
+parsed, the endpoint returns HTTP 200 with a degraded payload:
+`answer_correct=false`, `reasoning_quality="absent"`,
+`evidence_strength="insufficient"`, `needs_review=true`,
+`recommended_next_step="reinforce"`, and explanatory fallback strings in
+`answer_feedback` and `reasoning_feedback`. The degraded path never returns
+5xx; if `needs_review` is `true` due to degraded fallback, the FSE should
+surface an "evaluation unavailable" state rather than a "wrong answer" state.
+
+Status codes: `200` for success or degraded fallback; `401` for a missing or
+incorrect Bearer token; `503` only when no LLM provider is configured. There
+is no `404`, no `422` for missing documents, and no database-unavailable
+`503`; this endpoint does not touch the database.
+
+Expected latency is 3-10 seconds for a single evaluation.
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -603,8 +684,14 @@ explanation. See [Demo flow](#demo-flow-lesson-planning--teaching).
 7. The FSE renders the example and presents the tasks one at a time.
    `expected_answer` and `evaluation_criteria` stay server-side until the
    student submits, then drive immediate feedback.
-8. The student completes the tasks. Once `/evaluate-practice` ships, the FSE
-   can optionally submit answers for separate answer and reasoning grading.
+8. As the student submits each answer, the FSE calls `/evaluate-practice`
+   with the task's `prompt`, `expected_answer`, and `evaluation_criteria`,
+   plus the student's `student_answer` and `student_reasoning`. The FSE
+   displays `answer_feedback`, `reasoning_feedback`, any diagnosed
+   misconceptions, and routes the student to `progress`, `reinforce`, or
+   `teach_prerequisite` based on `recommended_next_step`. When
+   `needs_review` is `true`, the FSE surfaces an "evaluation unavailable"
+   state instead of committing to a routing decision.
 
 ### Attachments
 
@@ -1189,12 +1276,17 @@ grounded answers, correct citations, and correct not-covered responses.
 Callbacks to `https://akadverse.vercel.app/api/webhooks/ai-ingest` returned 200 OK.
 Exchange secrets privately. Production deployment remains a separate decision.
 
-Attachments, chat history, and AI-generated worked examples are complete
-(Phases 3.5a-3.5c and 4a). The remaining deferred items are the skipped concurrency
-test investigation, the durable callback outbox (only when an actual delivery
+Attachments, chat history, AI-generated worked examples, lesson planning,
+concept-scoped explanations, interactive micro-tasks, and practice evaluation
+are complete. The remaining deferred items are the skipped concurrency test
+investigation, the durable callback outbox (only when an actual delivery
 problem is observed), streaming `/explain` responses, and the full Stewart
-teaching roadmap (lesson plans, micro-tasks, evaluation, learner model, assistance
-ladder) pending Phase 0 alignment with the FSE and founder.
+teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration)
+pending Phase 0 alignment with the FSE and founder. A separate post-demo
+cleanup pass will address a latent metadata-read guard in
+`services/example_tasks.py`, strengthen the parsed-read test in
+`tests/test_practice_evaluation.py`, remove an unused import, and replace
+pre-rule `print()` calls in `services/model_discovery.py` and `main.py`.
 
 Plan a Railway
 upgrade or migration before the trial expires early December 2026.
