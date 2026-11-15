@@ -48,6 +48,7 @@ Status:
 - [x] Concept-scoped /explain: optional `concept_id` and `concept_description` fields (prompt-level scoping)
 - [x] Example tasks: POST /generate-example-tasks (worked example + interactive micro-tasks, 30k char cap, single-task fallback)
 - [x] Practice evaluation: POST /evaluate-practice (LLM-graded answer and reasoning with misconception diagnosis, DB-free, guarded degraded fallback with needs_review=true)
+- [x] Practice generation: POST /generate-practice (independent-practice question generation, distinct from guided /generate-example-tasks, DB-backed, solution hidden from student until submission)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -264,6 +265,56 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   `"absent"`, and the service forwards the validated recommendation as
   returned. The FSE should check `reasoning_quality` when gating advancement
   on reasoning.
+
+### Practice generation (current)
+
+- `POST /generate-practice` generates complete, independent-practice questions
+  for a concept, distinct from the guided `/generate-example-tasks` endpoint.
+  FSE directive (2026-11-15): the two endpoints are separated by learning
+  objective, not by naming. Guided reveals a solution progressively and teaches
+  approach; independent practice produces a standalone question whose solution
+  stays server-side until submission, then feeds `/evaluate-practice`.
+- Service signature:
+  `generate_practice(database, settings, *, concept_id, concept_description,
+  document_id, difficulty, question_type, max_questions) ->
+  GeneratePracticeResponse`. DB-backed: reads from `concept_explainer.chunks`
+  for the given `document_id`, same pattern as `/generate-example-tasks`.
+- Reads chunks in ID order, builds a prompt with 5,000-char per-chunk and
+  30,000-char total caps, records `source_chunk_ids` for included chunks.
+  Uses `settings.model_names[0]` at `temperature=0.3` with
+  `response_mime_type="application/json"` and a `response_schema` derived
+  from a private `_PracticeBundleLLM` model. Schema-attempt failure triggers a
+  plain-generation retry with the schema in the prompt, matching siblings.
+  `_extract_json_object` is a local copy per the one-copy-per-service convention.
+- `_repair_questions` drops entries missing `question_text` or
+  `expected_answer`, drops entries with invalid `question_type` or `difficulty`,
+  drops `multiple_choice` entries with fewer than 2 options, **clears `options`
+  on any non-`multiple_choice` question**, assigns `question_id` as
+  `pq-{concept_id}-{index+1}`, attaches request `concept_id` and prompt source
+  chunk IDs, and caps at `max_questions`. Fewer than 1 valid question remaining
+  raises `_PracticeRejected("no_valid_questions")` and triggers the degraded
+  fallback.
+- `activity_type` is a fixed literal `"INDEPENDENT_PRACTICE"` on every response
+  so FSE can distinguish this output from `/generate-example-tasks` at the
+  schema level, not by string matching on the response shape.
+- `needs_review: bool` is a required field with no default. The LLM does NOT
+  set it. The service sets it: `False` on success, `True` on degraded fallback.
+  Pydantic validation requires it to be present.
+- On any LLM, schema, parsing, or repair failure: log
+  `practice_generation.fallback` with `error_type` and `reason`, return 200
+  with `concept_id` echoed, `activity_type="INDEPENDENT_PRACTICE"`,
+  `questions=[]`, and `needs_review=True`. Fallback never returns 5xx.
+- `DocumentNotFound` maps to 404 at the route level. Database failures and
+  disabled-enterprise / missing-database return 503.
+- The prompt does NOT contain the literal phrase "worked example" anywhere.
+  This is load-bearing: the phrase would contradict the "no guided solution"
+  intent and also fail the corresponding test assertion. Phrasing is
+  "Ask a standalone question for the student to solve independently. Omit
+  solution steps and hints." Do not edit the prompt to add the forbidden phrase.
+- FSE keeps `expected_answer` and `explanation` server-side and reveals only
+  `question_text` (and `options` for MC) before submission. `question_text`
+  reads as an exam question, not a stepwise solution. This is the primary
+  quality signal to verify when the prompt is ever changed.
 
 ### Concept-scoped /explain
 
@@ -787,6 +838,7 @@ akadverse-concept-explainer/
 |   |-- lesson_planning.py        # POST /analyse-material
 |   |-- example_tasks.py          # POST /generate-example-tasks
 |   |-- practice_evaluation.py    # POST /evaluate-practice
+|   |-- practice_generation.py    # POST /generate-practice
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -806,6 +858,7 @@ akadverse-concept-explainer/
 |   |-- lesson_planning.py        # Generate structured plans from ingested chunks
 |   |-- example_tasks.py          # Worked examples and interactive tasks
 |   |-- practice_evaluation.py    # Answer and reasoning evaluation with misconception diagnosis
+|   |-- practice_generation.py    # Independent practice question generation
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -833,6 +886,7 @@ akadverse-concept-explainer/
 |   |-- test_analyse_material.py  # Lesson planning endpoint tests
 |   |-- test_example_tasks.py     # Worked-example task endpoint tests
 |   |-- test_practice_evaluation.py  # Practice evaluation endpoint tests
+|   |-- test_practice_generation.py  # Practice generation endpoint tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -913,12 +967,14 @@ Windows: `tests/conftest.py` sets the SelectorEventLoop policy for tests.
 `run.py` already sets it before Uvicorn starts; use `uv run python run.py`.
 Preserve this policy in any future process launcher.
 
-Focused run after `/evaluate-practice` recorded 9 passed. The seven
-practice-evaluation test functions produce eight cases because the auth test
-covers a missing token and an incorrect token. The ninth case is
-`test_refactor.py::test_main_app_has_all_expected_routes`.
-Full-suite projection is 312 collected, with 311 expected to pass and 1
-expected to skip. Record the actual count after a completed run.
+Verified full-suite baseline after `/evaluate-practice`: 311 passed, 1 skipped,
+1 warning in 31:36 (312 collected). This confirms the prior projection.
+
+Focused run after `/generate-practice`: 10 passed (9 new practice-generation
+test executions plus the existing
+`test_refactor.py::test_main_app_has_all_expected_routes`). Full-suite
+projection: 321 collected / 320 passed + 1 skipped. Pending developer
+verification at end of session.
 
 Historical baselines were 162 for Phase 2e, 217 for Phase 3, 250 for Phase
 3.5a, 262 for Phase 3.5b, 272 for Phase 3.5c, and 286 for Phase 4a. The
@@ -1067,15 +1123,23 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Four teaching-stage endpoints shipped and were verified on
+Five teaching-stage endpoints shipped and were verified on
 `csc424-lecture-1-2027`: `/analyse-material`, concept-scoped `/explain`,
-`/generate-example-tasks`, and `/evaluate-practice`. Await FSE feedback on
-the full teaching loop (plan, explain, practice, evaluate) before scoping the
-next feature. The likely next items are the assistance ladder L0-L6 and the
-learner model, but neither starts until FSE demo reaction lands. The durable
-callback outbox remains deferred until an observed delivery failure. The
-skipped-test investigation is deferred. Streaming `/explain` remains deferred.
-FSRS is last per FSE.
+`/generate-example-tasks` (guided), `/generate-practice` (independent), and
+`/evaluate-practice` (grading). The full learning progression is now
+demonstrable end-to-end: analyse → explain → guided example → independent
+practice → evaluate → adaptive next action.
+
+Remaining pre-Phase-0 items: the assistance ladder (`/generate-hint`, L1-L6)
+is designed but not yet built, punted in favor of `/generate-practice` on FSE
+directive; the FSE must clarify what "AI question bank is not working" refers
+to before Phase 0 can audit that path; and the Phase 0 audit itself (vocabulary
+reconciliation, request envelope, stable concept IDs, student context snapshot)
+remains blocked on FSE availability.
+
+The durable callback outbox remains deferred until an observed delivery
+failure. The skipped-test investigation is deferred. Streaming `/explain`
+remains deferred. FSRS is last per FSE.
 
 ## Deployment status
 
