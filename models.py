@@ -188,3 +188,32 @@ class EvaluatePracticeResponse(BaseModel):
     evidence_strength: Literal["independent", "assisted", "insufficient"]
     needs_review: bool
     recommended_next_step: Literal["progress", "reinforce", "teach_prerequisite"]
+
+
+class PracticeQuestion(BaseModel):
+    question_id: str
+    concept_id: str
+    question_text: str
+    question_type: Literal["multiple_choice", "short_answer", "numeric", "step"]
+    options: list[str] = Field(default_factory=list)
+    expected_answer: str
+    explanation: str
+    evaluation_criteria: list[str]
+    difficulty: Literal["easy", "medium", "hard"]
+    source_chunk_ids: list[str] = Field(default_factory=list)
+
+
+class GeneratePracticeRequest(BaseModel):
+    concept_id: str = Field(..., min_length=1)
+    concept_description: str = Field(..., min_length=1)
+    document_id: str = Field(..., min_length=1)
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    question_type: Literal["multiple_choice", "short_answer", "numeric", "step"] = "short_answer"
+    max_questions: int = Field(default=1, ge=1, le=5)
+
+
+class GeneratePracticeResponse(BaseModel):
+    concept_id: str
+    activity_type: Literal["INDEPENDENT_PRACTICE"] = "INDEPENDENT_PRACTICE"
+    questions: list[PracticeQuestion]
+    needs_review: bool
