@@ -217,3 +217,32 @@ class GeneratePracticeResponse(BaseModel):
     activity_type: Literal["INDEPENDENT_PRACTICE"] = "INDEPENDENT_PRACTICE"
     questions: list[PracticeQuestion]
     needs_review: bool
+
+
+class GenerateRevisionQuestionsRequest(BaseModel):
+    teaching_event_id: str = Field(..., min_length=1)
+    student_id: str = Field(..., min_length=1)
+    concept_id: str = Field(..., min_length=1)
+    concept_description: str = Field(..., min_length=1)
+    taught_summary: str = Field(..., min_length=1, max_length=2000)
+    subject: str = Field(..., min_length=1)
+    curriculum: str = ""
+    level: str = ""
+    topic: str = ""
+    language: str = "en"
+    max_questions: int = Field(default=3, ge=1, le=5)
+    question_types: list[Literal["mcq", "short_answer", "true_false"]] = Field(
+        default_factory=lambda: ["short_answer"],
+    )
+
+
+class GenerateRevisionQuestionsResponse(BaseModel):
+    teaching_event_id: str
+    generated_count: int
+    webhook_attempted: bool
+    webhook_status: Literal[
+        "processed", "accepted_async", "failed_permanent", "failed_transient", "not_attempted",
+    ]
+    webhook_results: list[dict] = Field(default_factory=list)
+    needs_review: bool
+    error_detail: str | None = Field(default=None, max_length=200)

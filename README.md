@@ -36,6 +36,7 @@ The intended caller is the Next.js backend, not a browser client.
 | Concept-scoped `/explain` | Implemented: optional `concept_id` and `concept_description` fields scope Stewart's answer to a single concept |
 | `POST /generate-example-tasks` | Implemented: decomposes a worked example into ordered interactive student tasks (multiple-choice, text, number, step responses) with expected answers and evaluation criteria |
 | `POST /evaluate-practice` | Implemented: LLM-graded answer and reasoning evaluation with misconception diagnosis; DB-free, returns 200 with `needs_review=true` on degraded fallback |
+| `POST /generate-practice` | Implemented: independent-practice question generation, source-grounded, solution hidden from student until submission; distinct from guided `/generate-example-tasks` |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -57,6 +58,7 @@ not change the committed job status or roll back chunks.
   - [Analyse material](#post-analyse-material)
   - [Generate example tasks](#post-generate-example-tasks)
   - [Evaluate practice](#post-evaluate-practice)
+  - [Generate practice](#post-generate-practice)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
@@ -672,6 +674,90 @@ The endpoint requires no ingested document or database connection.
 
 Expected latency is 3-10 seconds for a single evaluation.
 
+### POST /generate-practice
+
+Generates complete, independent-practice questions for a specific concept.
+Distinct from `/generate-example-tasks` in learning objective, prompt, and
+solution visibility. Use this when the student is ready to demonstrate
+understanding without guidance; use `/generate-example-tasks` when introducing
+the concept.
+
+| Aspect | `/generate-example-tasks` (guided) | `/generate-practice` (independent) |
+| --- | --- | --- |
+| Primary objective | Teach how to approach and solve | Measure independent understanding |
+| Solution visibility | Revealed progressively as micro-tasks | `expected_answer` and `explanation` returned to caller, kept server-side, NOT shown to student before submission |
+| Task structure | Worked example decomposed into 3-10 ordered micro-tasks | 1-5 standalone questions, one attempt each |
+| Response field | `tasks[]` with `sequence`, `prompt`, `hint_strategy` | `questions[]` with `question_text`, `options`, `expected_answer`, `explanation` |
+| `activity_type` | (implicit) | **`"INDEPENDENT_PRACTICE"`** (fixed literal) |
+| FSE flow | Student sees steps one at a time, guided | Student sees question only, attempts, then FSE calls `/evaluate-practice` |
+
+Learning progression: explanation → `/generate-example-tasks` (guided) →
+`/generate-practice` (independent) → `/evaluate-practice` (grading) → adaptive
+next teaching action.
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as `/explain`.
+
+```json
+{
+  "concept_id": "concept-4",
+  "concept_description": "The classification of data flow directions between devices, categorized as simplex, half-duplex, and full-duplex.",
+  "document_id": "csc424-lecture-1-2027",
+  "difficulty": "medium",
+  "question_type": "short_answer",
+  "max_questions": 2
+}
+```
+
+`concept_id`, `concept_description`, and `document_id` are required.
+`difficulty` defaults to `"medium"` and accepts `easy`, `medium`, or `hard`.
+`question_type` defaults to `"short_answer"` and accepts `short_answer`,
+`multiple_choice`, `numeric`, or `step`. `max_questions` defaults to 1 and
+accepts 1 to 5.
+
+The response contains four top-level fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `concept_id` | string | Echo of the request's `concept_id` |
+| `activity_type` | `"INDEPENDENT_PRACTICE"` | Fixed literal distinguishing this endpoint from `/generate-example-tasks` |
+| `questions` | array | 1 to `max_questions` entries; empty on degraded fallback |
+| `needs_review` | boolean | `false` on success; `true` on degraded fallback; set by the service, not the LLM |
+
+Each question in `questions` has: `question_id` (format `pq-{concept_id}-{n}`),
+`concept_id`, `question_text`, `question_type`, `options` (empty for non-multiple-choice),
+`expected_answer`, `explanation`, `evaluation_criteria` (list of strings),
+`difficulty`, and `source_chunk_ids` (chunks whose content informed the question).
+
+FSE integration notes:
+
+- **Keep `expected_answer` and `explanation` server-side.** The student should
+  see only `question_text` and (for multiple choice) `options` before submitting.
+  Revealing `expected_answer` before submission defeats the entire purpose.
+- **Route attempts through `/evaluate-practice`.** When the student submits,
+  pass their answer and reasoning to `/evaluate-practice` with the same
+  `concept_id`, `concept_description`, `question_text` (as `question`), and
+  `expected_answer`. `/generate-practice` does not grade.
+- **Distinguish guided vs independent evidence.** Per FSE's learning-evidence
+  vocabulary: guided example completed (from `/generate-example-tasks`),
+  practice completed independently, practice completed with hints, practice
+  completed with substantial assistance, or incorrect response/misconception
+  identified (from `/evaluate-practice`). Do not conflate.
+- **Do not treat `source_chunk_ids` as "these specific chunks caused this
+  question."** On a small document under the 30,000-character prompt cap, all
+  chunks are included in the prompt and therefore all are listed. On a large
+  document, the list is a subset.
+
+If the LLM call, schema, parsing, or repair fails, the endpoint returns HTTP
+200 with `activity_type="INDEPENDENT_PRACTICE"`, `questions=[]`, and
+`needs_review=true`. FSE should surface "practice unavailable" rather than
+displaying a fake question. The degraded path never returns 5xx.
+
+Status codes: `200` for success or degraded fallback; `401` for missing or
+incorrect Bearer token; `404` when the document has no ingested chunks; `503`
+when the ingest database is unavailable or the service runs in developer mode.
+
+Expected latency is 8-25 seconds.
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -688,7 +774,12 @@ Expected latency is 3-10 seconds for a single evaluation.
 7. The FSE renders the example and presents the tasks one at a time.
    `expected_answer` and `evaluation_criteria` stay server-side until the
    student submits, then drive immediate feedback.
-8. As the student submits each answer, the FSE calls `/evaluate-practice`
+8. Optionally, when the student is ready to demonstrate independent
+   understanding, the FSE calls `/generate-practice` with the concept and
+   a target difficulty. The response provides complete questions; the FSE
+   reveals only `question_text` (and `options` for multiple choice) to the
+   student and keeps `expected_answer` and `explanation` server-side.
+9. As the student submits each answer, the FSE calls `/evaluate-practice`
    with the plan's `concept_id` and `concept_description`, the task's
    `prompt` as `question`, its `expected_answer`, `evaluation_criteria`,
    and `response_type`, plus the student's `student_answer` and optional
@@ -1292,8 +1383,8 @@ Callbacks to `https://akadverse.vercel.app/api/webhooks/ai-ingest` returned 200 
 Exchange secrets privately. Production deployment remains a separate decision.
 
 Attachments, chat history, AI-generated worked examples, lesson planning,
-concept-scoped explanations, interactive micro-tasks, and practice evaluation
-are complete. The remaining deferred items are the skipped concurrency test
+concept-scoped explanations, interactive micro-tasks, practice evaluation, and independent practice
+generation are complete. The remaining deferred items are the skipped concurrency test
 investigation, the durable callback outbox (only when an actual delivery
 problem is observed), streaming `/explain` responses, and the full Stewart
 teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration)

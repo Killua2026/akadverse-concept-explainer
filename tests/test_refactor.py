@@ -17,5 +17,5 @@ def test_main_app_has_all_expected_routes():
         "/ingest", "/documents/{document_id}", "/documents/{document_id}/status",
         "/explain-with-grounding", "/explain", "/health",
         "/attachments", "/attachments/{attachment_id}", "/analyse-material", "/generate-example-tasks",
-        "/evaluate-practice", "/generate-practice",
+        "/evaluate-practice", "/generate-practice", "/generate-revision-questions",
     }
