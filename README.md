@@ -38,6 +38,7 @@ The intended caller is the Next.js backend, not a browser client.
 | `POST /evaluate-practice` | Implemented: LLM-graded answer and reasoning evaluation with misconception diagnosis; DB-free, returns 200 with `needs_review=true` on degraded fallback |
 | `POST /generate-practice` | Implemented: independent-practice question generation, source-grounded, solution hidden from student until submission; distinct from guided `/generate-example-tasks` |
 | `POST /generate-revision-questions` | Implemented: generates revision questions from a taught concept and submits them to FSE's `/webhooks/tutor/questions` via HMAC-SHA256; requires `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the deployed service |
+| `POST /generate-hint` | Implemented: generates one Assistance Ladder hint (L1-L6) at a caller-specified level; stateless, DB-free; FSE owns escalation policy |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
 | AI-generated worked examples | Implemented in Phase 4a: labeled with `[AI-GENERATED EXAMPLE]` and `source_type="ai_generated"` |
@@ -61,6 +62,7 @@ not change the committed job status or roll back chunks.
   - [Evaluate practice](#post-evaluate-practice)
   - [Generate practice](#post-generate-practice)
   - [Generate revision questions](#post-generate-revision-questions)
+  - [Generate hint](#post-generate-hint)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
 - [FSE Integration Testing Guide](#fse-integration-testing-guide)
@@ -818,6 +820,69 @@ Response to FSE:
 - `true` with `webhook_status in {"failed_permanent", "failed_transient"}`: our submission to your webhook failed. Question IDs not available. Consider re-firing the endpoint after investigating (same `teaching_event_id` gets a new `Idempotency-Key` value only if you generate a new teaching event; same event reuses the same key).
 - `true` with `webhook_status="not_attempted"`: generation failed before submission. No questions exist. Retry after a minute or investigate our logs.
 
+### POST /generate-hint
+
+Generates one Assistance Ladder hint at a caller-specified level. This endpoint completes the adaptive teaching loop: when a student gets a practice question wrong and asks for help, the FSE calls `/generate-hint` at the appropriate level for that turn, Stewart produces the hint content, and the FSE shows it to the student.
+
+**Model A (locked):** FSE owns escalation policy. The FSE decides which level to request on each turn based on the student's attempt, previous hints, and explicit requests. This endpoint generates the hint content at exactly the level requested. It does not track ladder state, does not decide when to escalate, does not persist attempts, and does not maintain "highest level reached."
+
+The six levels follow the founder doc's Assistance Ladder:
+
+| Level | `hint_type` | Purpose |
+| --- | --- | --- |
+| L1 | `L1_METACOGNITIVE` | Ask a question that helps the student inspect their approach |
+| L2 | `L2_DIRECTIONAL` | Point toward a useful next step or method |
+| L3 | `L3_CONCEPT_REMINDER` | Recall a relevant principle, formula, or lecture-note reference |
+| L4 | `L4_ANALOGOUS_EXAMPLE` | Show a structurally similar but different problem |
+| L5 | `L5_PARTIAL_SOLUTION` | Reveal part of the current problem's solution |
+| L6 | `L6_FULL_SOLUTION` | Provide and explain the full solution |
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as `/explain`.
+
+Request:
+
+```json
+{
+  "concept_id": "concept-4",
+  "concept_description": "The classification of data flow directions between devices, categorized as simplex, half-duplex, and full-duplex.",
+  "question": "Which mode of data communication allows two devices to send and receive data in both directions, but not at the same time?",
+  "expected_answer": "Half-duplex",
+  "evaluation_criteria": [
+    "Must identify the mode as half-duplex",
+    "Must distinguish half-duplex from full-duplex by simultaneity"
+  ],
+  "student_attempt": "Full-duplex",
+  "target_level": 2,
+  "previous_hints": ["Have you considered what the qualifier 'not at the same time' is testing?"]
+}
+```
+
+Required: `concept_id`, `concept_description`, `question`, `expected_answer`, `student_attempt`, `target_level`. `target_level` is 1-6. `evaluation_criteria` and `previous_hints` default to `[]`.
+
+Response:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `level_given` | int | Echo of `target_level` on success; `-1` on degraded fallback |
+| `hint_type` | enum | `L1_METACOGNITIVE` \| `L2_DIRECTIONAL` \| `L3_CONCEPT_REMINDER` \| `L4_ANALOGOUS_EXAMPLE` \| `L5_PARTIAL_SOLUTION` \| `L6_FULL_SOLUTION` \| `NO_HINT` |
+| `hint_content` | string | The student-facing hint text; empty on degraded fallback |
+| `rationale` | string | Tutor-facing one-sentence explanation of what this hint targets; not shown to the student |
+| `needs_review` | bool | `false` on success; `true` on degraded fallback |
+
+`needs_review` is a required field with no default. It is `false` only when a hint was successfully generated at the requested level. Any failure returns `true` with `level_given=-1`, `hint_type="NO_HINT"`, empty `hint_content`, and `rationale="Hint generation is temporarily unavailable."` The degraded path never returns 5xx.
+
+FSE integration notes:
+
+- **Pass `previous_hints` accurately.** The prompt tells the model not to repeat a prior hint in wording or substance. If you omit this list, or include only the current hint, the model may regenerate material the student has already seen. Send every hint shown in this attempt's ladder history.
+- **Do not call at a new level until the student has responded to the current one.** The endpoint itself imposes no constraint — you can call L6 immediately — but pedagogically, escalation without a student attempt is not a hint, it is a solution reveal disguised as help. FSE enforces the timing.
+- **L5 does not guarantee the answer is hidden.** Levels 1-5 rely on prompt instructions, not schema validation, to prevent premature reveal. L5 is the highest-risk level for boundary leakage. In practice the smoke test showed a clean L5 (eliminated the wrong answer, used analogy, left the identification to the student), but the boundary is prompt-enforced. If leakage is observed in the wild, tighten the level rule in `services/hint_generation.py` — one-line prompt change, no code change.
+- **L4 generates a similar problem, not a hint about this problem.** Level 4 is qualitatively different from L1-L3 and L5-L6: it presents a *different* problem to illustrate the approach. The FSE may want to render L4 differently (visually distinct, or as a sub-panel) rather than inline with the other hint levels.
+- **`rationale` is not shown to students.** It is a tutor-facing note about what the hint targets, useful for logging or instructor review. Render only `hint_content` to the student.
+
+Status codes: `200` on success or degraded fallback; `401` for missing or incorrect Bearer token; `422` if `target_level` is outside 1-6; `503` only when no LLM provider is configured. No `404`, no `500`.
+
+Expected latency: 3-8 seconds per hint.
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -849,6 +914,8 @@ Response to FSE:
    routing. Otherwise, use `recommended_next_step` to select the next step.
 
 Note: `/generate-revision-questions` is built and tested against stubs but is not part of the current demo walkthrough. Its end-to-end flow requires FSE's `/webhooks/tutor/questions` handler to be live. The demo uses `/generate-practice` and `/evaluate-practice` for the teaching loop.
+
+**Adaptive teaching loop with hints.** If the student gets a practice question wrong, the FSE calls `/evaluate-practice` to grade the attempt, then `/generate-hint` at level 1 to offer a metacognitive prompt. If the student retries and is still stuck, the FSE calls `/generate-hint` at level 2, passing the level-1 hint in `previous_hints`, and so on through L6. After any successful attempt, `/evaluate-practice` grades again to record evidence and recommend the next step. This is the full adaptive loop; the current demo shows analyze → explain → guided example → independent practice → evaluation, and hints extend the loop when the student struggles.
 
 ### Attachments
 
@@ -1563,7 +1630,7 @@ Exchange secrets privately. Production deployment remains a separate decision.
 
 Attachments, chat history, AI-generated worked examples, lesson planning,
 concept-scoped explanations, interactive micro-tasks, practice evaluation, independent practice
-generation, and revision question generation (pending FSE webhook deployment) are complete. The remaining deferred items are the skipped concurrency test
+generation, revision question generation (pending FSE webhook deployment), and Assistance Ladder hint generation are complete. The remaining deferred items are the skipped concurrency test
 investigation, the durable callback outbox (only when an actual delivery
 problem is observed), streaming `/explain` responses, and the full Stewart
 teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration)
