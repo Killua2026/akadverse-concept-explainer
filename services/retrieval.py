@@ -17,7 +17,7 @@ from models import ExplainResponse, ExplainSource, RetrievalInfo
 from services.attachments import get_attachment_bytes, get_attachment_metadata
 from services.chat_history import fetch_recent_messages
 from services.chunking import chunk_text
-from services.embedding import embed_chunks
+from services.embedding import embed_chunks_batch
 from services.extractors import ExtractionError, extract_text
 from services.gemini_provider import create_client
 
@@ -225,7 +225,7 @@ async def _rank_attachment_chunks(
 ) -> tuple[int, list[tuple[str, str, str]]]:
     if not chunks:
         return 0, []
-    embeddings = await embed_chunks([content for _, _, content in chunks], settings)
+    embeddings = await embed_chunks_batch([content for _, _, content in chunks], settings)
     if len(embeddings) != len(chunks):
         raise RuntimeError("Embedding count mismatch")
     question_norm = math.hypot(*vector)
@@ -249,7 +249,7 @@ def _merge_sources(
 
 
 async def _embed_question(question: str, settings: GeminiSettings) -> list[float]:
-    return (await embed_chunks([question], settings))[0]
+    return (await embed_chunks_batch([question], settings))[0]
 
 
 async def _query_chunks(database: Database, query_vector: list[float],

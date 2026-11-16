@@ -41,7 +41,7 @@ def configured(monkeypatch):
     context.__aenter__.return_value = api
     client = Mock(return_value=SimpleNamespace(aio=context))
     embed = AsyncMock(return_value=[[1.0] + [0.0] * 767])
-    monkeypatch.setattr(retrieval, "embed_chunks", embed)
+    monkeypatch.setattr(retrieval, "embed_chunks_batch", embed)
     monkeypatch.setattr(retrieval, "create_client", client)
     app = FastAPI()
     app.include_router(make_explain_router(settings))
@@ -895,3 +895,19 @@ async def test_explain_mixed_material_and_attachment(configured, attachment_api)
     prompt = configured.generate.await_args.kwargs["contents"]
     assert "--- Course material ---\n--- Source: Lecture ---\nCourse lecture content" in prompt
     assert "--- Attached files ---\n--- Attachment: notes.md ---\nAttachment paragraph 0" in prompt
+
+
+@pytest.mark.anyio
+async def test_explain_attachment_uses_parallel_embed(configured, attachment_api):
+    question = "Explain the topic"
+    content = "\n".join(f"Attachment paragraph {i} " + "content " * 120 for i in range(105))
+    async with attachment_api(course_vector=[1]):
+        identifier = await upload(configured.app, "notes.md", content.encode(), "text/markdown")
+        response = await post(configured.app, question=question, attachment_ids=[identifier])
+
+    assert response.status_code == 200
+    assert configured.embed.await_count == 2
+    question_call, attachment_call = configured.embed.await_args_list
+    assert question_call.args[0] == [question]
+    available = response.json()["retrieval_info"]["attachment_chunks_available"]
+    assert len(attachment_call.args[0]) == min(available, retrieval.ATTACHMENT_CHUNK_CAP) > 10
