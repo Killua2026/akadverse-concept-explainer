@@ -19,7 +19,7 @@ async def submit_questions_to_fse(
     try:
         body_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         signature = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
         idempotency_key = f"teach_{payload['teaching_event_id']}"
         headers = {
             "X-Akadverse-Signature": signature,
