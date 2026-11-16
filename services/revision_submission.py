@@ -19,12 +19,22 @@ async def submit_questions_to_fse(
     try:
         body_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         signature = hmac.new(webhook_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        idempotency_key = f"teach_{payload['teaching_event_id']}"
         headers = {
             "X-Akadverse-Signature": signature,
-            "X-Akadverse-Timestamp": datetime.now(timezone.utc).isoformat(),
-            "Idempotency-Key": f"teach_{payload['teaching_event_id']}",
+            "X-Akadverse-Timestamp": timestamp,
+            "Idempotency-Key": idempotency_key,
             "Content-Type": "application/json",
         }
+        logger.info(
+            "submission.diagnostic signature=%s body_sha256=%s body_length=%d timestamp=%s idempotency_key=%s",
+            signature,
+            hashlib.sha256(body_bytes).hexdigest(),
+            len(body_bytes),
+            timestamp,
+            idempotency_key,
+        )
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
             for attempt, delay in enumerate((0, 1, 4), start=1):
                 if delay:
