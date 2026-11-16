@@ -50,6 +50,7 @@ Status:
 - [x] Practice evaluation: POST /evaluate-practice (LLM-graded answer and reasoning with misconception diagnosis, DB-free, guarded degraded fallback with needs_review=true)
 - [x] Practice generation: POST /generate-practice (independent-practice question generation, distinct from guided /generate-example-tasks, DB-backed, solution hidden from student until submission)
 - [x] Revision questions: POST /generate-revision-questions (generates revision questions from taught_summary and submits to FSE's /webhooks/tutor/questions via HMAC-SHA256; DB-free, requires FSE_WEBHOOK_URL and FSE_WEBHOOK_SECRET env vars; end-to-end blocked on FSE webhook deployment)
+- [x] Hint generation: POST /generate-hint (Assistance Ladder L1-L6, one hint per request at a caller-specified level; stateless, DB-free; FSE owns escalation policy)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -415,6 +416,68 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
   confirmed: webhook endpoint live, URL value, secret value, latency budget
   acceptance (30s on their call, not 3s), or question_types v1 scope. These
   are the outstanding FSE confirmations before integration testing.
+
+### Hint generation (current)
+
+- `POST /generate-hint` generates one Assistance Ladder hint at a
+  caller-specified level (L1-L6). Completes the adaptive teaching loop:
+  analyse-material -> explain -> generate-example-tasks (guided) ->
+  generate-practice (independent) -> evaluate-practice (grading) ->
+  generate-hint (level-by-level on struggle) -> student retry ->
+  evaluate-practice again.
+- Model A (locked): FSE owns escalation policy. FSE decides which level
+  to request on each turn based on student attempt, previous hints, and
+  explicit requests. This service generates hint content at exactly the
+  level requested. No state tracking, no attempt persistence, no
+  "highest level reached" memory, no escalation logic. Pure function:
+  (attempt, previous_hints, target_level) -> hint.
+- Service module: `services/hint_generation.py`. Route:
+  `routes/hint_generation.py`. Models: `GenerateHintRequest`,
+  `GenerateHintResponse` in `models.py`.
+- Request: `concept_id`, `concept_description`, `question`,
+  `expected_answer`, `student_attempt`, `target_level` (1-6) are
+  required. `evaluation_criteria` and `previous_hints` default to `[]`.
+- Response: `level_given` (echo of `target_level` on success; `-1` on
+  fallback), `hint_type` (one of `L1_METACOGNITIVE`,
+  `L2_DIRECTIONAL`, `L3_CONCEPT_REMINDER`, `L4_ANALOGOUS_EXAMPLE`,
+  `L5_PARTIAL_SOLUTION`, `L6_FULL_SOLUTION`, `NO_HINT`), `hint_content`
+  (student-facing), `rationale` (tutor-facing, not shown to student),
+  `needs_review`.
+- `needs_review: bool` has NO default. Service sets it explicitly.
+  `false` only on success. Any failure returns `true` with
+  `level_given=-1`, `hint_type="NO_HINT"`, `hint_content=""`, and
+  `rationale="Hint generation is temporarily unavailable."`. Fallback
+  never returns 5xx.
+- The six level rules (founder doc §6, verbatim): L1 metacognitive
+  prompt, L2 directional hint, L3 concept reminder, L4 analogous
+  example (structurally similar but different problem), L5 partial
+  solution, L6 full solution. Each level has a specific instruction
+  block in `_level_rules(target_level)`. The L4 block contains the exact
+  phrase "STRUCTURALLY SIMILAR but DIFFERENT" (load-bearing, tested).
+- Generation uses `settings.model_names[0]` at `temperature=0.3` with
+  `response_mime_type="application/json"` and a `response_schema` from a
+  private `_HintResult` model. Schema-attempt failure triggers a
+  plain-generation retry with schema in prompt. `_extract_json_object`
+  is a local copy per the one-copy-per-service convention.
+- Two known limitations, accepted for v1, documented in the module
+  docstring at the top of `services/hint_generation.py`:
+  1. Answer leakage below L6. Gemini receives `expected_answer` at
+     every level because it needs it to know what not to reveal. Levels
+     1-5 rely on prompt instructions, not schema validation, to prevent
+     premature reveal. No deterministic post-processing added because
+     it would fail legitimate L5 cases that reference partial answer
+     text. Mitigation if observed: tighten the level rule in
+     `_level_rules` (one-line prompt change, no code change). Smoke
+     test on concept-4 L5 showed a clean result: eliminated the wrong
+     answer, used walkie-talkie analogy, left identification to the
+     student.
+  2. L4 similarity. The prompt instructs "structurally similar but
+     different problem" with different numbers, values, and answer.
+     Test coverage verifies the instruction reaches Gemini, not that
+     Gemini obeys. Same mitigation path.
+- Do NOT add `can_escalate` or `next_level` fields to the response.
+  Under Model A, FSE owns escalation entirely. Surfacing those would be
+  this service opining on a decision it does not own.
 
 ### Concept-scoped /explain
 
@@ -945,6 +1008,7 @@ akadverse-concept-explainer/
 |   |-- practice_evaluation.py    # POST /evaluate-practice
 |   |-- practice_generation.py    # POST /generate-practice
 |   |-- revision_questions.py     # POST /generate-revision-questions
+|   |-- hint_generation.py        # POST /generate-hint
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -967,6 +1031,7 @@ akadverse-concept-explainer/
 |   |-- practice_generation.py    # Independent practice question generation
 |   |-- revision_questions.py     # Revision question generation and FSE webhook submission
 |   |-- revision_submission.py    # HMAC-SHA256 signing and POST to FSE webhook
+|   |-- hint_generation.py        # Assistance Ladder hint generation (L1-L6)
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -997,6 +1062,7 @@ akadverse-concept-explainer/
 |   |-- test_practice_generation.py  # Practice generation endpoint tests
 |   |-- test_revision_questions.py   # Revision generation endpoint tests
 |   |-- test_revision_submission.py  # HMAC client and retry tests
+|   |-- test_hint_generation.py      # Hint generation endpoint tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -1081,10 +1147,13 @@ Verified full-suite baselines:
 - After `/evaluate-practice`: 311 passed, 1 skipped, 1 warning in 31:36
   (312 collected).
 - After `/generate-practice`: 320 passed, 1 skipped, 1 warning (321 collected).
+- After `/generate-revision-questions` and `/generate-hint`: pending
+  end-of-session verification.
 
 Focused run after `/generate-revision-questions`: 18 passed (7 submission
-+ 10 generation + 1 refactor). Full-suite projection after this commit:
-337 passed + 1 skipped / 338 collected. Pending developer verification at
++ 10 generation + 1 refactor). Focused run after `/generate-hint`: 13
+passed (12 new + 1 refactor). Full-suite projection after both commits:
+349 passed + 1 skipped / 350 collected. Pending developer verification at
 end of session.
 
 Focused run after `/generate-practice`: 10 passed (9 new practice-generation
@@ -1240,37 +1309,38 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Six teaching-stage endpoints shipped and were verified on
+Seven teaching-stage endpoints shipped and were verified on
 `csc424-lecture-1-2027`: `/analyse-material`, concept-scoped `/explain`,
 `/generate-example-tasks` (guided), `/generate-practice` (independent),
-`/evaluate-practice` (grading), and `/generate-revision-questions` (FSE
-webhook producer). The full learning loop is demonstrable end-to-end.
+`/evaluate-practice` (grading), `/generate-revision-questions` (FSE webhook
+producer), and `/generate-hint` (Assistance Ladder L1-L6). The full adaptive
+teaching loop is demonstrable end-to-end: analyse -> explain -> guided
+example -> independent practice -> evaluation -> hint at increasing level
+on struggle -> retry -> evaluation.
 
-Outstanding FSE dependencies:
+Outstanding FSE dependencies (from the revision question bank integration):
 - `POST /webhooks/tutor/questions` must be deployed on FSE's side with
   HMAC-SHA256 verification per their revision bank spec §6.2.
 - FSE must provision `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the
   Railway service.
 - FSE must confirm question_types v1 scope (recommend mcq, short_answer,
   true_false only).
-- FSE must confirm the 30s timeout budget on their call to us (their 3s
-  target is their webhook, not the full loop).
+- FSE must confirm the 30s timeout budget on their call to us.
+- FSE must confirm the question bank embedding model choice per their
+  §15.4. Our 768-dim `gemini-embedding-2` embeddings and their question
+  bank embeddings live in different tables and are never compared; no
+  dimension-matching requirement crosses the boundary.
 
-Pre-Phase-0 items still open: `/generate-hint` (assistance ladder L1-L6)
-is not yet built; the Phase 0 audit (vocabulary reconciliation, request
-envelope, stable concept IDs, student context snapshot) remains blocked
-on FSE availability after demo.
+Pre-Phase-0 items still open:
+- `.env.example` does not yet list `FSE_WEBHOOK_URL` and
+  `FSE_WEBHOOK_SECRET`. Follow-up one-line commit pending.
+- The Phase 0 audit (vocabulary reconciliation across the three operation
+  namespaces, request envelope decision, stable concept IDs, student
+  context snapshot schema) remains blocked on FSE availability after demo.
 
 Deferred items unchanged: durable callback outbox (until observed delivery
 problem), skipped-test investigation, streaming `/explain`, and FSRS
 integration (last per FSE).
-
-Remaining pre-Phase-0 items: the assistance ladder (`/generate-hint`, L1-L6)
-is designed but not yet built, punted in favor of `/generate-practice` on FSE
-directive; the FSE must clarify what "AI question bank is not working" refers
-to before Phase 0 can audit that path; and the Phase 0 audit itself (vocabulary
-reconciliation, request envelope, stable concept IDs, student context snapshot)
-remains blocked on FSE availability.
 
 The durable callback outbox remains deferred until an observed delivery
 failure. The skipped-test investigation is deferred. Streaming `/explain`
