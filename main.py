@@ -123,6 +123,7 @@ from routes.practice_evaluation import make_practice_evaluation_router
 from routes.practice_generation import make_practice_generation_router
 from routes.revision_questions import make_revision_questions_router
 from routes.hint_generation import make_hint_generation_router
+from routes.next_action import make_next_action_router
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 gemini_settings = GeminiSettings.from_env()
@@ -257,6 +258,7 @@ app.include_router(make_practice_evaluation_router(gemini_settings))
 app.include_router(make_practice_generation_router(gemini_settings))
 app.include_router(make_revision_questions_router(gemini_settings))
 app.include_router(make_hint_generation_router(gemini_settings))
+app.include_router(make_next_action_router(gemini_settings))
 
 
 @app.middleware("http")

@@ -1,7 +1,8 @@
 """Inbound ingestion contract."""
 
 from datetime import datetime
-from typing import Literal
+from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -273,3 +274,66 @@ class GenerateHintResponse(BaseModel):
     hint_content: str
     rationale: str
     needs_review: bool
+
+
+class TriggerType(str, Enum):
+    CONCEPT_OPENED = "CONCEPT_OPENED"
+    EXPLANATION_DELIVERED = "EXPLANATION_DELIVERED"
+    STUDENT_ASKED = "STUDENT_ASKED"
+    HINT_REQUESTED = "HINT_REQUESTED"
+    GUIDED_COMPLETED = "GUIDED_COMPLETED"
+    ATTEMPT_EVALUATED = "ATTEMPT_EVALUATED"
+    PRACTICE_COMPLETED = "PRACTICE_COMPLETED"
+    LESSON_COMPLETED = "LESSON_COMPLETED"
+    REVISION_REVIEW_COMPLETED = "REVISION_REVIEW_COMPLETED"
+    RETURN_VISIT = "RETURN_VISIT"
+    LESSON_STARTED = "LESSON_STARTED"
+
+
+class ActionType(str, Enum):
+    EXPLAIN_CONCEPT = "EXPLAIN_CONCEPT"
+    REINFORCE_CONCEPT = "REINFORCE_CONCEPT"
+    SHOW_GUIDED_EXAMPLE = "SHOW_GUIDED_EXAMPLE"
+    GIVE_HINT = "GIVE_HINT"
+    GENERATE_PRACTICE = "GENERATE_PRACTICE"
+    ADDRESS_MISCONCEPTION = "ADDRESS_MISCONCEPTION"
+    REASONING_EXERCISE = "REASONING_EXERCISE"
+    TRANSFER_TASK = "TRANSFER_TASK"
+    TEACH_PREREQUISITE = "TEACH_PREREQUISITE"
+    ADVANCE_TO_NEXT_CONCEPT = "ADVANCE_TO_NEXT_CONCEPT"
+    COMPLETE_LESSON = "COMPLETE_LESSON"
+    CONTINUE_CONVERSATION = "CONTINUE_CONVERSATION"
+    RECAP = "RECAP"
+    FLAG_FOR_REVIEW = "FLAG_FOR_REVIEW"
+
+
+class Decision(BaseModel):
+    action: ActionType
+    target_concept_id: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    reason_code: str
+    rationale: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class NextActionRequest(BaseModel):
+    request_id: str = Field(..., min_length=1)
+    schema_version: str = "1"
+    operation: Literal["NEXT_ACTION"] = "NEXT_ACTION"
+    trigger: TriggerType
+    student_context: dict[str, Any]
+    current: dict[str, Any]
+    latest_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_actions: list[ActionType] = Field(..., min_length=1)
+    policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class NextActionResponse(BaseModel):
+    request_id: str
+    schema_version: str = "1"
+    status: Literal["ok", "degraded"]
+    decision: Decision | None = None
+    signals: list[str] = Field(default_factory=list)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    model_version: str = ""
+    prompt_version: str = ""
