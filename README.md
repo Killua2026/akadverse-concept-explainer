@@ -820,6 +820,14 @@ Response to FSE:
 - `true` with `webhook_status in {"failed_permanent", "failed_transient"}`: our submission to your webhook failed. Question IDs not available. Consider re-firing the endpoint after investigating (same `teaching_event_id` gets a new `Idempotency-Key` value only if you generate a new teaching event; same event reuses the same key).
 - `true` with `webhook_status="not_attempted"`: generation failed before submission. No questions exist. Retry after a minute or investigate our logs.
 
+#### Production smoke test handoff (16 November 2026)
+
+- The first smoke test exposed missing canonical answers on generated short-answer questions. The Gemini prompt now explicitly requires a non-empty `correct_text`, and later tests generated two questions and attempted delivery.
+- The initial webhook `401` came from the receiver's auth-header timestamp parser rejecting six fractional digits before HMAC verification. The sender now emits UTC timestamps with millisecond precision. The FSE also deployed support for microsecond precision while preserving freshness checks.
+- Delivery `teach_test-e2e-2026-11-16-016` used a millisecond UTC header and received HTTP `400 INVALID_PAYLOAD`. The FSE correlation ID is `ff40a328-54df-48f6-aa32-13ff925e98c0`. The separate `timestamp_outside_window` entry was an intentional stale-timestamp probe.
+- Before retrying, get the failing field path and validation rule from the FSE for that correlation ID. One candidate is the JSON body's separate `occurred_at` field, which can still carry six fractional digits. Its role in this rejection is unconfirmed.
+- After resolving the schema issue, run one smoke test with a fresh teaching event ID. `processed` with usable results confirms end-to-end processing. `accepted_async` confirms delivery and leaves processing pending.
+
 ### POST /generate-hint
 
 Generates one Assistance Ladder hint at a caller-specified level. This endpoint completes the adaptive teaching loop: when a student gets a practice question wrong and asks for help, the FSE calls `/generate-hint` at the appropriate level for that turn, Stewart produces the hint content, and the FSE shows it to the student.
