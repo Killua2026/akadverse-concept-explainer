@@ -1147,14 +1147,13 @@ Verified full-suite baselines:
 - After `/evaluate-practice`: 311 passed, 1 skipped, 1 warning in 31:36
   (312 collected).
 - After `/generate-practice`: 320 passed, 1 skipped, 1 warning (321 collected).
-- After `/generate-revision-questions` and `/generate-hint`: pending
-  end-of-session verification.
+- After `/generate-revision-questions` and `/generate-hint`: 349 passed,
+  1 skipped, 1 warning in 21:52 (350 collected).
 
 Focused run after `/generate-revision-questions`: 18 passed (7 submission
 + 10 generation + 1 refactor). Focused run after `/generate-hint`: 13
-passed (12 new + 1 refactor). Full-suite projection after both commits:
-349 passed + 1 skipped / 350 collected. Pending developer verification at
-end of session.
+passed (12 new + 1 refactor). Full-suite verification after both commits:
+349 passed + 1 skipped / 350 collected.
 
 Focused run after `/generate-practice`: 10 passed (9 new practice-generation
 test executions plus the existing
