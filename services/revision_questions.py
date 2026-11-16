@@ -17,6 +17,13 @@ from services.revision_submission import submit_questions_to_fse
 
 logger = logging.getLogger(__name__)
 
+FORBIDDEN_STEM_PHRASES = (
+    "as i said earlier",
+    "as mentioned earlier in the lecture",
+    "in the passage below",
+    "refer to the passage",
+)
+
 REVISION_GENERATION_PROMPT = """You are an expert tutor writing revision questions about what was just taught to a student.
 
 Teaching event: {teaching_event_id}
@@ -96,19 +103,39 @@ def _repair_questions(raw_questions: list, max_questions: int, allowed_types: li
     if not isinstance(raw_questions, list):
         raise _RevisionRejected("invalid_question_list")
 
+    drop_message = "revision_questions.drop reason=%s question_type=%s stem_length=%s"
     questions = []
     for raw_question in raw_questions:
         try:
             question = _GeneratedQuestion.model_validate(raw_question)
-        except ValidationError:
+        except ValidationError as error:
+            raw_type = raw_question.get("type") if isinstance(raw_question, dict) else None
+            raw_stem = raw_question.get("stem") if isinstance(raw_question, dict) else None
+            question_type = raw_type if raw_type in ("mcq", "true_false", "short_answer") else "unknown"
+            stem_length = len(raw_stem.strip()) if isinstance(raw_stem, str) else 0
+            logger.warning(drop_message, "pydantic_validation_failed", question_type, stem_length)
+            error_type = repr([
+                (detail["loc"], detail["type"])
+                for detail in error.errors(include_input=False, include_context=False)
+            ])[:100]
+            logger.warning("revision_questions.validation_failed type=%s", error_type)
             continue
         stem = question.stem.strip()
-        if (
-            not 10 <= len(stem) <= 500
-            or not question.explanation.strip()
-            or question.type not in allowed_types
-            or any(phrase in stem.casefold() for phrase in ("passage", "as i said earlier", "above"))
-        ):
+        stem_length = len(stem)
+        if stem_length < 10:
+            logger.warning(drop_message, "stem_too_short", question.type, stem_length)
+            continue
+        if stem_length > 500:
+            logger.warning(drop_message, "stem_too_long", question.type, stem_length)
+            continue
+        if not question.explanation.strip():
+            logger.warning(drop_message, "explanation_empty", question.type, stem_length)
+            continue
+        if question.type not in allowed_types:
+            logger.warning(drop_message, "type_not_allowed", question.type, stem_length)
+            continue
+        if any(phrase in stem.casefold() for phrase in FORBIDDEN_STEM_PHRASES):
+            logger.warning(drop_message, "stem_forbidden_phrase", question.type, stem_length)
             continue
 
         wire_question = {
@@ -122,12 +149,14 @@ def _repair_questions(raw_questions: list, max_questions: int, allowed_types: li
         }
         if question.type == "mcq":
             index = question.correct_option_index
-            if (
-                not 3 <= len(question.options) <= 5
-                or index is None
-                or not 0 <= index < len(question.options)
-                or any(not option.strip() for option in question.options)
-            ):
+            if not 3 <= len(question.options) <= 5:
+                logger.warning(drop_message, "mcq_options_invalid", question.type, stem_length)
+                continue
+            if index is None or not 0 <= index < len(question.options):
+                logger.warning(drop_message, "mcq_correct_index_invalid", question.type, stem_length)
+                continue
+            if any(not option.strip() for option in question.options):
+                logger.warning(drop_message, "mcq_option_empty", question.type, stem_length)
                 continue
             wire_question["options"] = [
                 {"key": key, "text": option}
@@ -136,10 +165,12 @@ def _repair_questions(raw_questions: list, max_questions: int, allowed_types: li
             wire_question["correct_answer"] = "ABCDE"[index]
         elif question.type == "true_false":
             if question.correct_bool is None:
+                logger.warning(drop_message, "tf_correct_bool_missing", question.type, stem_length)
                 continue
             wire_question["correct_answer"] = question.correct_bool
         else:
             if not question.correct_text or not question.correct_text.strip():
+                logger.warning(drop_message, "sa_correct_text_empty", question.type, stem_length)
                 continue
             wire_question["correct_answer"] = question.correct_text
             wire_question["accepted_answers"] = question.accepted_answers
