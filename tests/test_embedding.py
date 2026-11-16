@@ -1,5 +1,6 @@
 """Embedding contract without network calls or real sleeps."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
@@ -109,3 +110,74 @@ async def test_rejects_nonfinite_values(sdk, value):
     ])
     with pytest.raises(RuntimeError, match="Embedding failed"):
         await embedding.embed_chunks(["chunk"], settings())
+
+
+@pytest.mark.anyio
+async def test_batch_returns_correct_shape(sdk, monkeypatch):
+    monkeypatch.setattr(embedding.asyncio, "sleep", AsyncMock())
+
+    async def generate(**kwargs):
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.5] * 768)])
+
+    sdk[1].side_effect = generate
+    result = await embedding.embed_chunks_batch(["chunk"] * 20, settings())
+    assert len(result) == 20
+    assert all(len(row) == 768 for row in result)
+
+
+@pytest.mark.anyio
+async def test_batch_single_call_per_chunk(sdk, monkeypatch):
+    monkeypatch.setattr(embedding.asyncio, "sleep", AsyncMock())
+    sdk[1].side_effect = [
+        SimpleNamespace(embeddings=[SimpleNamespace(values=[0.5] * 768)])
+        for _ in range(25)
+    ]
+    await embedding.embed_chunks_batch(["chunk"] * 25, settings())
+    assert sdk[1].await_count == 25
+    assert all(len(entry.kwargs["contents"]) == 1 for entry in sdk[1].await_args_list)
+
+
+@pytest.mark.anyio
+async def test_batch_respects_concurrency_limit(sdk, monkeypatch):
+    real_sleep = asyncio.sleep
+    sleep = AsyncMock()
+    monkeypatch.setattr(embedding.asyncio, "sleep", sleep)
+    in_flight = 0
+    peak_in_flight = 0
+
+    async def generate(**kwargs):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        try:
+            await real_sleep(0.05)
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.5] * 768)])
+        finally:
+            in_flight -= 1
+
+    sdk[1].side_effect = generate
+    await embedding.embed_chunks_batch(["chunk"] * 20, settings())
+    assert 1 < peak_in_flight <= embedding.EMBEDDING_RETRIEVAL_CONCURRENCY
+    sleep.assert_awaited_once_with(embedding.EMBEDDING_RETRIEVAL_BATCH_SLEEP_SECONDS)
+
+
+@pytest.mark.anyio
+async def test_batch_preserves_input_order(sdk):
+    values = dict(zip(["first", "second", "third", "fourth", "fifth"],
+                      [0.1, 0.2, 0.3, 0.4, 0.5]))
+
+    async def generate(*, contents, **kwargs):
+        value = values[contents[0]]
+        await asyncio.sleep((0.5 - value) / 10)
+        return SimpleNamespace(embeddings=[SimpleNamespace(values=[value] * 768)])
+
+    sdk[1].side_effect = generate
+    result = await embedding.embed_chunks_batch(list(values), settings())
+    assert result == [[value] * 768 for value in values.values()]
+
+
+@pytest.mark.anyio
+async def test_batch_rejects_incorrect_response_count(sdk):
+    sdk[1].side_effect = [SimpleNamespace(embeddings=[])]
+    with pytest.raises(RuntimeError, match="Embedding failed"):
+        await embedding.embed_chunks_batch(["chunk"], settings())
