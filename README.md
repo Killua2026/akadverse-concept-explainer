@@ -38,6 +38,7 @@ The intended caller is the Next.js backend, not a browser client.
 | `POST /evaluate-practice` | Implemented: LLM-graded answer and reasoning evaluation with misconception diagnosis; DB-free, returns 200 with `needs_review=true` on degraded fallback |
 | `POST /generate-practice` | Implemented: independent-practice question generation, source-grounded, solution hidden from student until submission; distinct from guided `/generate-example-tasks` |
 | `POST /generate-revision-questions` | Implemented: generates revision questions from a taught concept and submits them to FSE's `/webhooks/tutor/questions` via HMAC-SHA256; requires `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the deployed service |
+| `POST /next-action` | Implemented: Learning Orchestrator decision endpoint; given the student context snapshot and latest trigger, returns one structured next-action decision; stateless, DB-free |
 | `POST /generate-hint` | Implemented: generates one Assistance Ladder hint (L1-L6) at a caller-specified level; stateless, DB-free; FSE owns escalation policy |
 | Stewart chat history | Implemented in Phase 4a: 105-day persistence, last-10-message context, opt-in via `session_id` |
 | File attachments on `/explain` | Implemented in Phases 3.5a, 3.5b, 3.5c: text files and images, up to 8 per request |
@@ -62,6 +63,7 @@ not change the committed job status or roll back chunks.
   - [Evaluate practice](#post-evaluate-practice)
   - [Generate practice](#post-generate-practice)
   - [Generate revision questions](#post-generate-revision-questions)
+  - [Next action (orchestrator decision)](#post-next-action)
   - [Generate hint](#post-generate-hint)
   - [Demo flow: lesson planning → teaching](#demo-flow-lesson-planning--teaching)
   - [Attachments](#attachments)
@@ -85,6 +87,16 @@ Next.js backend -> POST /ingest -> Postgres jobs -> background worker
   -> transaction: replace document chunks and conditionally mark job done
   -> temp-file cleanup -> outbound callback using the shared HTTP client
 ```
+
+### Two-layer architecture
+
+The service exposes two distinct layers:
+
+1. **Content endpoints** (execution): `/explain`, `/generate-example-tasks`, `/generate-practice`, `/generate-hint`, `/evaluate-practice`, `/explain-with-grounding`, `/generate-revision-questions`. Each is a pure function of its inputs producing content or an evaluation. FSE calls these directly when it already knows what to do.
+
+2. **Orchestrator decision** (routing): `/next-action`. Given the student's learning context and the latest event, decides the one next teaching action. FSE validates the decision against guard rules, falls back if invalid, and executes by calling the appropriate content endpoint.
+
+The two layers are complementary. Content endpoints can be used independently of the orchestrator (as the current demo does). The orchestrator adds intelligence on top: instead of FSE encoding pedagogical policy in application code, the AI service reasons over evidence to propose the next move. FSE retains guard, fallback, and execution authority. This is the FSE-owned split per Handoff v2: AI decides, FSE guards and executes.
 
 Processing failures commit a sanitized error before attempting a failed
 callback. DELETE removes document chunks and jobs in one transaction; workers
@@ -891,6 +903,97 @@ Status codes: `200` on success or degraded fallback; `401` for missing or incorr
 
 Expected latency: 3-8 seconds per hint.
 
+### POST /next-action
+
+The Learning Orchestrator decision endpoint. Given the student's learning context snapshot and the latest learning event (trigger), returns one structured decision about what should happen next. This endpoint does NOT generate teaching content; it produces a routing decision. Content generation remains the job of `/explain`, `/generate-example-tasks`, `/generate-practice`, `/generate-hint`, and `/evaluate-practice`, which the FSE calls after validating the decision.
+
+**Architecture.** Per FSE's Orchestration Handoff v2: the AI service decides what should happen next; the backend guards the decision against hard rules (§2.5), falls back to a deterministic rule table if the decision is invalid (§2.6), and executes the decision by calling the appropriate content endpoint. Two layers of safety ensure a bad model decision wastes a turn but cannot corrupt state, expose untaught material, or skip a prerequisite.
+
+Use the same `Authorization: Bearer <AI_SERVICE_API_KEY>` header as other endpoints.
+
+Request shape:
+
+```json
+{
+  "request_id": "uuid",
+  "schema_version": "1",
+  "operation": "NEXT_ACTION",
+  "trigger": "ATTEMPT_EVALUATED",
+  "student_context": { "... snapshot from FSE, see §4 of handoff v2 ..." },
+  "current": {
+    "course_offering_id": "offering-001",
+    "lesson_run_id": "run-opaque",
+    "stage": "INDEPENDENT_PRACTICE",
+    "concept": { "concept_id": "...", "title": "...", "description": "...", "coverage": "EXPLAINED", "mastery": "DEVELOPING" },
+    "prerequisites": [ { "concept_id": "...", "title": "...", "coverage": "COMPLETED", "mastery": "UNDERSTOOD" } ],
+    "next_concepts": [ { "concept_id": "...", "title": "..." } ],
+    "activity": { "type": "independent_practice", "attempt_index": 2, "assistance": { "hints_used": 1, "assisted": true } }
+  },
+  "latest_evidence": [
+    {
+      "result": "incorrect",
+      "reasoning_quality": "weak",
+      "misconceptions": [ { "code": "half_duplex_confusion", "label": "..." } ],
+      "needs_review": false,
+      "assistance": { "hints_used": 1, "assisted": true }
+    }
+  ],
+  "allowed_actions": ["ADDRESS_MISCONCEPTION", "REINFORCE_CONCEPT", "GIVE_HINT", "FLAG_FOR_REVIEW"],
+  "policy": { "policy_version": "1", "max_consecutive_reinforce": 2 }
+}
+```
+
+Required fields: `request_id`, `trigger`, `student_context`, `current`, `allowed_actions` (minimum 1). `latest_evidence` and `policy` default to empty. `schema_version` and `operation` default to `"1"` and `"NEXT_ACTION"`.
+
+`trigger` is a closed enum: `CONCEPT_OPENED`, `EXPLANATION_DELIVERED`, `STUDENT_ASKED`, `HINT_REQUESTED`, `GUIDED_COMPLETED`, `ATTEMPT_EVALUATED`, `PRACTICE_COMPLETED`, `LESSON_COMPLETED`, `REVISION_REVIEW_COMPLETED`, `RETURN_VISIT`, `LESSON_STARTED`.
+
+Response shape:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `request_id` | string | Echo of request |
+| `schema_version` | string | Echo of request, `"1"` |
+| `status` | `"ok"` \| `"degraded"` | `"ok"` on success; `"degraded"` on any LLM, schema, parse, or validation failure |
+| `decision` | object \| null | `null` when `status="degraded"`; populated on success |
+| `signals` | list[string] | Extensibility hook; v1 emits only `"CONCEPT_READY_FOR_REVISION"` |
+| `usage` | object | `{model, input_tokens, output_tokens, model_calls}` |
+| `model_version` | string | Configured model name |
+| `prompt_version` | string | `"next-action-v1"` |
+
+`decision` object fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `action` | enum | One of the 14 allowed actions (below) |
+| `target_concept_id` | string | Must be one of: current concept, a prerequisite, or a next_concept |
+| `params` | object | Free-form action parameters; may be empty |
+| `reason_code` | string | Short reason for the decision (for audit) |
+| `rationale` | string | One-sentence human-readable explanation (for audit; not shown to student) |
+| `confidence` | float 0.0-1.0 | Self-reported confidence |
+
+`action` enum (14 values):
+
+`EXPLAIN_CONCEPT`, `REINFORCE_CONCEPT`, `SHOW_GUIDED_EXAMPLE`, `GIVE_HINT`, `GENERATE_PRACTICE`, `ADDRESS_MISCONCEPTION`, `REASONING_EXERCISE`, `TRANSFER_TASK`, `TEACH_PREREQUISITE`, `ADVANCE_TO_NEXT_CONCEPT`, `COMPLETE_LESSON`, `CONTINUE_CONVERSATION`, `RECAP`, `FLAG_FOR_REVIEW`.
+
+**`REQUEST_REVISION_QUESTIONS` was removed per FSE audit Q1.** Revision generation is backend-initiated under FSE's eligibility policy. When the model thinks a concept is ready for revision, it emits `signals: ["CONCEPT_READY_FOR_REVISION"]` alongside its one immediate action. The FSE decides whether to act on the signal; the AI service cannot generate revision questions unilaterally.
+
+**Post-parse validation.** Before returning a decision, the service validates:
+- `action` must be in `allowed_actions` (else `status="degraded"`, reason_code logged as `action_not_allowed`)
+- `target_concept_id` must be reachable from the current concept, its prerequisites, or next_concepts (else `target_not_reachable`)
+- `rationale` must be non-empty after trim (else `rationale_empty`)
+
+Any violation degrades to `decision=null`. The FSE's fallback table (§2.6) fires on `status="degraded"`.
+
+FSE integration notes:
+
+- **Guard on your side is still required.** Our post-parse validation is defense-in-depth; it does NOT replace your guard rules (§2.5). Prerequisites, enrollment, loop limits, and `needs_review=true` overrides remain FSE-owned checks against your own state.
+- **`params` may be empty.** The model sometimes returns correct `action` with `params: {}`. If you need specific params (e.g., `misconception_code` when the evidence names one, or `focus: "reasoning"` for `REASONING_EXERCISE`), factor that into your routing logic. A future prompt revision can make params population stricter if needed.
+- **Confidence is self-reported.** Do not use it as a threshold for safety decisions. It's informational for logging and review.
+- **Empty `allowed_actions` returns 422** at request validation, never reaches the service. If your guard would allow nothing, don't call `/next-action`; use your fallback directly.
+- **Latency is 3-8 seconds.** Your client timeout should be at least 10 seconds with fallback on timeout.
+
+Status codes: `200` on success or degraded; `401` for missing/incorrect Bearer token; `422` for invalid request (empty `allowed_actions`, malformed trigger enum, etc.); `503` only when no LLM provider is configured. No `404`, no `500` (degraded handles LLM failures internally).
+
 ### Demo flow: lesson planning → teaching
 
 1. The lecturer submits a document to `/ingest`. The worker chunks and embeds it.
@@ -924,6 +1027,8 @@ Expected latency: 3-8 seconds per hint.
 Note: `/generate-revision-questions` is built and tested against stubs but is not part of the current demo walkthrough. Its end-to-end flow requires FSE's `/webhooks/tutor/questions` handler to be live. The demo uses `/generate-practice` and `/evaluate-practice` for the teaching loop.
 
 **Adaptive teaching loop with hints.** If the student gets a practice question wrong, the FSE calls `/evaluate-practice` to grade the attempt, then `/generate-hint` at level 1 to offer a metacognitive prompt. If the student retries and is still stuck, the FSE calls `/generate-hint` at level 2, passing the level-1 hint in `previous_hints`, and so on through L6. After any successful attempt, `/evaluate-practice` grades again to record evidence and recommend the next step. This is the full adaptive loop; the current demo shows analyze → explain → guided example → independent practice → evaluation, and hints extend the loop when the student struggles.
+
+**Learning Orchestrator layer.** In production, the FSE also calls `/next-action` on each trigger (concept opened, attempt evaluated, hint requested, etc.) with the student's learning context snapshot. The endpoint decides the one next teaching action; the FSE guards and executes it. This is what makes the loop adaptive: after `/evaluate-practice` returns a diagnosis, `/next-action` decides whether the student needs a hint, a reinforcement, a prerequisite detour, or is ready to advance. Demo narration can describe this as "the AI service is not just a content generator, it's the teaching intelligence that sequences the entire lesson."
 
 ### Attachments
 
@@ -1638,7 +1743,7 @@ Exchange secrets privately. Production deployment remains a separate decision.
 
 Attachments, chat history, AI-generated worked examples, lesson planning,
 concept-scoped explanations, interactive micro-tasks, practice evaluation, independent practice
-generation, revision question generation (pending FSE webhook deployment), and Assistance Ladder hint generation are complete. The remaining deferred items are the skipped concurrency test
+generation, revision question generation (pending FSE webhook deployment), Assistance Ladder hint generation, and the Learning Orchestrator decision endpoint are complete. The remaining deferred items are the skipped concurrency test
 investigation, the durable callback outbox (only when an actual delivery
 problem is observed), streaming `/explain` responses, and the full Stewart
 teaching roadmap (learner model, assistance ladder L0-L6, FSRS integration)

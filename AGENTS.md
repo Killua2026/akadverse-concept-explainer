@@ -51,6 +51,7 @@ Status:
 - [x] Practice generation: POST /generate-practice (independent-practice question generation, distinct from guided /generate-example-tasks, DB-backed, solution hidden from student until submission)
 - [x] Revision questions: POST /generate-revision-questions (generates revision questions from taught_summary and submits to FSE's /webhooks/tutor/questions via HMAC-SHA256; DB-free, requires FSE_WEBHOOK_URL and FSE_WEBHOOK_SECRET env vars; end-to-end blocked on FSE webhook deployment)
 - [x] Hint generation: POST /generate-hint (Assistance Ladder L1-L6, one hint per request at a caller-specified level; stateless, DB-free; FSE owns escalation policy)
+- [x] Next-action orchestrator: POST /next-action (Learning Orchestrator decision endpoint; given student context and latest trigger, returns one structured next-action decision; stateless, DB-free; FSE guards and executes)
 - [ ] Phase 4b: Streaming responses for /explain (deferred)
 - [ ] Phase 4c: Durable callback outbox (deferred until observed delivery problem)
 - [ ] Phase 4d: Investigate skipped test_multiple_workers_no_collision (deferred)
@@ -478,6 +479,106 @@ ephemeral `/tmp`, this sweep rarely has anything to remove.
 - Do NOT add `can_escalate` or `next_level` fields to the response.
   Under Model A, FSE owns escalation entirely. Surfacing those would be
   this service opining on a decision it does not own.
+
+### Next-action orchestrator (current)
+
+- `POST /next-action` is the Learning Orchestrator's decision endpoint.
+  Given the student's learning context snapshot and the latest learning
+  event (trigger), returns one structured decision about what should
+  happen next. It does NOT generate teaching content; it produces a
+  routing decision that the FSE validates, guards, and executes by
+  calling the appropriate content endpoint.
+- FSE owns the architecture: AI service decides; FSE guards (§2.5 of
+  Orchestration Handoff v2), falls back to a deterministic rule table
+  (§2.6), and executes. Our service is stateless about the learner — no
+  memory, no persistence. The learner model lives with FSE and reaches
+  us through the `student_context` snapshot on every call.
+- Service module: `services/next_action.py`. Route:
+  `routes/next_action.py`. Models: `TriggerType` (11 values),
+  `ActionType` (14 values), `Decision`, `NextActionRequest`,
+  `NextActionResponse` in `models.py`.
+- Service signature:
+  `decide_next_action(settings, *, request_id, schema_version,
+  operation, trigger, student_context, current, latest_evidence,
+  allowed_actions, policy) -> NextActionResponse`. No `database`
+  parameter. DB-free.
+- `TriggerType` (11 values): `CONCEPT_OPENED`, `EXPLANATION_DELIVERED`,
+  `STUDENT_ASKED`, `HINT_REQUESTED`, `GUIDED_COMPLETED`,
+  `ATTEMPT_EVALUATED`, `PRACTICE_COMPLETED`, `LESSON_COMPLETED`,
+  `REVISION_REVIEW_COMPLETED`, `RETURN_VISIT`, `LESSON_STARTED`.
+- `ActionType` (14 values): `EXPLAIN_CONCEPT`, `REINFORCE_CONCEPT`,
+  `SHOW_GUIDED_EXAMPLE`, `GIVE_HINT`, `GENERATE_PRACTICE`,
+  `ADDRESS_MISCONCEPTION`, `REASONING_EXERCISE`, `TRANSFER_TASK`,
+  `TEACH_PREREQUISITE`, `ADVANCE_TO_NEXT_CONCEPT`, `COMPLETE_LESSON`,
+  `CONTINUE_CONVERSATION`, `RECAP`, `FLAG_FOR_REVIEW`.
+- `REQUEST_REVISION_QUESTIONS` was removed from the action enum per
+  FSE audit Q1. Revision generation is backend-initiated under FSE
+  eligibility policy. Replaced with `signals: list[str]` on the
+  response; v1 emits only `"CONCEPT_READY_FOR_REVISION"`. The FSE
+  decides whether to act on the signal; the AI service cannot trigger
+  revision generation unilaterally.
+- Prompt: `NEXT_ACTION_PROMPT_TEMPLATE` at temperature 0.2, containing
+  seventeen ordered decision principles (SAFETY FIRST, PREREQUISITE
+  GAP, DIAGNOSED MISCONCEPTION, REASONING GAP, INDEPENDENT SUCCESS,
+  ASSISTED SUCCESS, GUIDED FAILED, GUIDED SUCCEEDED, REPEATED FAILURE,
+  REVISION REVIEW FAILED, CONVERSATION, HINT REQUESTED, CONCEPT OPENED
+  (NEW), CONCEPT OPENED (IN PROGRESS), RETURN VISIT, LESSON COMPLETE,
+  FALLBACK) plus six hard rules labeled A-F (allowed_actions respect,
+  target reachability, loop limit, no-PII rationale, honest confidence,
+  signals vocabulary). Prompt version constant `NEXT_ACTION_PROMPT_VERSION
+  = "next-action-v1"`.
+- Principles 5 and 6 are mutually exclusive: principle 5 (independent
+  success) requires `assistance.hints_used == 0 AND assistance.assisted
+  is false`; principle 6 (assisted success) catches `hints_used > 0 OR
+  assisted is true`. This was caught during scope review — the original
+  overlap would have signaled `CONCEPT_READY_FOR_REVISION` for assisted
+  work, contaminating the revision bank with false independence claims.
+- The prompt template uses escaped braces (`{{ }}`) for every literal
+  `{` or `}` so Python's `.format()` does not interpret them as
+  placeholders. Only the six named placeholders (`{trigger}`,
+  `{student_context}`, `{current}`, `{latest_evidence}`,
+  `{allowed_actions}`, `{policy}`) use single braces. The JSON schema
+  example at the end of the prompt uses `{{ }}`. This is load-bearing;
+  an unescaped brace will raise at format time and the endpoint will
+  500 before Gemini is reached.
+- `student_context` is serialized as compact JSON and truncated at
+  19,900 chars (cap 20,000) with an honest marker appended:
+  `\n\n[NOTE: context truncated at 20000 chars; tail omitted due to size limit]`.
+  The log warning `next_action.snapshot_truncated` fires with the
+  original length and the cap. Truncation to 20k without a marker
+  would split JSON mid-string and mislead the model silently.
+- Schema-first generation matches sibling pattern: `response_mime_type="application/json"`
+  with `response_schema=_DecisionLLM` on the first attempt, plain
+  generation retry with schema in prompt on failure. `_extract_json_object`
+  is a local copy per the one-copy-per-service convention.
+- Post-parse validation (three checks): `action` must be in
+  `allowed_actions` (else `action_not_allowed`); `target_concept_id`
+  must be the current concept, a prerequisite, or a next_concept (else
+  `target_not_reachable`); `rationale` non-empty after strip (else
+  `rationale_empty`). Each rejection logs
+  `next_action.decision_rejected reason=<code>` and returns
+  `status="degraded"`, `decision=None`.
+- Degraded path: any LLM, schema, parse, or post-parse validation
+  failure returns HTTP 200 with `status="degraded"`, `decision=None`,
+  `signals=[]`, `usage={"model_calls": 0}`. Fallback never returns 5xx.
+  The only route-level 503 is `not settings.use_enterprise and not
+  settings.google_api_key`.
+- `status` and `decision` have no defaults. Both paths set them
+  explicitly. `decision` is `None` exactly when `status="degraded"`.
+- `signals` is typed `list[str]` (not Literal) so FSE can extend the
+  vocabulary without a schema bump.
+- `params` may be empty (`{}`) even when the prompt principle suggests
+  specific params (e.g., `misconception_code` for
+  ADDRESS_MISCONCEPTION, `focus="reasoning"` for REASONING_EXERCISE).
+  This is a known soft-prompt behavior; do NOT strengthen the prompt to
+  force param population until FSE confirms they need it for routing.
+  Post-smoke-test on concept-4, both principle 3 and principle 4
+  scenarios returned correct `action` with `params={}`.
+- Decision quality is not yet validated against real student patterns.
+  FSE audit §13 item 15 (decision-quality fixtures) is the P1 follow-up.
+  Until those land, the endpoint ships with smoke-tested decisions
+  (five representative cases in tests/test_next_action.py) and no
+  regression coverage against historical decision traces.
 
 ### Concept-scoped /explain
 
@@ -1009,6 +1110,7 @@ akadverse-concept-explainer/
 |   |-- practice_generation.py    # POST /generate-practice
 |   |-- revision_questions.py     # POST /generate-revision-questions
 |   |-- hint_generation.py        # POST /generate-hint
+|   |-- next_action.py            # POST /next-action
 |   |-- attachments.py            # POST/GET/DELETE /attachments (Phase 3.5a)
 |   `-- grounding.py              # Grounding with shared-secret auth (2e)
 |-- workers/
@@ -1032,6 +1134,7 @@ akadverse-concept-explainer/
 |   |-- revision_questions.py     # Revision question generation and FSE webhook submission
 |   |-- revision_submission.py    # HMAC-SHA256 signing and POST to FSE webhook
 |   |-- hint_generation.py        # Assistance Ladder hint generation (L1-L6)
+|   |-- next_action.py            # Learning Orchestrator decision logic
 |   |-- attachments.py            # Attachment CRUD and sweep (Phase 3.5a)
 |   |-- chat_history.py           # Chat persistence and sweep (Phase 4a)
 |   `-- callback.py               # Outbound POST with retry (2d)
@@ -1063,6 +1166,7 @@ akadverse-concept-explainer/
 |   |-- test_revision_questions.py   # Revision generation endpoint tests
 |   |-- test_revision_submission.py  # HMAC client and retry tests
 |   |-- test_hint_generation.py      # Hint generation endpoint tests
+|   |-- test_next_action.py          # Next-action orchestrator tests
 |   |-- test_attachments.py       # Attachment CRUD and sweep tests (Phase 3.5a)
 |   |-- test_status.py            # Document status endpoint tests
 |   `-- test_callback.py          # (2d)
@@ -1152,8 +1256,12 @@ Verified full-suite baselines:
 
 Focused run after `/generate-revision-questions`: 18 passed (7 submission
 + 10 generation + 1 refactor). Focused run after `/generate-hint`: 13
-passed (12 new + 1 refactor). Full-suite verification after both commits:
-349 passed + 1 skipped / 350 collected.
+passed (12 new + 1 refactor). Focused run after `/next-action`: 14 passed
+(13 new + 1 refactor). Full-suite verification after
+`/generate-revision-questions` and `/generate-hint`: 349 passed + 1
+skipped / 350 collected. Full-suite projection after `/next-action`:
+362 passed + 1 skipped / 363 collected. Pending end-of-session
+verification.
 
 Focused run after `/generate-practice`: 10 passed (9 new practice-generation
 test executions plus the existing
@@ -1308,38 +1416,45 @@ loudly when it fails. Silent failure is worse than loud failure.
 
 ## What to do next
 
-Seven teaching-stage endpoints shipped and were verified on
-`csc424-lecture-1-2027`: `/analyse-material`, concept-scoped `/explain`,
-`/generate-example-tasks` (guided), `/generate-practice` (independent),
-`/evaluate-practice` (grading), `/generate-revision-questions` (FSE webhook
-producer), and `/generate-hint` (Assistance Ladder L1-L6). The full adaptive
-teaching loop is demonstrable end-to-end: analyse -> explain -> guided
-example -> independent practice -> evaluation -> hint at increasing level
-on struggle -> retry -> evaluation.
+Eight endpoints shipped and were verified on `csc424-lecture-1-2027`:
+`/analyse-material`, concept-scoped `/explain`, `/generate-example-tasks`
+(guided), `/generate-practice` (independent), `/evaluate-practice`
+(grading), `/generate-revision-questions` (FSE webhook producer),
+`/generate-hint` (Assistance Ladder L1-L6), and `/next-action` (Learning
+Orchestrator decision endpoint). The full adaptive teaching loop is
+demonstrable end-to-end, with two layers: content endpoints (execution)
+and `/next-action` (routing).
 
-Outstanding FSE dependencies (from the revision question bank integration):
-- `POST /webhooks/tutor/questions` must be deployed on FSE's side with
-  HMAC-SHA256 verification per their revision bank spec §6.2.
-- FSE must provision `FSE_WEBHOOK_URL` and `FSE_WEBHOOK_SECRET` on the
-  Railway service.
-- FSE must confirm question_types v1 scope (recommend mcq, short_answer,
-  true_false only).
-- FSE must confirm the 30s timeout budget on their call to us.
-- FSE must confirm the question bank embedding model choice per their
-  §15.4. Our 768-dim `gemini-embedding-2` embeddings and their question
-  bank embeddings live in different tables and are never compared; no
-  dimension-matching requirement crosses the boundary.
+The FSE will not wire `/next-action` into their routing until their
+guard rules (§2.5 of Handoff v2) and fallback (§2.6) are coded and
+tested. Until then, content endpoints remain the integration surface and
+the demo narrative runs through `/explain` → `/generate-example-tasks` →
+`/generate-practice` → `/evaluate-practice` → `/generate-hint`.
+
+Outstanding FSE dependencies:
+- `POST /webhooks/tutor/questions` HMAC path: 401 INVALID_SIGNATURE
+  resolved (header validation was passing, not HMAC), remaining blocker
+  is 400 INVALID_PAYLOAD. FSE to identify failing field and format.
+- FSE to confirm question bank embedding model choice per audit §15.4.
+- FSE to publish decision-quality fixtures for `/next-action` prompt
+  validation (audit §13 item 15).
+- FSE Prisma audit completion and §18 handoff exchange.
 
 Pre-Phase-0 items still open:
 - `.env.example` does not yet list `FSE_WEBHOOK_URL` and
   `FSE_WEBHOOK_SECRET`. Follow-up one-line commit pending.
-- The Phase 0 audit (vocabulary reconciliation across the three operation
-  namespaces, request envelope decision, stable concept IDs, student
-  context snapshot schema) remains blocked on FSE availability after demo.
+- P0 items 1, 2, 4, 5, 6 from FSE audit §13 remain not started:
+  status flag on every endpoint, metering fields on every endpoint,
+  `/explain` request extension, stable source refs, concept identity
+  and versioning. Stage 1 (items 1+2, additive response fields across
+  all 14 endpoints) is the next natural P0 sequence.
+- Phase 0 audit document (vocabulary reconciliation, envelope, stable
+  concept IDs, student context snapshot schema) remains blocked on FSE
+  availability.
 
-Deferred items unchanged: durable callback outbox (until observed delivery
-problem), skipped-test investigation, streaming `/explain`, and FSRS
-integration (last per FSE).
+Deferred items unchanged: durable callback outbox (until observed
+delivery problem), skipped-test investigation, streaming `/explain`,
+and FSRS integration (last per FSE).
 
 The durable callback outbox remains deferred until an observed delivery
 failure. The skipped-test investigation is deferred. Streaming `/explain`
